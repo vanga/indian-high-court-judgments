@@ -14,7 +14,9 @@ import pandas as pd
 
 import threading
 import concurrent.futures
+import urllib3
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 reader = easyocr.Reader(["en"])
 
@@ -29,7 +31,7 @@ pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HB
 page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
-MAX_WORKERS = 5
+MAX_WORKERS = 1
 
 
 def get_json_file(file_path) -> dict:
@@ -77,7 +79,7 @@ class Downloader:
         self.court_name = self.court_codes[self.court_code]
         self.court_tracking = self.tracking_data.get(self.court_code, {})
         self.session_cookie_name = "PHPSESSID"
-        self.ecourts_token_cookie_name = "Judge_Ecourts_Token"
+        self.ecourts_token_cookie_name = "JSESSION"
         self.session_id = None
         self.ecourts_token = None
         self.app_token = (
@@ -239,13 +241,18 @@ class Downloader:
         pdf_download_link = pdf_link_response.json()["outputfile"]
 
         # download pdf and save
-        pdf_response = requests.request("GET", root_url + pdf_download_link)
+        pdf_response = requests.request(
+            "GET", root_url + pdf_download_link, verify=False
+        )
         pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
         # number of response butes
         no_of_bytes = len(pdf_response.content)
         if no_of_bytes == 0:
             print("Empty pdf", pdf_output_path)
             return False
+        if no_of_bytes == 315:
+            print("404 pdf response")
+        print(no_of_bytes, pdf_response.cookies.get("JSESSION"))
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
         print(f"Downloaded {pdf_output_path}, size: {no_of_bytes}")
@@ -269,7 +276,7 @@ class Downloader:
             captcha_url = self.captcha_url
         # download captch image and save
         captcha_response = requests.get(
-            captcha_url, headers={"Cookie": self.get_cookie()}
+            captcha_url, headers={"Cookie": self.get_cookie()}, verify=False
         )
         captcha_filename = f"/tmp/captcha{self.court_code}.png"
         with open(captcha_filename, "wb") as f:
@@ -331,6 +338,7 @@ class Downloader:
             self.captcha_token_url,
             headers=self.get_headers(),
             data=captcha_check_payload,
+            verify=False,
         )
         res_json = res.json()
         self.app_token = res_json["app_token"]
@@ -346,7 +354,13 @@ class Downloader:
         #     url,
         # )
         response = requests.request(
-            method, url, headers=headers, data=payload, **kwargs, timeout=60
+            method,
+            url,
+            headers=headers,
+            data=payload,
+            **kwargs,
+            timeout=60,
+            verify=False,
         )
         # if response is json
         try:
@@ -408,7 +422,9 @@ class Downloader:
         return pdf_link_payload_o
 
     def init_user_session(self):
-        res = requests.request("GET", "https://judgments.ecourts.gov.in/pdfsearch/")
+        res = requests.request(
+            "GET", "https://judgments.ecourts.gov.in/pdfsearch/", verify=False
+        )
         self.session_id = res.cookies.get(self.session_cookie_name)
         self.ecourts_token = res.cookies.get(self.ecourts_token_cookie_name)
 
