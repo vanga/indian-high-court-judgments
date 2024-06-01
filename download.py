@@ -120,7 +120,7 @@ class Downloader:
                 ):
                     no_of_results = len(res_dict["reportrow"]["aaData"])
                     print("Found results", no_of_results)
-                    for idx, row in tqdm(enumerate(res_dict["reportrow"]["aaData"])):
+                    for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
                         try:
                             is_pdf_downloaded = self.process_result_row(
                                 row, row_pos=idx
@@ -252,6 +252,7 @@ class Downloader:
             return False
         if no_of_bytes == 315:
             print("404 pdf response")
+            return False
         print(no_of_bytes, pdf_response.cookies.get("JSESSION"))
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
