@@ -242,7 +242,10 @@ class Downloader:
 
         # download pdf and save
         pdf_response = requests.request(
-            "GET", root_url + pdf_download_link, verify=False
+            "GET",
+            root_url + pdf_download_link,
+            verify=False,
+            headers=self.get_headers(),
         )
         pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
         # number of response butes
@@ -253,7 +256,6 @@ class Downloader:
         if no_of_bytes == 315:
             print("404 pdf response")
             return False
-        print(no_of_bytes, pdf_response.cookies.get("JSESSION"))
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
         print(f"Downloaded {pdf_output_path}, size: {no_of_bytes}")
