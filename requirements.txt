@@ -1,0 +1,5 @@
+tqdm
+requests
+bs4
+lxml
+easyocr

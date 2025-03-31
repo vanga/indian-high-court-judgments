@@ -10,7 +10,6 @@ import lxml.html as LH
 from http.cookies import SimpleCookie
 import urllib
 import easyocr
-import pandas as pd
 
 import threading
 import concurrent.futures
@@ -78,7 +77,7 @@ class Downloader:
         self.court_codes = get_court_codes()
         self.court_name = self.court_codes[self.court_code]
         self.court_tracking = self.tracking_data.get(self.court_code, {})
-        self.session_cookie_name = "PHPSESSID"
+        self.session_cookie_name = "JUDGEMENTSSEARCH_SESSID"
         self.ecourts_token_cookie_name = "JSESSION"
         self.session_id = None
         self.ecourts_token = None
@@ -119,7 +118,9 @@ class Downloader:
                     and len(res_dict["reportrow"]["aaData"]) > 0
                 ):
                     no_of_results = len(res_dict["reportrow"]["aaData"])
-                    print("Found results", no_of_results)
+                    print(
+                        f"Found {no_of_results} results for {self.court_code}, {self.court_name}, from: {from_date}, to: {to_date}"
+                    )
                     for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
                         try:
                             is_pdf_downloaded = self.process_result_row(
@@ -274,7 +275,43 @@ class Downloader:
             return match.group(1).split("#")[0]
         return None
 
+    def solve_math_expression(self, expression):
+        # credits to: https://github.com/NoelShallum
+        expression = expression.strip().replace(" ", "")
+        if "+" in expression:
+            nums = expression.split("+")
+            return str(int(nums[0]) + int(nums[1]))
+        elif "-" in expression:
+            nums = expression.split("-")
+            return str(int(nums[0]) - int(nums[1]))
+        elif (
+            "*" in expression
+            or "X" in expression
+            or "x" in expression
+            or "×" in expression
+        ):
+            expression = (
+                expression.replace("x", "*").replace("×", "*").replace("X", "*")
+            )
+            nums = expression.split("*")
+            return str(int(nums[0]) * int(nums[1]))
+        elif "/" in expression or "÷" in expression:
+            expression = expression.replace("÷", "/")
+            nums = expression.split("/")
+            return str(int(nums[0]) // int(nums[1]))
+        else:
+            raise ValueError(f"Unsupported mathematical expression: {expression}")
+
+    def is_match_expression(self, expression):
+        separators = ["+", "-", "*", "/", "÷", "x", "×", "X"]
+        for separator in separators:
+            if separator in expression:
+                return True
+        return False
+
     def solve_captcha(self, retries=0, captcha_url=None):
+        if retries > 5:
+            raise ValueError("Failed to solve captcha")
         if captcha_url is None:
             captcha_url = self.captcha_url
         # download captch image and save
@@ -287,14 +324,11 @@ class Downloader:
         result = reader.readtext(captcha_filename)
         Path(captcha_filename).unlink()
         captch_text = result[0][1].strip()
-        # strip, remove any special characters present anywhere
-        # final text should be 6 characters long
-        captch_text = "".join([c for c in captch_text if c.isnumeric()])
-        if len(captch_text) != 6:
-            if retries > 5:
-                raise Exception("Captcha not solved")
-            return self.solve_captcha(retries + 1)
-        return captch_text
+        if self.is_match_expression(captch_text):
+            answer = self.solve_math_expression(captch_text)
+        else:
+            self.solve_captcha(retries + 1, captcha_url)
+        return answer
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
         """
@@ -327,12 +361,11 @@ class Downloader:
     def refresh_token(self, with_app_token=False):
         print("Current session id ", self.session_id)
         print("Current token ", self.app_token)
-        captcha_text = self.solve_captcha()
+        answer = self.solve_captcha()
         captcha_check_payload = {
-            "captcha": captcha_text,
+            "captcha": answer,
             "search_opt": "PHRASE",
             "ajax_req": "true",
-            # "app_token": app_token,
         }
         if with_app_token:
             captcha_check_payload["app_token"] = self.app_token
@@ -390,7 +423,7 @@ class Downloader:
             return self.request_api(method, url, payload, **kwargs)
 
         elif "errormsg" in response_dict:
-
+            print("Error", response_dict["errormsg"])
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
