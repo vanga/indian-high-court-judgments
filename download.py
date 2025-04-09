@@ -30,7 +30,7 @@ pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HB
 page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
-MAX_WORKERS = 1
+MAX_WORKERS = 20
 
 
 def get_json_file(file_path) -> dict:
@@ -94,7 +94,7 @@ class Downloader:
             print("Error processing court", self.court_code, self.court_name)
 
     def process_court(self):
-        last_date = self.court_tracking.get("last_date", "2023-12-31")
+        last_date = self.court_tracking.get("last_date", "1996-01-01")
         from_date, to_date = self.get_new_date_range(last_date)
         if from_date is None:
             print("No more data to download for: ", self.court_code, self.court_name)
@@ -322,13 +322,23 @@ class Downloader:
         with open(captcha_filename, "wb") as f:
             f.write(captcha_response.content)
         result = reader.readtext(captcha_filename)
+        if not result:
+            print("No result from captcha")
+            return self.solve_captcha(retries + 1, captcha_url)
         Path(captcha_filename).unlink()
         captch_text = result[0][1].strip()
         if self.is_match_expression(captch_text):
-            answer = self.solve_math_expression(captch_text)
+            try:
+                answer = self.solve_math_expression(captch_text)
+                return answer
+            except Exception as e:
+                print(e)
+                traceback.print_exc()
+                print(captch_text)
+                print("Error solving math expression", captch_text)
+                self.solve_captcha(retries + 1, captcha_url)
         else:
-            self.solve_captcha(retries + 1, captcha_url)
-        return answer
+            return self.solve_captcha(retries + 1, captcha_url)
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
         """
