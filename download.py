@@ -196,7 +196,7 @@ class Downloader:
                         search_payload["iDisplayStart"] = 0
                         search_payload["iDisplayLength"] = page_size
                         logger.info(
-                            f"Downloading data for: {self.court_code}, court: {self.court_name}, from:[] {from_date},to: {to_date}"
+                            f"Downloading data for: {self.court_code}, court: {self.court_name}, from: {from_date},to: {to_date}"
                         )
 
             except Exception as e:
@@ -303,7 +303,7 @@ class Downloader:
 
     def solve_math_expression(self, expression):
         # credits to: https://github.com/NoelShallum
-        expression = expression.strip().replace(" ", "")
+        expression = expression.strip().replace(" ", "").replace(".", "")
         if "+" in expression:
             nums = expression.split("+")
             return str(int(nums[0]) + int(nums[1]))
