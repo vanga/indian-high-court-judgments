@@ -37,7 +37,7 @@ pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HB
 page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
-MAX_WORKERS = 10
+MAX_WORKERS = 1
 
 captcha_failures_dir = Path("./captcha-failures")
 captcha_tmp_dir = Path("./captcha-tmp")
