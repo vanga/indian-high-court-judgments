@@ -26,6 +26,7 @@ reader = easyocr.Reader(["en"])
 
 root_url = "https://judgments.ecourts.gov.in"
 output_dir = Path("./data")
+START_DATE = "2008-01-01"
 
 
 payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=100&mDataProp_0=0&sSearch_0=&bRegex_0=false&bSearchable_0=true&bSortable_0=true&mDataProp_1=1&sSearch_1=&bRegex_1=false&bSearchable_1=true&bSortable_1=true&sSearch=&bRegex=false&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1&search_txt1=&search_txt2=&search_txt3=&search_txt4=&search_txt5=&pet_res=&state_code=27~1&state_code_li=&dist_code=null&case_no=&case_year=&from_date=&to_date=&judge_name=&reg_year=&fulltext_case_type=&int_fin_party_val=undefined&int_fin_case_val=undefined&int_fin_court_val=undefined&int_fin_decision_val=undefined&act=&sel_search_by=undefined&sections=undefined&judge_txt=&act_txt=&section_txt=&judge_val=&act_val=&year_val=&judge_arr=&flag=&disp_nature=&search_opt=PHRASE&date_val=ALL&fcourt_type=2&citation_yr=&citation_vol=&citation_supl=&citation_page=&case_no1=&case_year1=&pet_res1=&fulltext_case_type1=&citation_keyword=&sel_lang=&proximity=&neu_cit_year=&neu_no=&ajax_req=true&app_token=1fbc7fbb840eb95975c684565909fe6b3b82b8119472020ff10f40c0b1c901fe"
@@ -39,7 +40,9 @@ lock = threading.Lock()
 MAX_WORKERS = 10
 
 captcha_failures_dir = Path("./captcha-failures")
+captcha_tmp_dir = Path("./captcha-tmp")
 captcha_failures_dir.mkdir(parents=True, exist_ok=True)
+captcha_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 
 def get_json_file(file_path) -> dict:
@@ -124,7 +127,7 @@ class Downloader:
         return search_payload
 
     def process_court(self):
-        last_date = self.court_tracking.get("last_date", "2008-01-01")
+        last_date = self.court_tracking.get("last_date", START_DATE)
         from_date, to_date = self.get_new_date_range(last_date)
         if from_date is None:
             logger.info(
@@ -344,7 +347,7 @@ class Downloader:
         captcha_response = requests.get(
             captcha_url, headers={"Cookie": self.get_cookie()}, verify=False
         )
-        captcha_filename = Path(f"./tmp/captcha{self.court_code}.png")
+        captcha_filename = Path(f"{captcha_tmp_dir}/captcha{self.court_code}.png")
         with open(captcha_filename, "wb") as f:
             f.write(captcha_response.content)
         result = reader.readtext(str(captcha_filename))
@@ -502,7 +505,7 @@ class Downloader:
             self.session_id = new_session_cookie
 
     def get_new_date_range(self, last_date: str) -> tuple[str | None, str | None]:
-        day_step = 7
+        day_step = 1
         last_date_dt = datetime.strptime(last_date, "%Y-%m-%d")
         new_from_date_dt = last_date_dt + timedelta(days=1)
         new_to_date_dt = new_from_date_dt + timedelta(days=day_step - 1)
