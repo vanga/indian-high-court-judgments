@@ -1,4 +1,4 @@
-tmp/
+captcha-tmp/
 captcha-failures/
 data/
 .DS_Store

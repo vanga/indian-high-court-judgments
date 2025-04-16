@@ -1,4 +1,5 @@
 from tqdm import tqdm
+import argparse
 from datetime import datetime, timedelta
 import traceback
 import re
@@ -37,7 +38,12 @@ pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HB
 page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
-MAX_WORKERS = 1
+MAX_WORKERS = 2
+
+captcha_failures_dir = Path("./captcha-failures")
+captcha_tmp_dir = Path("./captcha-tmp")
+captcha_failures_dir.mkdir(parents=True, exist_ok=True)
+captcha_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 captcha_failures_dir = Path("./captcha-failures")
 captcha_tmp_dir = Path("./captcha-tmp")
@@ -73,6 +79,116 @@ def save_court_tracking_date(court_code, court_tracking):
     save_tracking_data(tracking_data)
     # release the lock
     lock.release()
+
+
+def get_new_date_range(
+    last_date: str, day_step: int = 1
+) -> tuple[str | None, str | None]:
+    last_date_dt = datetime.strptime(last_date, "%Y-%m-%d")
+    new_from_date_dt = last_date_dt + timedelta(days=1)
+    new_to_date_dt = new_from_date_dt + timedelta(days=day_step - 1)
+    if new_from_date_dt.date() > datetime.now().date():
+        return None, None
+
+    if new_to_date_dt.date() > datetime.now().date():
+        new_to_date_dt = datetime.now().date()
+    new_from_date = new_from_date_dt.strftime("%Y-%m-%d")
+    new_to_date = new_to_date_dt.strftime("%Y-%m-%d")
+    return new_from_date, new_to_date
+
+
+def get_date_ranges_to_process(court_code, start_date=None, end_date=None, day_step=1):
+    """
+    Generate date ranges to process for a given court.
+    If start_date is provided but no end_date, use current date as end_date.
+    If neither is provided, use tracking data to determine the next date range.
+    """
+    # If start_date is provided but end_date is not, use current date as end_date
+    if start_date and not end_date:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+
+    if start_date and end_date:
+        # Convert string dates to datetime objects
+        start_date_dt = datetime.strptime(start_date, "%Y-%m-%d")
+        end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
+
+        # Generate date ranges with specified step
+        current_date = start_date_dt
+        while current_date <= end_date_dt:
+            range_end = min(current_date + timedelta(days=day_step - 1), end_date_dt)
+            yield (current_date.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d"))
+            current_date = range_end + timedelta(days=1)
+    else:
+        # Use tracking data to get next date range
+        tracking_data = get_tracking_data()
+        court_tracking = tracking_data.get(court_code, {})
+        last_date = court_tracking.get("last_date", START_DATE)
+
+        # Process from last_date to current date in chunks
+        current_date = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
+        end_date_dt = datetime.now()
+
+        while current_date <= end_date_dt:
+            range_end = min(current_date + timedelta(days=day_step - 1), end_date_dt)
+            yield (current_date.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d"))
+            current_date = range_end + timedelta(days=1)
+
+
+class CourtDateTask:
+    """A task representing a court and date range to process"""
+
+    def __init__(self, court_code, from_date, to_date):
+        self.court_code = court_code
+        self.from_date = from_date
+        self.to_date = to_date
+
+    def __str__(self):
+        return f"CourtDateTask(court_code={self.court_code}, from_date={self.from_date}, to_date={self.to_date})"
+
+
+def generate_tasks(court_code=None, start_date=None, end_date=None, day_step=1):
+    """Generate tasks for processing courts and date ranges as a generator"""
+    court_codes = get_court_codes()
+    if court_code:
+        court_codes = {court_code: court_codes[court_code]}
+
+    for code in court_codes:
+        for from_date, to_date in get_date_ranges_to_process(
+            code, start_date, end_date, day_step
+        ):
+            yield CourtDateTask(code, from_date, to_date)
+
+
+def process_task(task):
+    """Process a single court-date task"""
+    try:
+        downloader = Downloader(task.court_code)
+        downloader.process_date_range(task.from_date, task.to_date)
+    except Exception as e:
+        court_codes = get_court_codes()
+        logger.error(
+            f"Error processing court {task.court_code} {court_codes.get(task.court_code, 'Unknown')}: {e}"
+        )
+        traceback.print_exc()
+
+
+def run(court_code=None, start_date=None, end_date=None, day_step=1):
+    """
+    Run the downloader with optional parameters using Python's multiprocessing
+    with a generator that yields tasks on demand.
+    """
+    # Create a task generator
+    tasks = generate_tasks(court_code, start_date, end_date, day_step)
+
+    # Use ProcessPoolExecutor with map to process tasks in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        # map automatically consumes the iterator and processes tasks in parallel
+        # it returns results in the same order as the input iterator
+        for i, result in enumerate(executor.map(process_task, tasks)):
+            # process_task doesn't return anything, so we're just tracking progress
+            logger.info(f"Completed task {i+1}")
+
+    logger.info("All tasks completed")
 
 
 class Downloader:
@@ -128,7 +244,7 @@ class Downloader:
 
     def process_court(self):
         last_date = self.court_tracking.get("last_date", START_DATE)
-        from_date, to_date = self.get_new_date_range(last_date)
+        from_date, to_date = get_new_date_range(last_date)
         if from_date is None:
             logger.info(
                 f"No more data to download for: {self.court_code} {self.court_name}"
@@ -186,7 +302,7 @@ class Downloader:
                     last_date = to_date
                     self.court_tracking["last_date"] = last_date
                     save_court_tracking_date(self.court_code, self.court_tracking)
-                    from_date, to_date = self.get_new_date_range(to_date)
+                    from_date, to_date = get_new_date_range(to_date)
                     if from_date is None:
                         logger.info(
                             f"No more data to download for: {self.court_code} {self.court_name}"
@@ -347,7 +463,11 @@ class Downloader:
         captcha_response = requests.get(
             captcha_url, headers={"Cookie": self.get_cookie()}, verify=False
         )
-        captcha_filename = Path(f"{captcha_tmp_dir}/captcha{self.court_code}.png")
+        # Generate a unique filename using UUID
+        unique_id = uuid.uuid4().hex[:8]
+        captcha_filename = Path(
+            f"{captcha_tmp_dir}/captcha_{self.court_code}_{unique_id}.png"
+        )
         with open(captcha_filename, "wb") as f:
             f.write(captcha_response.content)
         result = reader.readtext(str(captcha_filename))
@@ -367,8 +487,10 @@ class Downloader:
                 # move the captcha image to a new folder for debugging
                 new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
                 captcha_filename.rename(Path(f"{captcha_failures_dir}/{new_filename}"))
-                self.solve_captcha(retries + 1, captcha_url)
+                return self.solve_captcha(retries + 1, captcha_url)
         else:
+            # If not a math expression, try again
+            captcha_filename.unlink()  # Clean up the file
             return self.solve_captcha(retries + 1, captcha_url)
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
@@ -504,20 +626,6 @@ class Downloader:
         if new_session_cookie:
             self.session_id = new_session_cookie
 
-    def get_new_date_range(self, last_date: str) -> tuple[str | None, str | None]:
-        day_step = 1
-        last_date_dt = datetime.strptime(last_date, "%Y-%m-%d")
-        new_from_date_dt = last_date_dt + timedelta(days=1)
-        new_to_date_dt = new_from_date_dt + timedelta(days=day_step - 1)
-        if new_from_date_dt.date() > datetime.now().date():
-            return None, None
-
-        if new_to_date_dt.date() > datetime.now().date():
-            new_to_date_dt = datetime.now().date()
-        new_from_date = new_from_date_dt.strftime("%Y-%m-%d")
-        new_to_date = new_to_date_dt.strftime("%Y-%m-%d")
-        return new_from_date, new_to_date
-
     def get_headers(self):
         headers = {
             "Accept": "application/json, text/javascript, */*; q=0.01",
@@ -539,30 +647,84 @@ class Downloader:
         }
         return headers
 
-
-def run():
-    court_codes = get_court_codes()
-
-    def process(court_code):
-        try:
-            Downloader(court_code).download()
-        except Exception as e:
-            logger.error(
-                f"Error processing court {court_code} {court_codes[court_code]}: {e}"
+    def process_date_range(self, from_date, to_date):
+        """Process a specific date range for this court"""
+        if from_date is None or to_date is None:
+            logger.info(
+                f"No more data to download for: {self.court_code} {self.court_name}"
             )
-            traceback.print_exc()
+            return
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = []
-        for code, name in court_codes.items():
-            futures.append(executor.submit(process, code))
+        search_payload = self.default_search_payload()
+        search_payload["from_date"] = from_date
+        search_payload["to_date"] = to_date
+        self.init_user_session()
+        search_payload["state_code"] = self.court_code
+        search_payload["app_token"] = self.app_token
+        results_available = True
+        pdfs_downloaded = 0
 
-        for future in concurrent.futures.as_completed(futures):
-            res = future.result()
+        logger.info(
+            f"Downloading data for: {self.court_code}, court: {self.court_name}, from: {from_date}, to: {to_date}"
+        )
+
+        while results_available:
+            try:
+                response = self.request_api("POST", self.search_url, search_payload)
+                res_dict = response.json()
+                if self._results_exist_in_search_response(res_dict):
+                    for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
+                        try:
+                            is_pdf_downloaded = self.process_result_row(
+                                row, row_pos=idx
+                            )
+                            if is_pdf_downloaded:
+                                pdfs_downloaded += 1
+                            if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
+                                # after 25 downloads, need to solve captcha for every pdf link request
+                                logger.info(
+                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session"
+                                )
+                                break
+                        except Exception as e:
+                            logger.error(f"Error processing row {row}: {e}")
+                            traceback.print_exc()
+
+                    if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
+                        pdfs_downloaded = 0
+                        self.init_user_session()
+                        search_payload["app_token"] = self.app_token
+                        continue
+
+                    # prepare next iteration
+                    search_payload = self._prepare_next_iteration(search_payload)
+                else:
+                    # No more results for this date range
+                    results_available = False
+
+            except Exception as e:
+                logger.error(
+                    f"Error processing court {self.court_code} {self.court_name} for dates {from_date} to {to_date}: {e}"
+                )
+                traceback.print_exc()
+                results_available = False
 
 
 if __name__ == "__main__":
-    run()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--court_code", type=str, default=None)
+    parser.add_argument(
+        "--start_date", type=str, default=None, help="Start date in YYYY-MM-DD format"
+    )
+    parser.add_argument(
+        "--end_date", type=str, default=None, help="End date in YYYY-MM-DD format"
+    )
+    parser.add_argument(
+        "--day_step", type=int, default=1, help="Number of days per chunk"
+    )
+    args = parser.parse_args()
+
+    run(args.court_code, args.start_date, args.end_date, args.day_step)
 
 """
 captcha prompt while downloading pdf seems to be different from session timeout
