@@ -1,4 +1,4 @@
-* Join [discord server](https://discord.gg/cAXJTub5) if you want to collaborate on this repo or have any questions. Reachout to `vangap` on discord if you need access to the PDF judgments as bulk download.
+* Join [discord server](https://discord.gg/cAXJTub5) if you want to collaborate on this repo or have any questions. Reach out to `vangap` on discord if you need access to the PDF judgments as bulk download.
 * **Be responsible, considerate, and think about the maintainers of the ecourts website. Avoid scraping with high concurrency.**
 * **track.json** is broken and not working as expected.
 
