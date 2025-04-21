@@ -64,6 +64,8 @@ class MetadataProcessor:
             title = ""
 
         description_elem = html_element.xpath("./text()")
+        judge_txt = html_element.xpath("./strong/text()")
+        judge_name = judge_txt[0].split(":")[1].strip() if judge_txt else ""
         description = (
             description_elem[0].strip() if description_elem else ""
         )  # Empty string instead of None
@@ -72,6 +74,8 @@ class MetadataProcessor:
             "court_code": metadata["court_code"],
             "title": title,
             "description": description,
+            "judge": judge_name,
+            "pdf_link": metadata["pdf_link"],
         }
 
         # Wrap XPath queries in try-except to handle missing elements
@@ -84,28 +88,28 @@ class MetadataProcessor:
             try:
                 case_details["cnr"] = case_details_elements.xpath(
                     './/span[contains(text(), "CNR")]/following-sibling::font/text()'
-                )[0]
+                )[0].strip()
             except (IndexError, KeyError):
                 case_details["cnr"] = ""
 
             try:
                 case_details["date_of_registration"] = case_details_elements.xpath(
                     './/span[contains(text(), "Date of registration")]/following-sibling::font/text()'
-                )[0]
+                )[0].strip()
             except (IndexError, KeyError):
                 case_details["date_of_registration"] = ""
 
             try:
                 case_details["decision_date"] = case_details_elements.xpath(
                     './/span[contains(text(), "Decision Date")]/following-sibling::font/text()'
-                )[0]
+                )[0].strip()
             except (IndexError, KeyError):
                 case_details["decision_date"] = ""
 
             try:
                 case_details["disposal_nature"] = case_details_elements.xpath(
                     './/span[contains(text(), "Disposal Nature")]/following-sibling::font/text()'
-                )[0]
+                )[0].strip()
             except (IndexError, KeyError):
                 case_details["disposal_nature"] = ""
 

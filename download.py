@@ -22,6 +22,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # add a logger
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+logger.setLevel("INFO")
 
 reader = easyocr.Reader(["en"])
 
@@ -38,12 +39,6 @@ pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HB
 page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
-MAX_WORKERS = 2
-
-captcha_failures_dir = Path("./captcha-failures")
-captcha_tmp_dir = Path("./captcha-tmp")
-captcha_failures_dir.mkdir(parents=True, exist_ok=True)
-captcha_tmp_dir.mkdir(parents=True, exist_ok=True)
 
 captcha_failures_dir = Path("./captcha-failures")
 captcha_tmp_dir = Path("./captcha-tmp")
@@ -392,6 +387,7 @@ class Downloader:
             root_url + pdf_download_link,
             verify=False,
             headers=self.get_headers(),
+            timeout=30,
         )
         pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
         # number of response butes
@@ -455,13 +451,14 @@ class Downloader:
         return False
 
     def solve_captcha(self, retries=0, captcha_url=None):
+        logger.debug(f"Solving captcha, retries: {retries}")
         if retries > 5:
             raise ValueError("Failed to solve captcha")
         if captcha_url is None:
             captcha_url = self.captcha_url
         # download captcha image and save
         captcha_response = requests.get(
-            captcha_url, headers={"Cookie": self.get_cookie()}, verify=False
+            captcha_url, headers={"Cookie": self.get_cookie()}, verify=False, timeout=30
         )
         # Generate a unique filename using UUID
         unique_id = uuid.uuid4().hex[:8]
@@ -483,7 +480,6 @@ class Downloader:
                 return answer
             except Exception as e:
                 logger.error(f"Error solving math expression {captch_text}: {e}")
-                traceback.print_exc()
                 # move the captcha image to a new folder for debugging
                 new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
                 captcha_filename.rename(Path(f"{captcha_failures_dir}/{new_filename}"))
@@ -532,6 +528,7 @@ class Downloader:
             headers=self.get_headers(),
             data=captcha_check_payload,
             verify=False,
+            timeout=30,
         )
         res_json = res.json()
         self.app_token = res_json["app_token"]
@@ -613,10 +610,20 @@ class Downloader:
 
     def init_user_session(self):
         res = requests.request(
-            "GET", "https://judgments.ecourts.gov.in/pdfsearch/", verify=False
+            "GET",
+            f"{self.root_url}/pdfsearch/",
+            verify=False,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/135.0.0.0 Safari/537.36",
+            },
+            timeout=30,
         )
         self.session_id = res.cookies.get(self.session_cookie_name)
         self.ecourts_token = res.cookies.get(self.ecourts_token_cookie_name)
+        if self.ecourts_token is None:
+            raise ValueError(
+                "Failed to get session token, not expected to happen. This could happen if the IP might have been detected as spam"
+            )
 
     def get_cookie(self):
         return f"{self.ecourts_token_cookie_name}={self.ecourts_token}; {self.session_cookie_name}={self.session_id}"
@@ -714,14 +721,21 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--court_code", type=str, default=None)
     parser.add_argument(
-        "--start_date", type=str, default=None, help="Start date in YYYY-MM-DD format"
+        "--start_date",
+        type=str,
+        default=None,
+        help="Start date in YYYY-MM-DD format",
     )
     parser.add_argument(
-        "--end_date", type=str, default=None, help="End date in YYYY-MM-DD format"
+        "--end_date",
+        type=str,
+        default=None,
+        help="End date in YYYY-MM-DD format",
     )
     parser.add_argument(
         "--day_step", type=int, default=1, help="Number of days per chunk"
     )
+    parser.add_argument("--max_workers", type=int, default=2, help="Number of workers")
     args = parser.parse_args()
 
     run(args.court_code, args.start_date, args.end_date, args.day_step)
