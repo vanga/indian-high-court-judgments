@@ -133,12 +133,13 @@ class CourtDateTask:
     """A task representing a court and date range to process"""
 
     def __init__(self, court_code, from_date, to_date):
+        self.id = str(uuid.uuid4())
         self.court_code = court_code
         self.from_date = from_date
         self.to_date = to_date
 
     def __str__(self):
-        return f"CourtDateTask(court_code={self.court_code}, from_date={self.from_date}, to_date={self.to_date})"
+        return f"CourtDateTask(id={self.id}, court_code={self.court_code}, from_date={self.from_date}, to_date={self.to_date})"
 
 
 def generate_tasks(court_code=None, start_date=None, end_date=None, day_step=1):
@@ -167,7 +168,7 @@ def process_task(task):
         traceback.print_exc()
 
 
-def run(court_code=None, start_date=None, end_date=None, day_step=1):
+def run(court_code=None, start_date=None, end_date=None, day_step=1, max_workers=2):
     """
     Run the downloader with optional parameters using Python's multiprocessing
     with a generator that yields tasks on demand.
@@ -176,7 +177,7 @@ def run(court_code=None, start_date=None, end_date=None, day_step=1):
     tasks = generate_tasks(court_code, start_date, end_date, day_step)
 
     # Use ProcessPoolExecutor with map to process tasks in parallel
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         # map automatically consumes the iterator and processes tasks in parallel
         # it returns results in the same order as the input iterator
         for i, result in enumerate(executor.map(process_task, tasks)):
@@ -738,7 +739,9 @@ if __name__ == "__main__":
     parser.add_argument("--max_workers", type=int, default=2, help="Number of workers")
     args = parser.parse_args()
 
-    run(args.court_code, args.start_date, args.end_date, args.day_step)
+    run(
+        args.court_code, args.start_date, args.end_date, args.day_step, args.max_workers
+    )
 
 """
 captcha prompt while downloading pdf seems to be different from session timeout
