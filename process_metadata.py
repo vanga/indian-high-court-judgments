@@ -6,17 +6,26 @@ import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import exiftool
+import concurrent.futures
+import os
+import shutil
+
+ADD_PDF_METADATA = False
 
 src = Path("./data")
 
 
 class MetadataProcessor:
-    def __init__(self, src, batch_size=5000):
+    def __init__(self, src, batch_size=5000, output_dir="processed_data"):
         self.src = src
         self.without_rh = 0
-        self.output_path = "processed_metadata.parquet"
+        self.output_dir = Path(output_dir)
+        self.output_path = self.output_dir / "processed_metadata.parquet"
         self.record_count = 0
         self.batch_size = batch_size
+
+        # Create output directory if it doesn't exist
+        self.output_dir.mkdir(exist_ok=True)
 
         # Buffer to hold records before writing
         self.record_buffer = []
@@ -51,70 +60,62 @@ class MetadataProcessor:
         for file in self.src.glob("**/*.json"):
             yield file
 
+    def _add_pdf_metadata(self, processed, pdf_path: Path):
+        if not pdf_path.exists():
+            print(f"Skipping {file} because it has no pdf")
+            return
+        pdf_metadata = et.get_metadata(pdf_path)
+        if len(pdf_metadata) != 1:
+            print(
+                f"Error processing {file} for exif metadata, count: {len(pdf_metadata)}"
+            )
+        else:
+            pdf_metadata = pdf_metadata[0]
+            processed["size"] = pdf_metadata.get("File:FileSize", None)
+            processed["file_type"] = pdf_metadata.get("File:FileType", None)
+            processed["mime_type"] = pdf_metadata.get("File:MIMEType", None)
+            processed["pdf_version"] = pdf_metadata.get("PDF:PDFVersion", None)
+            processed["pdf_linearized"] = pdf_metadata.get("PDF:Linearized", None)
+            processed["pdf_pages"] = pdf_metadata.get("PDF:PageCount", None)
+            processed["pdf_producer"] = pdf_metadata.get("PDF:Producer", None)
+            processed["pdf_language"] = pdf_metadata.get("PDF:Language", None)
+            processed["pdf_producer"] = pdf_metadata.get("PDF:Producer", None)
+
     def process(self):
         try:
-            count = 0
-            with exiftool.ExifToolHelper() as et:
+            if ADD_PDF_METADATA:
+                with exiftool.ExifToolHelper() as et:
+                    for file in tqdm(self.get_metadata_files()):
+                        try:
+                            metadata = self.load_metadata(file)
+                            processed = self.process_metadata(metadata)
+                            if not processed:
+                                print(f"Skipping {file} because it has no raw_html")
+                                continue
+                        except Exception as e:
+                            print(f"Error processing {file}: {e}")
+                            continue
+
+                        try:
+                            pdf_path = file.with_suffix(".pdf")
+                            self._add_pdf_metadata(processed, pdf_path)
+                        except Exception as e:
+                            print(f"Error processing {file}: {e}")
+                        finally:
+                            self.add_record(processed)
+            else:
                 for file in tqdm(self.get_metadata_files()):
-                    count +=1
-                    if count > 1000000:
-                        break
                     try:
                         metadata = self.load_metadata(file)
                         processed = self.process_metadata(metadata)
-                        if not processed:
-                            print(f"Skipping {file} because it has no raw_html")
-                            continue
-                        pdf_path = file.with_suffix(".pdf")
-                        if not pdf_path.exists():
-                            print(f"Skipping {file} because it has no pdf")
-                            continue
-                        pdf_metadata = et.get_metadata(pdf_path)
-                        if len(pdf_metadata) != 1:
-                            print(
-                                f"Error processing {file} for exif metadata, count: {len(pdf_metadata)}"
-                            )
-                        else:
-                            pdf_metadata = pdf_metadata[0]
-                            processed["size"] = pdf_metadata.get("File:FileSize", None)
-                            processed["file_type"] = pdf_metadata.get(
-                                "File:FileType", None
-                            )
-                            processed["mime_type"] = pdf_metadata.get(
-                                "File:MIMEType", None
-                            )
-                            processed["pdf_version"] = pdf_metadata.get(
-                                "PDF:PDFVersion", None
-                            )
-                            processed["pdf_linearized"] = pdf_metadata.get(
-                                "PDF:Linearized", None
-                            )
-                            processed["pdf_pages"] = pdf_metadata.get(
-                                "PDF:PageCount", None
-                            )
-                            processed["pdf_producer"] = pdf_metadata.get(
-                                "PDF:Producer", None
-                            )
-                            processed["pdf_language"] = pdf_metadata.get(
-                                "PDF:Language", None
-                            )
-                            processed["pdf_producer"] = pdf_metadata.get(
-                                "PDF:Producer", None
-                            )
-
                         self.add_record(processed)
                     except Exception as e:
                         print(f"Error processing {file}: {e}")
-                        continue
         except Exception as e:
             print(f"Error processing {file}: {e}")
-
-            # Write any remaining records in the buffer
+        finally:
             if self.record_buffer:
                 self.write_batch()
-
-        finally:
-            # Close the writer if it exists
             if hasattr(self, "writer") and self.writer is not None:
                 self.writer.close()
                 print(f"Wrote {self.record_count} records to {self.output_path}")
@@ -286,9 +287,93 @@ class MetadataProcessor:
         with open(file) as f:
             return json.load(f)
 
+    def process_court_dir(self, court_dir):
+        """Process a single court directory and return the output file path."""
+        court_name = court_dir.name
+        output_file = self.output_dir / f"{court_name}_metadata.parquet"
 
-# You can adjust the batch size based on your data characteristics and memory availability
-processor = MetadataProcessor(src, batch_size=1000)
-processor.process()
+        processor = MetadataProcessor(court_dir, batch_size=self.batch_size)
+        processor.output_path = output_file
+        processor.process()
 
-print(f"Records without raw_html: {processor.without_rh}")
+        return output_file, processor.record_count, processor.without_rh
+
+    def process_parallel(self, max_workers=None):
+        """Process all court directories in parallel."""
+        court_dirs = [d for d in self.src.glob("court/cnrorders/*") if d.is_dir()]
+
+        if not court_dirs:
+            print("No court directories found!")
+            return
+
+        print(f"Found {len(court_dirs)} court directories to process")
+
+        total_records = 0
+        total_without_rh = 0
+        output_files = []
+
+        with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers
+        ) as executor:
+            futures = {
+                executor.submit(self.process_court_dir, court_dir): court_dir.name
+                for court_dir in court_dirs
+            }
+
+            for future in tqdm(
+                concurrent.futures.as_completed(futures),
+                total=len(futures),
+                desc="Processing courts",
+            ):
+                court_name = futures[future]
+                try:
+                    output_file, record_count, without_rh = future.result()
+                    output_files.append(output_file)
+                    total_records += record_count
+                    total_without_rh += without_rh
+                    print(
+                        f"Completed {court_name}: {record_count} records, {without_rh} without raw_html"
+                    )
+                except Exception as e:
+                    print(f"Error processing {court_name}: {e}")
+
+        self.combine_parquet_files(output_files)
+
+        print(f"Total records processed: {total_records}")
+        print(f"Total records without raw_html: {total_without_rh}")
+
+    def combine_parquet_files(self, file_paths):
+        """Combine multiple parquet files into a single file."""
+        if not file_paths:
+            print("No files to combine")
+            return
+
+        print(f"Combining {len(file_paths)} parquet files...")
+
+        # Read and combine all parquet files
+        dfs = []
+        for file_path in file_paths:
+            if file_path.exists() and file_path.stat().st_size > 0:
+                try:
+                    df = pd.read_parquet(file_path)
+                    dfs.append(df)
+                except Exception as e:
+                    print(f"Error reading {file_path}: {e}")
+
+        if not dfs:
+            print("No valid parquet files to combine")
+            return
+
+        combined_df = pd.concat(dfs, ignore_index=True)
+
+        combined_df.to_parquet(self.output_path, compression="snappy")
+
+        print(
+            f"Combined {len(dfs)} files with {len(combined_df)} total records to {self.output_path}"
+        )
+
+
+if __name__ == "__main__":
+    processor = MetadataProcessor(src, batch_size=1000, output_dir="processed_data")
+
+    processor.process_parallel(max_workers=32)

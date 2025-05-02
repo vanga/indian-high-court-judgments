@@ -1,3 +1,4 @@
+from typing import Optional, Generator
 from tqdm import tqdm
 import argparse
 from datetime import datetime, timedelta
@@ -36,7 +37,7 @@ payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=100&mDa
 
 pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HBHC010262202017_1_2047-06-29.pdf#page=&search=+&citation_year=&fcourt_type=2&file_type=undefined&nc_display=undefined&ajax_req=true&app_token=c64944b84c687f501f9692e239e2a0ab007eabab497697f359a2f62e4fcd3d10"
 
-page_size = 1000
+page_size = 5000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
 
@@ -142,13 +143,25 @@ class CourtDateTask:
         return f"CourtDateTask(id={self.id}, court_code={self.court_code}, from_date={self.from_date}, to_date={self.to_date})"
 
 
-def generate_tasks(court_code=None, start_date=None, end_date=None, day_step=1):
+def generate_tasks(
+    court_codes: Optional[list[str]] = None,
+    start_date: Optional[str] = None,
+    end_date: Optional[str] = None,
+    day_step: int = 1,
+) -> Generator[CourtDateTask, None, None]:
     """Generate tasks for processing courts and date ranges as a generator"""
-    court_codes = get_court_codes()
-    if court_code:
-        court_codes = {court_code: court_codes[court_code]}
+    all_court_codes = get_court_codes()
+    if not court_codes:
+        court_codes = all_court_codes
+    else:
+        court_codes = {
+            court_code: all_court_codes[court_code] for court_code in court_codes
+        }
 
-    for code in court_codes:
+    # Get the court codes in reverse order
+    reversed_court_codes = dict(reversed(list(court_codes.items())))
+
+    for code in reversed_court_codes:
         for from_date, to_date in get_date_ranges_to_process(
             code, start_date, end_date, day_step
         ):
@@ -158,8 +171,8 @@ def generate_tasks(court_code=None, start_date=None, end_date=None, day_step=1):
 def process_task(task):
     """Process a single court-date task"""
     try:
-        downloader = Downloader(task.court_code)
-        downloader.process_date_range(task.from_date, task.to_date)
+        downloader = Downloader(task)
+        downloader.download()
     except Exception as e:
         court_codes = get_court_codes()
         logger.error(
@@ -168,13 +181,13 @@ def process_task(task):
         traceback.print_exc()
 
 
-def run(court_code=None, start_date=None, end_date=None, day_step=1, max_workers=2):
+def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_workers=2):
     """
     Run the downloader with optional parameters using Python's multiprocessing
     with a generator that yields tasks on demand.
     """
     # Create a task generator
-    tasks = generate_tasks(court_code, start_date, end_date, day_step)
+    tasks = generate_tasks(court_codes, start_date, end_date, day_step)
 
     # Use ProcessPoolExecutor with map to process tasks in parallel
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -188,7 +201,8 @@ def run(court_code=None, start_date=None, end_date=None, day_step=1, max_workers
 
 
 class Downloader:
-    def __init__(self, court_code):
+    def __init__(self, task: CourtDateTask):
+        self.task = task
         self.root_url = "https://judgments.ecourts.gov.in"
         self.search_url = f"{self.root_url}/pdfsearch/?p=pdf_search/home/"
         self.captcha_url = f"{self.root_url}/pdfsearch/vendor/securimage/securimage_show.php"  # not lint skip/
@@ -196,7 +210,7 @@ class Downloader:
         self.pdf_link_url = f"{self.root_url}/pdfsearch/?p=pdf_search/openpdfcaptcha"
         self.pdf_link_url_wo_captcha = f"{root_url}/pdfsearch/?p=pdf_search/openpdf"
 
-        self.court_code = court_code
+        self.court_code = task.court_code
         self.tracking_data = get_tracking_data()
         self.court_codes = get_court_codes()
         self.court_name = self.court_codes[self.court_code]
@@ -227,24 +241,22 @@ class Downloader:
         )
         if results_exist:
             no_of_results = len(res_dict["reportrow"]["aaData"])
-            logger.info(
-                f"Found {no_of_results} results for {self.court_code}, {self.court_name}"
-            )
+            logger.info(f"Found {no_of_results} results for task: {self.task}")
         return results_exist
 
     def _prepare_next_iteration(self, search_payload):
         search_payload["sEcho"] += 1
         search_payload["iDisplayStart"] += page_size
-        logger.info(f"Next iteration: {search_payload['iDisplayStart']}")
+        logger.info(
+            f"Next iteration: {search_payload['iDisplayStart']}, task: {self.task.id}"
+        )
         return search_payload
 
     def process_court(self):
         last_date = self.court_tracking.get("last_date", START_DATE)
         from_date, to_date = get_new_date_range(last_date)
         if from_date is None:
-            logger.info(
-                f"No more data to download for: {self.court_code} {self.court_name}"
-            )
+            logger.info(f"No more data to download for: task: {self.task.id}")
             return
         search_payload = self.default_search_payload()
         search_payload["from_date"] = from_date
@@ -279,12 +291,14 @@ class Downloader:
                             if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                 # after 25 downloads, need to solve captcha for every pdf link request. Starting with a fresh session would be faster so that we get another 25 downloads without captcha
                                 logger.info(
-                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session"
+                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task.id}"
                                 )
                                 break
 
                         except Exception as e:
-                            logger.error(f"Error processing row {row}: {e}")
+                            logger.error(
+                                f"Error processing row {row}: {e}, task: {self.task}"
+                            )
                             traceback.print_exc()
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                         pdfs_downloaded = 0
@@ -300,9 +314,7 @@ class Downloader:
                     save_court_tracking_date(self.court_code, self.court_tracking)
                     from_date, to_date = get_new_date_range(to_date)
                     if from_date is None:
-                        logger.info(
-                            f"No more data to download for: {self.court_code} {self.court_name}"
-                        )
+                        logger.info(f"No more data to download for: task: {self.task}")
                         results_available = False
                     else:
                         search_payload["from_date"] = from_date
@@ -310,14 +322,10 @@ class Downloader:
                         search_payload["sEcho"] = 1
                         search_payload["iDisplayStart"] = 0
                         search_payload["iDisplayLength"] = page_size
-                        logger.info(
-                            f"Downloading data for: {self.court_code}, court: {self.court_name}, from: {from_date},to: {to_date}"
-                        )
+                        logger.info(f"Downloading data for task: {self.task}")
 
             except Exception as e:
-                logger.error(
-                    f"Error processing court {self.court_code} {self.court_name}: {e}"
-                )
+                logger.error(f"Error processing task: {self.task}, Error: {e}")
                 traceback.print_exc()
                 self.court_tracking["failed_dates"] = self.court_tracking.get(
                     "failed_dates", []
@@ -338,7 +346,9 @@ class Downloader:
         # case_details = html_element.xpath("./strong//text()")
         # check if button with onclick is present
         if not (soup.button and "onclick" in soup.button.attrs):
-            logger.info("No button found, likely multi language judgment")
+            logger.info(
+                f"No button found, likely multi language judgment, task: {self.task}"
+            )
             with open("html-parse-failures.txt", "a") as f:
                 f.write(html + "\n")
             # TODO: requires special parsing
@@ -378,7 +388,9 @@ class Downloader:
             "POST", self.pdf_link_url, pdf_link_payload
         )
         if "outputfile" not in pdf_link_response.json():
-            logger.error(f"Error downloading pdf {pdf_link_response.json()}")
+            logger.error(
+                f"Error downloading pdf, task: {self.task}, Error: {pdf_link_response.json()}"
+            )
             return False
         pdf_download_link = pdf_link_response.json()["outputfile"]
 
@@ -394,14 +406,20 @@ class Downloader:
         # number of response butes
         no_of_bytes = len(pdf_response.content)
         if no_of_bytes == 0:
-            logger.error(f"Empty pdf {pdf_output_path}")
+            logger.error(
+                f"Empty pdf, task: {self.task}, output path: {pdf_output_path}"
+            )
             return False
         if no_of_bytes == 315:
-            logger.error(f"404 pdf response {pdf_output_path}")
+            logger.error(
+                f"404 pdf response, task: {self.task}, output path: {pdf_output_path}"
+            )
             return False
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
-        logger.debug(f"Downloaded {pdf_output_path}, size: {no_of_bytes}")
+        logger.debug(
+            f"Downloaded, task: {self.task}, output path: {pdf_output_path}, size: {no_of_bytes}"
+        )
         return True
 
     def update_headers_with_new_session(self, headers):
@@ -452,8 +470,8 @@ class Downloader:
         return False
 
     def solve_captcha(self, retries=0, captcha_url=None):
-        logger.debug(f"Solving captcha, retries: {retries}")
-        if retries > 5:
+        logger.debug(f"Solving captcha, retries: {retries}, task: {self.task.id}")
+        if retries > 10:
             raise ValueError("Failed to solve captcha")
         if captcha_url is None:
             captcha_url = self.captcha_url
@@ -470,9 +488,10 @@ class Downloader:
             f.write(captcha_response.content)
         result = reader.readtext(str(captcha_filename))
         if not result:
-            logger.warning("No result from captcha")
+            logger.warning(
+                f"No result from captcha, task: {self.task.id}, retries: {retries}"
+            )
             return self.solve_captcha(retries + 1, captcha_url)
-
         captch_text = result[0][1].strip()
         if self.is_match_expression(captch_text):
             try:
@@ -480,7 +499,9 @@ class Downloader:
                 captcha_filename.unlink()
                 return answer
             except Exception as e:
-                logger.error(f"Error solving math expression {captch_text}: {e}")
+                logger.error(
+                    f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captch_text}, Error: {e}"
+                )
                 # move the captcha image to a new folder for debugging
                 new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
                 captcha_filename.rename(Path(f"{captcha_failures_dir}/{new_filename}"))
@@ -504,10 +525,12 @@ class Downloader:
         )
         res_json = pdf_link_response.json()
         if "message" in res_json and res_json["message"] == "Captcha not solved":
-            logger.warning(f"Captcha not solved {pdf_link_response.json()}")
+            logger.warning(
+                f"Captcha not solved, task: {self.task.id}, retries: {retries}, Error: {pdf_link_response.json()}"
+            )
             if retries == 2:
                 return res_json
-            logger.info("Retrying pdf captch solve")
+            logger.info(f"Retrying pdf captch solve, task: {self.task.id}")
             return self.solve_pdf_download_captcha(
                 response, pdf_link_payload, retries + 1
             )
@@ -638,6 +661,7 @@ class Downloader:
         headers = {
             "Accept": "application/json, text/javascript, */*; q=0.01",
             "Accept-Language": "en-US,en;q=0.9,pt;q=0.8",
+            "Accept-Encoding": "gzip, deflate, br",
             "Connection": "keep-alive",
             "Content-Type": "application/x-www-form-urlencoded; charset=UTF-8",
             "Cookie": self.get_cookie(),
@@ -655,26 +679,22 @@ class Downloader:
         }
         return headers
 
-    def process_date_range(self, from_date, to_date):
+    def download(self):
         """Process a specific date range for this court"""
-        if from_date is None or to_date is None:
-            logger.info(
-                f"No more data to download for: {self.court_code} {self.court_name}"
-            )
+        if self.task.from_date is None or self.task.to_date is None:
+            logger.info(f"No more data to download for: task: {self.task}")
             return
 
         search_payload = self.default_search_payload()
-        search_payload["from_date"] = from_date
-        search_payload["to_date"] = to_date
+        search_payload["from_date"] = self.task.from_date
+        search_payload["to_date"] = self.task.to_date
         self.init_user_session()
         search_payload["state_code"] = self.court_code
         search_payload["app_token"] = self.app_token
         results_available = True
         pdfs_downloaded = 0
 
-        logger.info(
-            f"Downloading data for: {self.court_code}, court: {self.court_name}, from: {from_date}, to: {to_date}"
-        )
+        logger.info(f"Downloading data for: task: {self.task}")
 
         while results_available:
             try:
@@ -691,11 +711,13 @@ class Downloader:
                             if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                 # after 25 downloads, need to solve captcha for every pdf link request
                                 logger.info(
-                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session"
+                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task}"
                                 )
                                 break
                         except Exception as e:
-                            logger.error(f"Error processing row {row}: {e}")
+                            logger.error(
+                                f"Error processing row {row}: {e}, task: {self.task}"
+                            )
                             traceback.print_exc()
 
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
@@ -711,16 +733,15 @@ class Downloader:
                     results_available = False
 
             except Exception as e:
-                logger.error(
-                    f"Error processing court {self.court_code} {self.court_name} for dates {from_date} to {to_date}: {e}"
-                )
+                logger.error(f"Error processing task: {self.task}, {e}")
                 traceback.print_exc()
-                results_available = False
+                # results_available = False
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--court_code", type=str, default=None)
+    parser.add_argument("--court_codes", type=str, default=[])
     parser.add_argument(
         "--start_date",
         type=str,
@@ -739,9 +760,20 @@ if __name__ == "__main__":
     parser.add_argument("--max_workers", type=int, default=2, help="Number of workers")
     args = parser.parse_args()
 
-    run(
-        args.court_code, args.start_date, args.end_date, args.day_step, args.max_workers
-    )
+    if args.court_codes:
+        assert (
+            args.court_code is None
+        ), "court_code and court_codes cannot both be provided"
+        court_codes = args.court_codes.split(",")
+    elif args.court_code:
+        court_codes = [args.court_code]
+    else:
+        court_codes = get_court_codes()
+
+    for court_code in court_codes:
+        run(
+            court_codes, args.start_date, args.end_date, args.day_step, args.max_workers
+        )
 
 """
 captcha prompt while downloading pdf seems to be different from session timeout
