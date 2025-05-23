@@ -38,6 +38,7 @@ payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=100&mDa
 pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HBHC010262202017_1_2047-06-29.pdf#page=&search=+&citation_year=&fcourt_type=2&file_type=undefined&nc_display=undefined&ajax_req=true&app_token=c64944b84c687f501f9692e239e2a0ab007eabab497697f359a2f62e4fcd3d10"
 
 page_size = 5000
+MATH_CAPTCHA = False
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
 
@@ -219,9 +220,7 @@ class Downloader:
         self.ecourts_token_cookie_name = "JSESSION"
         self.session_id = None
         self.ecourts_token = None
-        self.app_token = (
-            "490a7e9b99e4553980213a8b86b3235abc51612b038dbdb1f9aa706b633bbd6c"
-        )
+        self.app_token = "490a7e9b99e4553980213a8b86b3235abc51612b038dbdb1f9aa706b633bbd6c"  # not lint skip/
 
     def download(self):
         try:
@@ -462,7 +461,7 @@ class Downloader:
         else:
             raise ValueError(f"Unsupported mathematical expression: {expression}")
 
-    def is_match_expression(self, expression):
+    def is_math_expression(self, expression):
         separators = ["+", "-", "*", "/", "÷", "x", "×", "X"]
         for separator in separators:
             if separator in expression:
@@ -493,23 +492,34 @@ class Downloader:
             )
             return self.solve_captcha(retries + 1, captcha_url)
         captch_text = result[0][1].strip()
-        if self.is_match_expression(captch_text):
-            try:
-                answer = self.solve_math_expression(captch_text)
-                captcha_filename.unlink()
-                return answer
-            except Exception as e:
-                logger.error(
-                    f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captch_text}, Error: {e}"
-                )
-                # move the captcha image to a new folder for debugging
-                new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
-                captcha_filename.rename(Path(f"{captcha_failures_dir}/{new_filename}"))
+
+        if MATH_CAPTCHA:
+            if self.is_math_expression(captch_text):
+                try:
+                    answer = self.solve_math_expression(captch_text)
+                    captcha_filename.unlink()
+                    return answer
+                except Exception as e:
+                    logger.error(
+                        f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captch_text}, Error: {e}"
+                    )
+                    # move the captcha image to a new folder for debugging
+                    new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
+                    captcha_filename.rename(
+                        Path(f"{captcha_failures_dir}/{new_filename}")
+                    )
+                    return self.solve_captcha(retries + 1, captcha_url)
+            else:
+                # If not a math expression, try again
+                captcha_filename.unlink()  # Clean up the file
                 return self.solve_captcha(retries + 1, captcha_url)
         else:
-            # If not a math expression, try again
-            captcha_filename.unlink()  # Clean up the file
-            return self.solve_captcha(retries + 1, captcha_url)
+            captcha_text = "".join([c for c in captch_text if c.isnumeric()])
+            if len(captcha_text) != 6:
+                if retries > 10:
+                    raise Exception("Captcha not solved")
+                return self.solve_captcha(retries + 1)
+            return captcha_text
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
         html_str = response["filename"]

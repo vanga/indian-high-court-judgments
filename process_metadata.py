@@ -16,16 +16,12 @@ src = Path("./data")
 
 
 class MetadataProcessor:
-    def __init__(self, src, batch_size=5000, output_dir="processed_data"):
+    def __init__(self, src, batch_size=5000, output_path="processed_metadata.parquet"):
         self.src = src
         self.without_rh = 0
-        self.output_dir = Path(output_dir)
-        self.output_path = self.output_dir / "processed_metadata.parquet"
+        self.output_path = output_path
         self.record_count = 0
         self.batch_size = batch_size
-
-        # Create output directory if it doesn't exist
-        self.output_dir.mkdir(exist_ok=True)
 
         # Buffer to hold records before writing
         self.record_buffer = []
@@ -46,15 +42,22 @@ class MetadataProcessor:
             "decision_date",
             "disposal_nature",
             "court",
-            "size",
-            "file_type",
-            "mime_type",
-            "pdf_version",
-            "pdf_linearized",
-            "pdf_pages",
-            "pdf_producer",
-            "pdf_language",
+            "raw_html",
         ]
+
+        if ADD_PDF_METADATA:
+            self.all_fields.extend(
+                [
+                    "size",
+                    "file_type",
+                    "mime_type",
+                    "pdf_version",
+                    "pdf_linearized",
+                    "pdf_pages",
+                    "pdf_producer",
+                    "pdf_language",
+                ]
+            )
 
     def get_metadata_files(self):
         for file in self.src.glob("**/*.json"):
@@ -62,12 +65,12 @@ class MetadataProcessor:
 
     def _add_pdf_metadata(self, processed, pdf_path: Path):
         if not pdf_path.exists():
-            print(f"Skipping {file} because it has no pdf")
+            print(f"Skipping {pdf_path} because it has no pdf")
             return
         pdf_metadata = et.get_metadata(pdf_path)
         if len(pdf_metadata) != 1:
             print(
-                f"Error processing {file} for exif metadata, count: {len(pdf_metadata)}"
+                f"Error processing {pdf_path} for exif metadata, count: {len(pdf_metadata)}"
             )
         else:
             pdf_metadata = pdf_metadata[0]
@@ -96,8 +99,12 @@ class MetadataProcessor:
                             print(f"Error processing {file}: {e}")
                             continue
 
+                        pdf_path = file.with_suffix(".pdf")
+                        if not pdf_path.exists():
+                            processed["pdf_exists"] = False
+                        else:
+                            processed["pdf_exists"] = True
                         try:
-                            pdf_path = file.with_suffix(".pdf")
                             self._add_pdf_metadata(processed, pdf_path)
                         except Exception as e:
                             print(f"Error processing {file}: {e}")
@@ -147,6 +154,7 @@ class MetadataProcessor:
             "description": description,
             "judge": judge_name,
             "pdf_link": metadata["pdf_link"],
+            "raw_html": metadata["raw_html"],
         }
 
         # Wrap XPath queries in try-except to handle missing elements
