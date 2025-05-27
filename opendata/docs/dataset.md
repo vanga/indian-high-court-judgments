@@ -14,7 +14,7 @@ This dataset contains judgements from the Indian High Courts, downloaded from ec
  * Once every month
 
 ### Structure of the data in the bucket
-    * pdfs/court=xyz/month=2025-01/abc.pdf
-    * json/court=xyz/month=2025-01/abc.json
-    * parquet/court=xyz/month=2025-01/consolidated.parquet
-    * archive/court=xyz/month=2025-01.tar
+    * data/pdf/year=2025/court=xyz/bench=xyz/judgment1.pdf,judgment2.pdf
+    * metadata/parquet/year=2025/court=xyz/bench=xyz/metadata.parquet
+    * metadata/tar/year=2025/court=xyz/bench=xyz/json-metadata.tar
+    * data/tar/year=2025/court=xyz/bench=xyz/pdfs.tar
