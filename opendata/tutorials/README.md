@@ -1,3 +1,5 @@
+Refer to the [athena doc](../ATHENA.md) for more information on how to query the metadata.
+
 # High Court Judgments PDF Processor
 
 This script processes tar archives containing PDF files of Indian High Court judgments stored in an AWS S3 bucket. It extracts text from these PDFs, converts them into a structured text format (JSON-like), compresses them into a `tar.gz` archive, and uploads the results to a specified output S3 bucket.
@@ -42,7 +44,7 @@ data/text-tars/year=<YEAR>/court=<COURT>/bench=<BENCH>/texts.tar.gz
 
 ## ⚙️ Requirements
 
-- Python 3.9
+- Python 3.12
 - AWS credentials configured for `boto3` to access S3
 - Required Python packages:
   - `boto3`
