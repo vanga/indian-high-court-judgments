@@ -252,7 +252,7 @@ class MetadataProcessor:
             "pdf_link": "string",
             "cnr": "string",
             "date_of_registration": "string",  # some dates are malformed
-            "decision_date": "datetime64[ns]",
+            "decision_date": "date32[day][pyarrow]",
             "disposal_nature": "string",
             "court": "string",
             "size": "Int64",  # Nullable integer
@@ -271,7 +271,9 @@ class MetadataProcessor:
                 df[col] = df[col].astype(dtype)
 
         # Convert to PyArrow Table
-        table = pa.Table.from_pandas(df)
+        table = pa.Table.from_pandas(
+            df,
+        )
 
         # Initialize writer if needed
         if self.writer is None:

@@ -15,7 +15,7 @@ CREATE DATABASE court_cases;
 ### Create a Table for Parquet Files with Partitioning
 
 ```sql
-CREATE EXTERNAL TABLE court_cases.judgments ( court_code STRING, title STRING, description STRING, judge STRING, pdf_link STRING, cnr STRING, date_of_registration STRING, decision_date TIMESTAMP, disposal_nature STRING, court_name STRING
+CREATE EXTERNAL TABLE court_cases.judgments ( court_code STRING, title STRING, description STRING, judge STRING, pdf_link STRING, cnr STRING, date_of_registration STRING, decision_date DATE, disposal_nature STRING, court_name STRING
 )
 PARTITIONED BY ( year STRING, court STRING)
 STORED AS PARQUET
