@@ -50,7 +50,7 @@ data/text-tars/year=<YEAR>/court=<COURT>/bench=<BENCH>/texts.tar.gz
 
 Install dependencies:
 ```bash
-pip install boto3 PyPDF2
+pip install -r requirements.txt
 ```
 
 ---
@@ -118,8 +118,8 @@ Ensure the AWS credentials used to run this script have the following S3 permiss
     "s3:PutObject"
   ],
   "Resource": [
-    "arn:aws:s3:::indian-high-court-judgments/*",
-    "arn:aws:s3:::<OUTPUT_BUCKET_NAME>/*"
+    "arn:aws:s3:::<OUTPUT_BUCKET_NAME>/*",
+    "arn:aws:s3:::<OUTPUT_BUCKET_NAME>"
   ]
 }
 ```

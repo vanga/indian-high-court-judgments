@@ -15,10 +15,9 @@ CREATE DATABASE court_cases;
 ### Create a Table for Parquet Files with Partitioning
 
 ```sql
-CREATE EXTERNAL TABLE court_cases.judgments ( court_code STRING, title STRING, description STRING, judge STRING, pdf_link STRING, cnr STRING, date_of_registration STRING, decision_date STRING, disposal_nature STRING, court_name STRING
+CREATE EXTERNAL TABLE court_cases.judgments ( court_code STRING, title STRING, description STRING, judge STRING, pdf_link STRING, cnr STRING, date_of_registration STRING, decision_date TIMESTAMP, disposal_nature STRING, court_name STRING
 )
-PARTITIONED BY ( year STRING, court STRING, bench STRING
-)
+PARTITIONED BY ( year STRING, court STRING)
 STORED AS PARQUET
 LOCATION 's3://indian-high-court-judgments/metadata/parquet/'
 TBLPROPERTIES ( 'has_encrypted_data'='false',
@@ -27,9 +26,7 @@ TBLPROPERTIES ( 'has_encrypted_data'='false',
   'projection.year.range'='1950,2025',
   'projection.court.type'='enum',
   'projection.court.values'='9_13,27_1,19_16,18_6,36_29,28_2,22_18,7_26,24_17,2_5,1_12,20_7,29_3,32_4,23_23,14_25,17_21,21_11,3_22,8_9,11_24,16_20,5_15,33_10,10_8',
-  'projection.bench.type'='enum',
-  'projection.bench.values'='cisdb_16012018,cishclko,newos_spl,hcbgoa,testcase,hcaurdb,newos,newas,calcutta_appellate_side,calcutta_circuit_bench_at_jalpaiguri,calcutta_original_side,calcutta_circuit_bench_at_port_blair,nlghccis,azghccis,arghccis,asghccis,taphc,aphc,cghccisdb,dhcdb,gujarathc,cmis,jammuhc,kashmirhc,jhar_pg,karhcdharwad,karnataka_bng_old,karhckalaburagi,highcourtofkerala,mphc_db_ind,mphc_db_jbp,mphc_db_gwl,manipurhc_pg,meghalaya,cisnc,phhc,rhcjodh240618,jaipur,sikkimhc_pg,thcnc,ukhcucis_pg,hc_cis_mas,mdubench,patnahcucisdb94',
-  'storage.location.template'='s3://indian-high-court-judgments/metadata/parquet/year=${year}/court=${court}/bench=${bench}/'
+  'storage.location.template'='s3://indian-high-court-judgments/metadata/parquet/year=${year}/court=${court}/'
 )
 ```
 
@@ -42,19 +39,16 @@ SELECT
   court_code,
   title,
   judge,
-  pdf_link,
   date_of_registration,
   decision_date,
   court_name,
   year,
-  court,
-  bench
+  court
 FROM 
   court_cases.judgments
 WHERE 
   year = '2025'
   AND court = '32_4'
-  AND bench = 'highcourtofkerala'
 LIMIT 10;
 ```
 
