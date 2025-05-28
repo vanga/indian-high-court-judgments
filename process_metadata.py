@@ -183,7 +183,7 @@ class MetadataProcessor:
                     './/span[contains(text(), "Decision Date")]/following-sibling::font/text()'
                 )[0].strip()
             except (IndexError, KeyError):
-                case_details["decision_date"] = ""
+                case_details["decision_date"] = None
 
             try:
                 case_details["disposal_nature"] = case_details_elements.xpath(
@@ -207,7 +207,7 @@ class MetadataProcessor:
             # If we can't find the case details element, set all fields to empty strings
             case_details["cnr"] = ""
             case_details["date_of_registration"] = ""
-            case_details["decision_date"] = ""
+            case_details["decision_date"] = None
             case_details["disposal_nature"] = ""
             case_details["court"] = ""
 
@@ -251,8 +251,8 @@ class MetadataProcessor:
             "judge": "string",
             "pdf_link": "string",
             "cnr": "string",
-            "date_of_registration": "string",
-            "decision_date": "string",
+            "date_of_registration": "string",  # some dates are malformed
+            "decision_date": "datetime64[ns]",
             "disposal_nature": "string",
             "court": "string",
             "size": "Int64",  # Nullable integer
