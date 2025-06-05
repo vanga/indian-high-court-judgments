@@ -159,10 +159,7 @@ def generate_tasks(
             court_code: all_court_codes[court_code] for court_code in court_codes
         }
 
-    # Get the court codes in reverse order
-    reversed_court_codes = dict(reversed(list(court_codes.items())))
-
-    for code in reversed_court_codes:
+    for code in court_codes:
         for from_date, to_date in get_date_ranges_to_process(
             code, start_date, end_date, day_step
         ):
