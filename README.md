@@ -1,4 +1,7 @@
-* Join [discord server](https://discord.gg/cAXJTub5) if you want to collaborate on this repo or have any questions. Reach out to `vangap` on discord if you need access to the PDF judgments as bulk download.
+* All the data is available for download [here](https://registry.opendata.aws/indian-high-court-judgments/)
+* The data is licensed under [Creative Commons Attribution 4.0 (CC-BY-4.0)](https://creativecommons.org/licenses/by/4.0/), which means you are free to use, share, and adapt the data as long as you provide appropriate attribution.
+* AWS sponsors the storage and data transfer costs of the data.
+* Join [discord server](https://discord.gg/mQhghxCRJU) if you want to collaborate on this repo or have any questions.
 * **Be responsible, considerate, and think about the maintainers of the ecourts website. Avoid scraping with high concurrency.**
 * **track.json** is broken and not working as expected.
 
@@ -162,4 +165,3 @@ This script:
 - **CAPTCHA Failures**: If the script encounters issues with CAPTCHA solving, failed CAPTCHAs are saved in the `./captcha-failures` directory for debugging.
 - **Session Expiry**: The script automatically handles session expiry by refreshing tokens and cookies.
 - **Download Errors**: Failed downloads are tracked and can be retried in subsequent runs.
-
