@@ -29,15 +29,15 @@ reader = easyocr.Reader(["en"])
 
 root_url = "https://scr.sci.gov.in"
 output_dir = Path("./sc_data")
-START_DATE = "2024-01-10"
+START_DATE = "2020-01-10"
 
 # Updated payload for Supreme Court based on curl request
-payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=10&mDataProp_0=0&sSearch_0=&bRegex_0=false&bSearchable_0=true&bSortable_0=true&mDataProp_1=1&sSearch_1=&bRegex_1=false&bSearchable_1=true&bSortable_1=true&sSearch=&bRegex=false&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1&search_txt1=&search_txt2=&search_txt3=&search_txt4=&search_txt5=&pet_res=&state_code=&state_code_li=&dist_code=null&case_no=&case_year=&from_date=&to_date=&judge_name=&reg_year=&fulltext_case_type=&act=&judge_txt=&act_txt=&section_txt=&judge_val=&act_val=&year_val=&judge_arr=&flag=&disp_nature=&search_opt=PHRASE&date_val=ALL&fcourt_type=3&citation_yr=&citation_vol=&citation_supl=&citation_page=&case_no1=&case_year1=&pet_res1=&fulltext_case_type1=&citation_keyword=&sel_lang=&proximity=&neu_cit_year=&neu_no=&ncn=&bool_opt=&sort_flg=undefined&ajax_req=true"
+DEFAULT_SEARCH_PAYLOAD = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=10&mDataProp_0=0&sSearch_0=&bRegex_0=false&bSearchable_0=true&bSortable_0=true&mDataProp_1=1&sSearch_1=&bRegex_1=false&bSearchable_1=true&bSortable_1=true&sSearch=&bRegex=false&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1&search_txt1=&search_txt2=&search_txt3=&search_txt4=&search_txt5=&pet_res=&state_code=&state_code_li=&dist_code=null&case_no=&case_year=&from_date=&to_date=&judge_name=&reg_year=&fulltext_case_type=&act=&judge_txt=&act_txt=&section_txt=&judge_val=&act_val=&year_val=&judge_arr=&flag=&disp_nature=&search_opt=PHRASE&date_val=ALL&fcourt_type=3&citation_yr=&citation_vol=&citation_supl=&citation_page=&case_no1=&case_year1=&pet_res1=&fulltext_case_type1=&citation_keyword=&sel_lang=&proximity=&neu_cit_year=&neu_no=&ncn=&bool_opt=&sort_flg=&ajax_req=true&app_token="
 
 # Updated PDF payload for Supreme Court
 pdf_link_payload = "val=0&lang_flg=undefined&path=2025_5_275_330&citation_year=2025&fcourt_type=3&nc_display=2025INSC555&ajax_req=true"
 
-page_size = 5000
+PAGE_SIZE = 5000
 MATH_CAPTCHA = False
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
@@ -195,6 +195,7 @@ class Downloader:
 
         self.tracking_data = get_tracking_data()
         self.session_cookie_name = "SCR_SESSID"
+        self.alt_session_cookie_name = "PHPSESSID"
         self.ecourts_token_cookie_name = "JSESSION"
         self.session_id = None
         self.ecourts_token = None
@@ -212,7 +213,7 @@ class Downloader:
 
     def _prepare_next_iteration(self, search_payload):
         search_payload["sEcho"] += 1
-        search_payload["iDisplayStart"] += page_size
+        search_payload["iDisplayStart"] += PAGE_SIZE
         logger.info(
             f"Next iteration: {search_payload['iDisplayStart']}, task: {self.task.id}"
         )
@@ -222,59 +223,44 @@ class Downloader:
         html = row[1]
         soup = BeautifulSoup(html, "html.parser")
 
-        # First check for direct PDF button (single language)
-        if soup.button and "onclick" in soup.button.attrs:
-            pdf_info = self.extract_pdf_fragment(soup.button["onclick"])
-            if pdf_info:
-                return self._process_pdf_download(pdf_info, row_pos, html)
+        # First check for direct PDF button (single language) with role="link"
+        button = soup.find("button", {"role": "link"})
+        assert (
+            button and "onclick" in button.attrs
+        ), f"No PDF button found, task: {self.task}"
+        pdf_info = self.extract_pdf_fragment_from_button(button["onclick"])
+        assert pdf_info, f"No PDF info found, task: {self.task}"
 
         # Check for multi-language selector
         select_element = soup.find("select", {"name": "language"})
-        if select_element and "onchange" in select_element.attrs:
-            pdf_info = self.extract_pdf_fragment_from_select(select_element["onchange"])
-            if pdf_info:
-                return self._process_pdf_download(
-                    pdf_info, row_pos, html, is_multilang=True
-                )
+        language_codes = [
+            option.get("value") for option in select_element.find_all("option")
+        ]
+        pdf_info["language_codes"] = language_codes
+        pdfs_downloaded = 0
+        for lang_code in language_codes:
+            is_fresh_download = self._process_pdf_download(
+                pdf_info, row_pos, html, lang_code
+            )
+            if is_fresh_download:
+                pdfs_downloaded += 1
+        return pdfs_downloaded
 
-        # If neither button nor select found
-        logger.info(f"No PDF button or language selector found, task: {self.task}")
-        with open("html-parse-failures.txt", "a") as f:
-            f.write(html + "\n")
-        return False
-
-    def extract_pdf_fragment(self, html_attribute):
+    def extract_pdf_fragment_from_button(self, onclick_attr):
         """Extract PDF fragment from button onclick attribute"""
-        # Pattern: javascript:open_pdf('0','2008','2008_2_95_100','2008INSC111');
+        # Pattern: onclick=open_pdf('3','2009','2009_9_572_578','2009INSC834','N')
         pattern = r"javascript:open_pdf\('(.*?)','(.*?)','(.*?)','(.*?)'\)"
-        match = re.search(pattern, html_attribute)
+        match = re.search(pattern, onclick_attr)
         if match:
             val = match.group(1)
-            citation_year = match.group(2)
             path = match.group(3).split("#")[0]
+            citation_year = match.group(2)
             nc_display = match.group(4)
             return {
                 "val": val,
-                "citation_year": citation_year,
                 "path": path,
+                "citation_year": citation_year,
                 "nc_display": nc_display,
-            }
-        return None
-
-    def extract_pdf_fragment_from_select(self, onchange_attr):
-        """Extract PDF fragment and metadata from multi-language select onchange attribute"""
-        # Pattern: javascript:get_pdf_lang('0','2008_2_95_100','2008');
-        pattern = r"javascript:get_pdf_lang\('(.*?)','(.*?)','(.*?)'\)"
-        match = re.search(pattern, onchange_attr)
-        if match:
-            val = match.group(1)
-            path = match.group(2).split("#")[0]
-            citation_year = match.group(3)
-            return {
-                "val": val,
-                "path": path,
-                "citation_year": citation_year,
-                "nc_display": "",  # Will be extracted from HTML
             }
         return None
 
@@ -288,7 +274,7 @@ class Downloader:
             languages.append({"value": value, "text": text})
         return languages
 
-    def _process_pdf_download(self, pdf_info, row_pos, html, is_multilang=False):
+    def _process_pdf_download(self, pdf_info, row_pos, html, lang_code=""):
         """Common method to process PDF download for both single and multi-language cases"""
         if not pdf_info or not pdf_info.get("path"):
             logger.error(f"Invalid PDF info extracted: {pdf_info}")
@@ -298,33 +284,15 @@ class Downloader:
         citation_year = pdf_info.get("citation_year", "")
         nc_display = pdf_info.get("nc_display", "")
         val = pdf_info.get("val", str(row_pos))
-
-        # If nc_display is empty (from multi-lang), try to extract from HTML
-        if not nc_display:
-            nc_display = self.extract_nc_display(html)
-
-        pdf_output_path = self.get_pdf_output_path(path)
-        is_pdf_present = self.is_pdf_downloaded(path)
+        assert nc_display, f"No nc_display found, task: {self.task}"
+        pdf_output_path = self.get_pdf_output_path(path, lang_code)
+        is_pdf_present = pdf_output_path.exists()
         pdf_needs_download = not is_pdf_present
 
-        # Extract language options if multilingual
-        available_languages = []
-        if is_multilang:
-            soup = BeautifulSoup(html, "html.parser")
-            select_element = soup.find("select", {"name": "language"})
-            if select_element:
-                available_languages = self.extract_language_options(select_element)
-
         if pdf_needs_download:
-            if is_multilang:
-                # For multi-language, pass all extracted parameters
-                is_fresh_download = self.download_pdf_multilang(
-                    path, val, citation_year, nc_display, lang_code=""
-                )
-            else:
-                is_fresh_download = self.download_pdf(
-                    path, val, citation_year, nc_display
-                )
+            is_fresh_download = self.download_pdf(
+                path, val, citation_year, nc_display, lang_code
+            )
         else:
             is_fresh_download = False
 
@@ -332,12 +300,9 @@ class Downloader:
         metadata = {
             "raw_html": html,
             "pdf_link": path,
-            "citation_year": citation_year,
-            "nc_display": nc_display,
-            "val": val,
             "downloaded": is_pdf_present or is_fresh_download,
-            "is_multilang": is_multilang,
-            "available_languages": available_languages,
+            "pdf_info": pdf_info,
+            "lang_code": lang_code,
         }
         metadata_output.parent.mkdir(parents=True, exist_ok=True)
         with open(metadata_output, "w") as f:
@@ -553,7 +518,7 @@ class Downloader:
             )
         return pdf_link_response
 
-    def refresh_token(self, with_app_token=False):
+    def refresh_token(self):
         logger.debug(f"Current session id {self.session_id}")
         answer = self.solve_captcha()
         captcha_check_payload = {
@@ -611,25 +576,25 @@ class Downloader:
             logger.error(f"Error {response_dict['errormsg']}")
             self.refresh_token()
             return self.request_api(method, url, payload, **kwargs)
+        elif response.text.strip() == "":
+            self.refresh_token()
+            logger.error(f"Empty response, task: {self.task.id}")
+            return self.request_api(method, url, payload, **kwargs)
 
         return response
 
-    def get_pdf_output_path(self, pdf_fragment):
-        return output_dir / (pdf_fragment.split("#")[0] + ".pdf")
-
-    def is_pdf_downloaded(self, pdf_fragment):
-        pdf_metadata_path = self.get_pdf_output_path(pdf_fragment).with_suffix(".json")
-        if pdf_metadata_path.exists():
-            pdf_metadata = get_json_file(pdf_metadata_path)
-            return pdf_metadata["downloaded"]
-        return False
+    def get_pdf_output_path(self, pdf_fragment, lang_code=""):
+        if lang_code:
+            return output_dir / (pdf_fragment.split("#")[0] + f"_{lang_code}.pdf")
+        else:
+            return output_dir / (pdf_fragment.split("#")[0] + "_EN.pdf")
 
     def default_search_payload(self):
-        search_payload = urllib.parse.parse_qs(payload)
+        search_payload = urllib.parse.parse_qs(DEFAULT_SEARCH_PAYLOAD)
         search_payload = {k: v[0] for k, v in search_payload.items()}
         search_payload["sEcho"] = 1
         search_payload["iDisplayStart"] = 0
-        search_payload["iDisplayLength"] = page_size
+        search_payload["iDisplayLength"] = PAGE_SIZE
         return search_payload
 
     def default_pdf_link_payload(self):
@@ -647,7 +612,9 @@ class Downloader:
             },
             timeout=30,
         )
-        self.session_id = res.cookies.get(self.session_cookie_name)
+        self.session_id = res.cookies.get(
+            self.session_cookie_name, res.cookies.get(self.alt_session_cookie_name)
+        )
         self.ecourts_token = res.cookies.get(self.ecourts_token_cookie_name)
         if self.ecourts_token is None:
             raise ValueError(
@@ -658,7 +625,9 @@ class Downloader:
         return f"{self.ecourts_token_cookie_name}={self.ecourts_token}; {self.session_cookie_name}={self.session_id}"
 
     def update_session_id(self, response):
-        new_session_cookie = response.cookies.get(self.session_cookie_name)
+        new_session_cookie = response.cookies.get(
+            self.session_cookie_name, response.cookies.get(self.alt_session_cookie_name)
+        )
         if new_session_cookie:
             self.session_id = new_session_cookie
 
@@ -688,9 +657,6 @@ class Downloader:
 
     def download(self):
         """Process a specific date range for Supreme Court"""
-        if self.task.from_date is None or self.task.to_date is None:
-            logger.info(f"No more data to download for: task: {self.task}")
-            return
 
         search_payload = self.default_search_payload()
         search_payload["from_date"] = self.task.from_date
@@ -708,11 +674,7 @@ class Downloader:
                 if self._results_exist_in_search_response(res_dict):
                     for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
                         try:
-                            is_pdf_downloaded = self.process_result_row(
-                                row, row_pos=idx
-                            )
-                            if is_pdf_downloaded:
-                                pdfs_downloaded += 1
+                            pdfs_downloaded += self.process_result_row(row, row_pos=idx)
                             if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                 # after 25 downloads, need to solve captcha for every pdf link request
                                 logger.info(
@@ -744,10 +706,10 @@ class Downloader:
                 traceback.print_exc()
                 results_available = False
 
-    def download_pdf(self, pdf_fragment, val, citation_year, nc_display):
+    def download_pdf(self, pdf_fragment, val, citation_year, nc_display, lang_code=""):
         """Download PDF for single-language judgment"""
         # prepare temp pdf request
-        pdf_output_path = self.get_pdf_output_path(pdf_fragment)
+        pdf_output_path = self.get_pdf_output_path(pdf_fragment, lang_code)
         pdf_link_payload = self.default_pdf_link_payload()
 
         # Set all required parameters matching the curl request
@@ -758,8 +720,10 @@ class Downloader:
         pdf_link_payload["fcourt_type"] = "3"
         pdf_link_payload["ajax_req"] = "true"
 
-        # For single language judgments, lang_flg might not be needed or empty
-        pdf_link_payload["lang_flg"] = ""
+        if lang_code:
+            pdf_link_payload["lang_flg"] = lang_code
+        else:
+            pdf_link_payload["lang_flg"] = ""
 
         logger.debug(
             f"Downloading PDF, path: {pdf_fragment}, citation_year: {citation_year}, nc_display: {nc_display}"
@@ -823,7 +787,7 @@ if __name__ == "__main__":
         help="End date in YYYY-MM-DD format",
     )
     parser.add_argument(
-        "--day_step", type=int, default=30, help="Number of days per chunk"
+        "--day_step", type=int, default=300, help="Number of days per chunk"
     )
     parser.add_argument("--max_workers", type=int, default=1, help="Number of workers")
     args = parser.parse_args()
