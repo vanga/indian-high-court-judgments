@@ -165,3 +165,148 @@ This script:
 - **CAPTCHA Failures**: If the script encounters issues with CAPTCHA solving, failed CAPTCHAs are saved in the `./captcha-failures` directory for debugging.
 - **Session Expiry**: The script automatically handles session expiry by refreshing tokens and cookies.
 - **Download Errors**: Failed downloads are tracked and can be retried in subsequent runs.
+
+
+the amount of storage required to download the data 1) by courts 2)by years is mentioned below 
+
+# Summary of Data
+1. **Total Size by Court**
+2. **Total Size by Year**
+3. **Total Size**
+---
+
+## 1. Total Size by Court
+
+
+| Code   | Court                             | Total Size (GB) |
+| ------ | --------------------------------- | --------------: |
+| 19\~16 | Calcutta High Court               |           18.95 |
+| 1\~12  | High Court of Jammu and Kashmir   |           13.06 |
+| 27\~1  | Bombay High Court                 |           49.46 |
+| 32\~4  | High Court of Kerala              |           77.75 |
+| 3\~22  | High Court of Punjab and Haryana  |          118.65 |
+| 5\~15  | High Court of Uttarakhand         |            7.04 |
+| 7\~26  | High Court of Delhi               |            33.1 |
+| 22\~18 | High Court of Chhattisgarh        |           55.06 |
+| 36\~29 | High Court for State of Telangana |           93.66 |
+| 10\~8  | Patna High Court                  |           79.49 |
+| 21\~11 | High Court of Orissa              |           55.22 |
+| 2\~5   | High Court of Himachal Pradesh    |           17.75 |
+| 24\~17 | High Court of Gujarat             |           20.96 |
+| 9\~13  | Allahabad High Court              |           49.98 |
+| 18\~6  | Gauhati High Court                |           14.68 |
+| 20\~7  | High Court of Jharkhand           |           26.86 |
+| 8\~9   | High Court of Rajasthan           |           66.15 |
+| 28\~2  | High Court of Andhra Pradesh      |            45.8 |
+| 33\~10 | Madras High Court                 |          105.45 |
+| 23\~23 | High Court of Madhya Pradesh      |           41.83 |
+| 29\~3  | High Court of Karnataka           |           49.69 |
+| 11\~24 | High Court of Sikkim              |            0.63 |
+| 16\~20 | High Court of Tripura             |            3.47 |
+| 14\~25 | High Court of Manipur             |            1.64 |
+| 17\~21 | High Court of Meghalaya           |            1.28 |
+
+---
+
+## 2. Total Size by Year
+
+| Year | Total Size (MB) |
+| :--- | --------------: |
+| Year | Total Size (GB) |
+| :--- | --------------: |
+| 1950 | 0.0 |
+| 1951 | 0.0 |
+| 1952 | 0.0 |
+| 1953 | 0.0 |
+| 1954 | 0.0 |
+| 1955 | 0.0 |
+| 1956 | 0.0 |
+| 1957 | 0.0 |
+| 1958 | 0.0 |
+| 1959 | 0.0 |
+| 1960 | 0.0 |
+| 1961 | 0.0 |
+| 1962 | 0.0 |
+| 1963 | 0.0 |
+| 1964 | 0.0 |
+| 1965 | 0.0 |
+| 1966 | 0.0 |
+| 1967 | 0.0 |
+| 1968 | 0.0 |
+| 1969 | 0.0 |
+| 1970 | 0.0 |
+| 1971 | 0.0 |
+| 1972 | 0.0 |
+| 1973 | 0.0 |
+| 1974 | 0.0 |
+| 1975 | 0.0 |
+| 1976 | 0.0 |
+| 1977 | 0.0 |
+| 1978 | 0.01 |
+| 1979 | 0.0 |
+| 1980 | 0.0 |
+| 1981 | 0.0 |
+| 1982 | 0.0 |
+| 1983 | 0.0 |
+| 1984 | 0.0 |
+| 1985 | 0.0 |
+| 1986 | 0.0 |
+| 1987 | 0.0 |
+| 1988 | 0.0 |
+| 1989 | 0.0 |
+| 1990 | 0.0 |
+| 1991 | 0.0 |
+| 1992 | 0.0 |
+| 1993 | 0.01 |
+| 1994 | 0.0 |
+| 1995 | 0.01 |
+| 1996 | 0.03 |
+| 1997 | 0.08 |
+| 1998 | 0.21 |
+| 1999 | 0.06 |
+| 2000 | 0.11 |
+| 2001 | 0.28 |
+| 2002 | 0.26 |
+| 2003 | 0.95 |
+| 2004 | 1.96 |
+| 2005 | 3.12 |
+| 2006 | 5.17 |
+| 2007 | 10.27 |
+| 2008 | 12.58 |
+| 2009 | 16.7 |
+| 2010 | 22.42 |
+| 2011 | 29.15 |
+| 2012 | 29.7 |
+| 2013 | 29.57 |
+| 2014 | 33.52 |
+| 2015 | 38.48 |
+| 2016 | 40.82 |
+| 2017 | 45.66 |
+| 2018 | 66.72 |
+| 2019 | 76.93 |
+| 2020 | 56.91 |
+| 2021 | 87.28 |
+| 2022 | 134.37 |
+| 2023 | 145.52 |
+| 2024 | 134.55 |
+| 2025 | 24.13 |
+
+---
+
+## 3. Total Across All Years
+
+* **Total Size:** 1,072,716.02 MB
+* **Converted to GB:** 1,047.66 GB (using 1 GB = 1,024 MB)
+* **Converted to TB:** 1.023 TB (using 1 TB = 1,024*1,024 MB)
+
+## Key Insights
+
+| Insight                                      | Value                    |
+| :-------------------------------------------| :------------------------|
+| Year with highest data volume               | **2023** (145.516 GB) |
+| Court with highest data volume              | **3_22** (118.646 GB) |
+| Total data volume across all years          |    |
+|     **1,047.66 GB**          |
+|    **1.023 TB**             |
+
+
