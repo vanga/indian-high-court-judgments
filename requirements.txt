@@ -3,4 +3,7 @@ requests
 bs4
 lxml
 easyocr
+boto3
+pyarrow
+pandas
 
