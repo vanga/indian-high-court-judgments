@@ -511,11 +511,18 @@ class Downloader:
                 captcha_filename.unlink()  # Clean up the file
                 return self.solve_captcha(retries + 1, captcha_url)
         else:
-            captcha_text = "".join([c for c in captch_text if c.isnumeric()])
-            if len(captcha_text) != 6:
+            # Clean captcha text to only alphanumeric characters
+            captcha_text = "".join([c for c in captch_text if c.isalnum()])
+            # Accept 4-8 alphanumeric characters (being flexible with length)
+            if len(captcha_text) < 4 or len(captcha_text) > 8:
+                logger.warning(
+                    f"Invalid captcha length: {len(captcha_text)}, text: '{captcha_text}', task: {self.task.id}, retries: {retries}"
+                )
                 if retries > 10:
                     raise Exception("Captcha not solved")
                 return self.solve_captcha(retries + 1)
+            logger.info(f"Solved captcha: '{captcha_text}', task: {self.task.id}")
+            captcha_filename.unlink()  # Clean up the file
             return captcha_text
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
@@ -777,10 +784,8 @@ if __name__ == "__main__":
     else:
         court_codes = get_court_codes()
 
-    for court_code in court_codes:
-        run(
-            court_codes, args.start_date, args.end_date, args.day_step, args.max_workers
-        )
+    # Run once with the selected set of court codes
+    run(court_codes, args.start_date, args.end_date, args.day_step, args.max_workers)
 
 """
 captcha prompt while downloading pdf seems to be different from session timeout
