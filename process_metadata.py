@@ -265,9 +265,14 @@ class MetadataProcessor:
             "pdf_language": "string",
         }
 
+        # Handle date conversion with proper format
+        if 'decision_date' in df.columns:
+            # Convert decision_date with dayfirst=True for DD-MM-YYYY format
+            df['decision_date'] = pd.to_datetime(df['decision_date'], format='mixed', dayfirst=True, errors='coerce')
+        
         # Apply the dtypes
         for col, dtype in dtypes.items():
-            if col in df.columns:
+            if col in df.columns and col != 'decision_date':  # Skip decision_date as we handled it above
                 df[col] = df[col].astype(dtype)
 
         # Convert to PyArrow Table

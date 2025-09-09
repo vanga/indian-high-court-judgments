@@ -34,7 +34,6 @@ jobs:
 
       - name: Ensure directories exist
         run: |
-          mkdir -p ./local_hc_metadata
           mkdir -p ./data
 
       - name: Run court data pipeline

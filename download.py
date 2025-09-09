@@ -29,7 +29,7 @@ try:
     from botocore.client import Config
     S3_AVAILABLE = True
 except ImportError as e:
-    print(f"❌ S3 dependencies not available: {e}")
+    print(f"S3 dependencies not available: {e}")
     S3_AVAILABLE = False
 
 try:
@@ -38,7 +38,7 @@ try:
     from process_metadata import MetadataProcessor
     PARQUET_AVAILABLE = True
 except ImportError as e:
-    print(f"❌ Parquet dependencies not available: {e}")
+    print(f"Parquet dependencies not available: {e}")
     PARQUET_AVAILABLE = False
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -262,15 +262,12 @@ def get_bench_codes():
         with open(BENCH_CODES_FILE, 'r') as f:
             return json.load(f)
     except FileNotFoundError:
-        print(f"[WARN] {BENCH_CODES_FILE} not found, using empty mapping")
+        print(f"Warning: {BENCH_CODES_FILE} not found, using empty mapping")
         return {}
 
 
 def get_court_dates_from_index_files():
-    # """Get updated_at dates from metadata index files"""
-    # # Example: replicate this and send return as 18_6 court date as 2025-08-22 , {'10_8': {'patnahcucisdb94': '2025-05-05T00:00:00'}, ...}
-    # # Hardcoded for testing: return Gauhati High Court (18_6) with bench 'gauhatihc_pg' and date '2025-08-22'
-    return {'5_15': {'ukhcucis_pg': '2024-01-22T00:00:00'}}
+    """Get updated_at dates from metadata index files"""
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
         return {}
@@ -304,7 +301,7 @@ def get_court_dates_from_index_files():
                     result[court_code][bench] = updated_at
     
     except Exception as e:
-        print(f"[ERROR] Failed to fetch dates: {e}")
+        print(f"Failed to fetch dates: {e}")
         return {}
     
     print(f"Found dates for {len(result)} courts")
@@ -332,11 +329,11 @@ def read_updated_at_from_index(s3, bucket, key):
         index_data = json.loads(response['Body'].read().decode('utf-8'))
         return index_data.get('updated_at')
     except Exception as e:
-        print(f"[WARN] Failed to read {key}: {e}")
+        print(f"Warning: Failed to read {key}: {e}")
         return None
 
 
-def update_index_files_after_download(court_code, bench, new_files):
+def update_index_files_after_download(court_code, bench, new_files, to_date=None):
     """Update both metadata and data index files with new download information"""
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
@@ -346,7 +343,17 @@ def update_index_files_after_download(court_code, bench, new_files):
     s3_unsigned = boto3.client('s3', config=Config(signature_version=UNSIGNED))
     
     year = datetime.now().year
-    current_time = datetime.now().isoformat()
+    # Use to_date if provided, otherwise use current time
+    if to_date:
+        if isinstance(to_date, str):
+            # If to_date is a string, parse it and convert to ISO format
+            to_date_dt = datetime.strptime(to_date, "%Y-%m-%d")
+        else:
+            # If to_date is already a datetime/date object
+            to_date_dt = to_date if hasattr(to_date, 'hour') else datetime.combine(to_date, datetime.min.time())
+        update_time = to_date_dt.isoformat()
+    else:
+        update_time = datetime.now().isoformat()
     
     # Update both metadata and data index files
     updates = [
@@ -374,17 +381,18 @@ def update_index_files_after_download(court_code, bench, new_files):
                 response = s3_unsigned.get_object(Bucket=S3_BUCKET, Key=update['key'])
                 index_data = json.loads(response['Body'].read().decode('utf-8'))
             except Exception:
-                index_data = {"files": [], "file_count": 0, "updated_at": current_time}
+                index_data = {"files": [], "file_count": 0, "updated_at": update_time}
             
-            # Add new files
+            # Add new files (store only filenames, not full paths)
             existing_files = set(index_data.get('files', []))
             for new_file in update['files']:
-                if new_file not in existing_files:
-                    index_data['files'].append(new_file)
+                filename = os.path.basename(new_file)  # Extract just the filename
+                if filename not in existing_files:
+                    index_data['files'].append(filename)
             
             # Update metadata
             index_data['file_count'] = len(index_data['files'])
-            index_data['updated_at'] = current_time
+            index_data['updated_at'] = update_time
             
             # Get actual tar file size
             try:
@@ -393,7 +401,7 @@ def update_index_files_after_download(court_code, bench, new_files):
                 index_data['tar_size'] = tar_size
                 index_data['tar_size_human'] = format_size(tar_size)
             except Exception as e:
-                print(f"[WARN] Could not get tar size for {update['tar_key']}: {e}")
+                print(f"Warning: Could not get tar size for {update['tar_key']}: {e}")
                 index_data['tar_size'] = 0
                 index_data['tar_size_human'] = "0 B"
             
@@ -422,10 +430,8 @@ def run_incremental_download(court_code_dl, start_date, end_date=None):
         # Create and process download task
         task = CourtDateTask(
             court_code=court_code_dl,
-            # from_date=start_date.strftime("%Y-%m-%d"),
-            # to_date=end_date.strftime("%Y-%m-%d")
-            from_date="2025-03-06",
-            to_date="2025-03-07"
+            from_date=start_date.strftime("%Y-%m-%d"),
+            to_date=end_date.strftime("%Y-%m-%d")
         )
         
         # Track downloaded files
@@ -445,35 +451,38 @@ def run_incremental_download(court_code_dl, start_date, end_date=None):
         return {'metadata': [], 'data': []}
 
 def sync_to_s3():
-    """Sync new data to S3 for court 18~6 only"""
+    """Sync new data to S3 for all courts"""
     if not S3_AVAILABLE:
-        print("[ERROR] S3 dependencies not available")
+        print("ERROR: S3 dependencies not available")
         return
     
-    # Hardcoded to only process court 18~6 (Gauhati High Court)
-    court_code = "5~15"
-    s3_court_code = "5_15"
-    
-    print(f"\n[SYNC S3] Processing court {court_code} (Gauhati High Court)")
+    print("Starting S3 sync for all courts")
     
     # Get current dates from S3 index files
     court_dates = get_court_dates_from_index_files()
-    print(court_dates , " &&  " , type(court_dates))
     
-    if not court_dates or s3_court_code not in court_dates:
-        print(f"No existing data found in S3 for court {court_code}, exiting")
+    if not court_dates:
+        print("No existing data found in S3, exiting")
         return
     
-    benches = court_dates.get(s3_court_code, {})
-    latest_date = get_latest_court_date(benches)
-    print(f"Latest date for court {court_code}: {latest_date}")
+    total_courts = len(court_dates)
+    print(f"Found {total_courts} courts to process")
     
-    downloaded_files = download_court_data(s3_court_code, latest_date)
+    for s3_court_code, benches in court_dates.items():
+        court_code = s3_court_code.replace('_', '~')
+        print(f"Processing court {court_code}")
+        
+        latest_date = get_latest_court_date(benches)
+        print(f"Latest date for court {court_code}: {latest_date}")
+        
+        downloaded_files = download_court_data(s3_court_code, latest_date)
+        
+        if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
+            upload_files_to_s3(court_code, downloaded_files)
+        
+        print(f"Completed court {court_code}")
     
-    if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
-        upload_files_to_s3(court_code, downloaded_files)
-    
-    print(f"Sync completed for court {court_code}")
+    print("S3 sync completed for all courts")
 
 
 def get_latest_court_date(benches):
@@ -485,7 +494,7 @@ def get_latest_court_date(benches):
             if latest_date is None or date > latest_date:
                 latest_date = date
         except Exception as e:
-            print(f"[WARN] Invalid date {updated_at_str}: {e}")
+            print(f"Warning: Invalid date {updated_at_str}: {e}")
     return latest_date
 
 
@@ -493,25 +502,24 @@ def download_court_data(court_code, latest_date):
     """Download data for a specific court"""
     today = datetime.now().date()
     
+    # Calculate the next date to download (latest_date + 1)
+    start_date = latest_date + timedelta(days=1)
+    
+    # Download only 10 days after latest date (for testing/incremental updates)
+    # end_date = min(latest_date + timedelta(days=10), today)
+
+    # For full sync, download up to today
+    end_date = today
+
     # Check if we need to download anything
-    if latest_date >= today:
-        print(f"Court {court_code}: Already up-to-date (latest: {latest_date})")
+    if start_date > end_date:
+        print(f"Court {court_code}: No data to download (start_date {start_date} > end_date {end_date})")
         return {'metadata': [], 'data': []}
     
     # Convert court code for download (replace _ with ~)
     court_code_dl = court_code.replace('_', '~')
     
-    # Calculate the next date to download (latest_date + 1)
-    start_date = latest_date + timedelta(days=1)
-    
-    # Production mode: download from next day up to today
-    end_date = today
-    print(f"Downloading: Court {court_code}: {start_date} → {end_date}")
-    
-    # Don't download future dates
-    if start_date > today:
-        print(f"Court {court_code}: No future data to download")
-        return {'metadata': [], 'data': []}
+    print(f"Downloading: Court {court_code}: {start_date} to {end_date}")
     
     # Run download
     downloaded_files = run_incremental_download(court_code_dl, start_date, end_date)
@@ -520,9 +528,8 @@ def download_court_data(court_code, latest_date):
     court_dates = get_court_dates_from_index_files()
     benches = court_dates.get(court_code, {})
     for bench in benches.keys():
-        update_index_files_after_download(court_code, bench, downloaded_files)
+        update_index_files_after_download(court_code, bench, downloaded_files, end_date)
     
-    # Return the downloaded files so caller can handle upload
     return downloaded_files
 
 
@@ -1146,8 +1153,8 @@ def upload_files_to_s3(court_code, downloaded_files):
     current_time = datetime.now()
     year = current_time.year
     
-    print(f"🚀 Starting S3 upload for court {court_code}")
-    print(f"📊 Files to upload: {len(downloaded_files['metadata'])} metadata, {len(downloaded_files['data'])} data files")
+    print(f"Starting S3 upload for court {court_code}")
+    print(f"Files to upload: {len(downloaded_files['metadata'])} metadata, {len(downloaded_files['data'])} data files")
     
     # Extract bench from file paths and organize by bench
     bench_files = {}
@@ -1170,40 +1177,32 @@ def upload_files_to_s3(court_code, downloaded_files):
     
     # Upload files by bench
     for bench, files in bench_files.items():
-        print(f"\n📁 Processing bench: {bench}")
+        print(f"Processing bench: {bench}")
         
-        # Convert court code from 11~24 to 11_24 for S3 path
+        # Convert court code to S3 format
         s3_court_code = court_code.replace('~', '_')
         
         # Upload metadata files with progress bar
         if files['metadata']:
-            print(f"📄 Uploading {len(files['metadata'])} JSON metadata files...")
+            print(f"Uploading {len(files['metadata'])} JSON metadata files...")
             with tqdm(total=len(files['metadata']), desc="JSON files", unit="file") as pbar:
                 for metadata_file in files['metadata']:
                     success = upload_single_file_to_s3(
                         s3_client, metadata_file, s3_court_code, bench, year, 'metadata'
                     )
-                    if success:
-                        pbar.set_postfix_str("✅")
-                    else:
-                        pbar.set_postfix_str("❌")
                     pbar.update(1)
         
         # Upload data files with progress bar
         if files['data']:
-            print(f"📄 Uploading {len(files['data'])} PDF data files...")
+            print(f"Uploading {len(files['data'])} PDF data files...")
             with tqdm(total=len(files['data']), desc="PDF files", unit="file") as pbar:
                 for data_file in files['data']:
                     success = upload_single_file_to_s3(
                         s3_client, data_file, s3_court_code, bench, year, 'data'
                     )
-                    if success:
-                        pbar.set_postfix_str("✅")
-                    else:
-                        pbar.set_postfix_str("❌")
                     pbar.update(1)
         
-        print(f"✅ Completed individual file upload for bench {bench}")
+        print(f"Completed individual file upload for bench {bench}")
         
         # Create and upload tar files for this bench
         create_and_upload_tar_files(s3_client, s3_court_code, bench, year, files)
@@ -1211,13 +1210,13 @@ def upload_files_to_s3(court_code, downloaded_files):
         # Create and upload parquet files for this bench
         create_and_upload_parquet_files(s3_client, s3_court_code, bench, year, files)
     
-    print(f"\n🎉 S3 upload completed for court {court_code}")
+    print(f"S3 upload completed for court {court_code}")
 
 
 def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
     """Download existing tar files, append new content, and upload back to S3"""
     
-    print(f"📦 Creating/updating tar files for bench {bench}")
+    print(f"Creating/updating tar files for bench {bench}")
     
     # Handle metadata tar file
     if files['metadata']:
@@ -1228,7 +1227,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         temp_existing_tar = None
         
         try:
-            print(f"  📥 Downloading existing metadata tar...")
+            print(f"  Downloading existing metadata tar...")
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_tar_key)
             
             # Download existing tar to temp file
@@ -1239,12 +1238,12 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
             # Read existing files list to avoid duplicates
             with tarfile.open(temp_existing_tar.name, 'r:gz') as existing_tar:
                 existing_files_set = set(existing_tar.getnames())
-                print(f"  📋 Found existing metadata tar with {len(existing_files_set)} files")
+                print(f"  Found existing metadata tar with {len(existing_files_set)} files")
             
         except s3_client.exceptions.NoSuchKey:
-            print(f"  📝 No existing metadata tar found, will create new one")
+            print(f"  No existing metadata tar found, will create new one")
         except Exception as e:
-            print(f"  ⚠️  Warning: Could not download existing metadata tar: {e}")
+            print(f"  Warning: Could not download existing metadata tar: {e}")
         
         # Create new tar file with both existing and new content
         with tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False) as temp_new_tar:
@@ -1259,7 +1258,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                                 if file_obj:
                                     new_tar.addfile(member, file_obj)
                     except Exception as e:
-                        print(f"  ⚠️  Warning: Could not read existing tar content: {e}")
+                        print(f"  Warning: Could not read existing tar content: {e}")
                 
                 # Then add new files (skip duplicates)
                 new_files_added = 0
@@ -1274,10 +1273,10 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                             pbar.set_postfix_str(f"Skipped duplicate")
                         pbar.update(1)
                 
-                print(f"  ➕ Added {new_files_added} new metadata files to tar")
+                print(f"  Added {new_files_added} new metadata files to tar")
         
         # Upload updated tar to S3
-        print(f"  📤 Uploading updated metadata tar...")
+        print(f"  Uploading updated metadata tar...")
         with open(temp_new_tar.name, 'rb') as f:
             s3_client.put_object(
                 Bucket=S3_BUCKET,
@@ -1290,7 +1289,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         os.unlink(temp_new_tar.name)
         if temp_existing_tar and os.path.exists(temp_existing_tar.name):
             os.unlink(temp_existing_tar.name)
-        print(f"  ✅ Successfully uploaded updated metadata tar")
+        print(f"  Successfully uploaded updated metadata tar")
     
     # Handle data/PDF tar file
     if files['data']:
@@ -1301,7 +1300,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         temp_existing_tar = None
         
         try:
-            print(f"  📥 Downloading existing data tar...")
+            print(f"  Downloading existing data tar...")
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_tar_key)
             
             # Download existing tar to temp file
@@ -1312,12 +1311,12 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
             # Read existing files list to avoid duplicates
             with tarfile.open(temp_existing_tar.name, 'r') as existing_tar:
                 existing_files_set = set(existing_tar.getnames())
-                print(f"  📋 Found existing data tar with {len(existing_files_set)} files")
+                print(f"  Found existing data tar with {len(existing_files_set)} files")
             
         except s3_client.exceptions.NoSuchKey:
-            print(f"  📝 No existing data tar found, will create new one")
+            print(f"  No existing data tar found, will create new one")
         except Exception as e:
-            print(f"  ⚠️  Warning: Could not download existing data tar: {e}")
+            print(f"  Warning: Could not download existing data tar: {e}")
         
         # Create new tar file with both existing and new content
         with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as temp_new_tar:
@@ -1332,7 +1331,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                                 if file_obj:
                                     new_tar.addfile(member, file_obj)
                     except Exception as e:
-                        print(f"  ⚠️  Warning: Could not read existing tar content: {e}")
+                        print(f"  Warning: Could not read existing tar content: {e}")
                 
                 # Then add new files (skip duplicates)
                 new_files_added = 0
@@ -1347,10 +1346,10 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                             pbar.set_postfix_str(f"Skipped duplicate")
                         pbar.update(1)
                 
-                print(f"  ➕ Added {new_files_added} new data files to tar")
+                print(f"  Added {new_files_added} new data files to tar")
         
         # Upload updated tar to S3
-        print(f"  📤 Uploading updated data tar...")
+        print(f"  Uploading updated data tar...")
         with open(temp_new_tar.name, 'rb') as f:
             s3_client.put_object(
                 Bucket=S3_BUCKET,
@@ -1363,14 +1362,14 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         os.unlink(temp_new_tar.name)
         if temp_existing_tar and os.path.exists(temp_existing_tar.name):
             os.unlink(temp_existing_tar.name)
-        print(f"  ✅ Successfully uploaded updated data tar")
+        print(f"  Successfully uploaded updated data tar")
 
 
 
 def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
     """Download existing parquet, append new data, and upload back to S3"""
     if not PARQUET_AVAILABLE:
-        print("  ❌ Parquet libraries not available, skipping parquet creation")
+        print("  Parquet libraries not available, skipping parquet creation")
         print("  Install with: pip install pyarrow")
         return
         
@@ -1380,7 +1379,7 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
         return
     
     try:
-        print(f"  📊 Creating/updating parquet files for bench {bench}")
+        print(f"  Creating/updating parquet files for bench {bench}")
         
         # Define S3 key for parquet file
         parquet_key = f"metadata/parquet/year={year}/court={court_code}/bench={bench}/metadata.parquet"
@@ -1395,7 +1394,7 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
             # Try to download existing parquet file
             existing_data = None
             try:
-                print(f"  📥 Downloading existing parquet file...")
+                print(f"  Downloading existing parquet file...")
                 response = s3_client.get_object(Bucket=S3_BUCKET, Key=parquet_key)
                 
                 # Save existing parquet to temp file
@@ -1405,12 +1404,12 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
                 # Read existing parquet data
                 import pandas as pd
                 existing_data = pd.read_parquet(existing_parquet_path)
-                print(f"  📋 Found existing parquet with {len(existing_data)} records")
+                print(f"  Found existing parquet with {len(existing_data)} records")
                 
             except s3_client.exceptions.NoSuchKey:
-                print(f"  📝 No existing parquet found, will create new one")
+                print(f"  No existing parquet found, will create new one")
             except Exception as e:
-                print(f"  ⚠️  Warning: Could not download existing parquet: {e}")
+                print(f"  Warning: Could not download existing parquet: {e}")
             
             # Create temporary directory for new JSON files
             new_json_dir = temp_path / "new_json"
@@ -1424,14 +1423,14 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
                 shutil.copy2(json_file, dest_path)
             
             # Create parquet from new JSON files
-            print(f"  🔄 Processing {len(files['metadata'])} new JSON files...")
+            print(f"  Processing {len(files['metadata'])} new JSON files...")
             mp = MetadataProcessor(new_json_dir, output_path=new_parquet_path)
             mp.process()
             
             # Read new parquet data
             import pandas as pd
             new_data = pd.read_parquet(new_parquet_path)
-            print(f"  ➕ Created parquet with {len(new_data)} new records")
+            print(f"  Created parquet with {len(new_data)} new records")
             
             # Combine existing and new data
             if existing_data is not None:
@@ -1445,20 +1444,20 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
                     after_dedup = len(combined_data)
                     duplicates_removed = before_dedup - after_dedup
                     if duplicates_removed > 0:
-                        print(f"  🗑️  Removed {duplicates_removed} duplicate records")
+                        print(f"Removed {duplicates_removed} duplicate records")
                 else:
-                    print(f"  ⚠️  No pdf_link column found, keeping all records")
+                    print(f"No pdf_link column found, keeping all records")
                 
-                print(f"  📊 Combined parquet: {len(existing_data)} existing + {len(new_data)} new = {len(combined_data)} total records")
+                print(f"Combined parquet: {len(existing_data)} existing + {len(new_data)} new = {len(combined_data)} total records")
             else:
                 combined_data = new_data
-                print(f"  📊 New parquet file with {len(combined_data)} records")
+                print(f"New parquet file with {len(combined_data)} records")
             
             # Save combined data to final parquet file
             combined_data.to_parquet(combined_parquet_path, index=False)
             
             # Upload combined parquet file to S3
-            print(f"  📤 Uploading updated parquet file...")
+            print(f"  Uploading updated parquet file...")
             with open(combined_parquet_path, 'rb') as f:
                 s3_client.put_object(
                     Bucket=S3_BUCKET,
@@ -1467,10 +1466,10 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
                     ContentType='application/octet-stream'
                 )
             
-            print(f"  ✅ Successfully uploaded updated parquet file")
+            print(f"  Successfully uploaded updated parquet file")
             
     except Exception as e:
-        print(f"  ❌ Failed to create/update parquet file: {e}")
+        print(f"  Failed to create/update parquet file: {e}")
         import traceback
         traceback.print_exc()
 
@@ -1496,10 +1495,8 @@ def upload_single_file_to_s3(s3_client, local_file_path, court_code, bench, year
         filename = os.path.basename(local_file_path)
         
         if file_type == 'metadata':
-            # Upload to metadata/json/year=2025/court=11_24/bench=sikkimhc_pg/
             s3_key = f"metadata/json/year={year}/court={court_code}/bench={bench}/{filename}"
-        else:  # data/pdf files
-            # Upload to data/pdf/year=2025/court=11_24/bench=sikkimhc_pg/
+        else: 
             s3_key = f"data/pdf/year={year}/court={court_code}/bench={bench}/{filename}"
         
         # Upload the file
@@ -1514,7 +1511,7 @@ def upload_single_file_to_s3(s3_client, local_file_path, court_code, bench, year
         return True
         
     except Exception as e:
-        print(f"\n❌ Failed to upload {local_file_path}: {e}")
+        print(f"Failed to upload {local_file_path}: {e}")
         return False
 
 
@@ -1538,7 +1535,7 @@ if __name__ == "__main__":
         "--day_step", type=int, default=1, help="Number of days per chunk"
     )
     parser.add_argument("--max_workers", type=int, default=2, help="Number of workers")
-    parser.add_argument("--sync-s3", action="store_true", help="Run S3 sync for court 18~6 only")
+    parser.add_argument("--sync-s3", action="store_true", help="Run S3 sync for all courts")
     parser.add_argument("--fetch-dates", action="store_true", help="Fetch latest dates from tar index files")
     args = parser.parse_args()
 
