@@ -24,6 +24,7 @@ import tarfile
 
 # S3 imports - only imported when needed
 try:
+    import math
     import boto3
     from botocore import UNSIGNED
     from botocore.client import Config
@@ -268,6 +269,7 @@ def get_bench_codes():
 
 def get_court_dates_from_index_files():
     """Get updated_at dates from metadata index files"""
+    return {'20_7': {'jhar_pg': '2025-05-05T00:00:00'}}  # For testing, return fixed data
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
         return {}
@@ -418,8 +420,8 @@ def update_index_files_after_download(court_code, bench, new_files, to_date=None
             print(f"Failed to update {update['type']} index: {e}")
 
 
-def run_incremental_download(court_code_dl, start_date, end_date=None):
-    """Run download for specific court and date range"""
+def run_incremental_download(court_code_dl, start_date, end_date=None, max_workers=4):
+    """Run download for specific court and date range with multiprocessing support"""
     # If no end_date provided, make it same as start_date
     if end_date is None:
         end_date = start_date
@@ -427,30 +429,99 @@ def run_incremental_download(court_code_dl, start_date, end_date=None):
     print(f"Downloading {court_code_dl}: {start_date} → {end_date}")
     
     try:
-        # Create and process download task
-        task = CourtDateTask(
-            court_code=court_code_dl,
-            from_date=start_date.strftime("%Y-%m-%d"),
-            to_date=end_date.strftime("%Y-%m-%d")
-        )
-        
-        # Track downloaded files
+        # Use the same robust approach as regular downloads
+        # Instead of FileTrackingDownloader, use the regular run() function with threading
         downloaded_files = {'metadata': [], 'data': []}
         
-        # Create a modified downloader that tracks files and forces PDF downloads
-        downloader = FileTrackingDownloader(task, downloaded_files, force_pdf_download=False)
-        downloader.download()
+        # Use run() function for robust multi-threaded downloading
+        print(f"Starting multi-threaded download with {max_workers} workers...")
         
-        print(f"Download completed: {court_code_dl}")
-        print(f"Downloaded {len(downloaded_files['metadata'])} metadata files and {len(downloaded_files['data'])} PDF files")
+        # Call run with the specific court and date range
+        run(
+            court_codes=[court_code_dl], 
+            start_date="2025-05-06",
+            end_date="2025-09-09", 
+            # start_date=start_date.strftime("%Y-%m-%d"), 
+            # end_date=end_date.strftime("%Y-%m-%d"), 
+
+            day_step=1, 
+            max_workers=max_workers
+        )
         
+        print(f"Multi-threaded download completed: {court_code_dl}")
+        
+        # Now collect all downloaded files for this court and date range
+        # Scan the output directory for files created in this date range
+        from pathlib import Path
+        import glob
+        import json
+        
+        # Convert court_code_dl back to get the bench directory name
+        # court_code_dl is like "20~7", need to find corresponding bench
+        court_code_underscore = court_code_dl.replace('~', '_')  # "20_7"
+        
+        print(f"Debug: court_code_dl = {court_code_dl}, court_code_underscore = {court_code_underscore}")
+        
+        # Load bench codes to find the bench name
+        try:
+            with open('bench-codes.json', 'r') as f:
+                bench_codes = json.load(f)
+            
+            # Find ALL bench names for this court code (not just the first one)
+            target_benches = []
+            for bench_name, court_code in bench_codes.items():
+                if court_code == court_code_underscore:
+                    target_benches.append(bench_name)
+            
+            if target_benches:
+                print(f"Targeting {len(target_benches)} bench directories for court {court_code_underscore}: {target_benches}")
+                # Get files from ALL bench directories for this court
+                for target_bench in target_benches:
+                    bench_path = Path(f"./data/court/cnrorders/{target_bench}")
+                    if bench_path.exists():
+                        json_files = list(bench_path.glob("**/*.json"))
+                        pdf_files = list(bench_path.glob("**/*.pdf"))
+                        
+                        # Add all files from this bench
+                        for json_file in json_files:
+                            downloaded_files['metadata'].append(str(json_file))
+                        
+                        for pdf_file in pdf_files:
+                            downloaded_files['data'].append(str(pdf_file))
+                        
+                        print(f"Found {len(json_files)} JSON and {len(pdf_files)} PDF files in {target_bench}")
+                    else:
+                        print(f"Warning: Bench directory {bench_path} does not exist")
+            else:
+                print(f"Warning: Could not find any bench for court code {court_code_underscore}")
+                print(f"Available court codes in bench-codes.json: {list(bench_codes.values())}")
+                
+        except Exception as e:
+            print(f"Warning: Could not load bench codes: {e}")
+            # Fallback to scanning all directories (old behavior)
+            print("Falling back to scanning all bench directories...")
+            court_output_dir = Path(f"./data/court/cnrorders")
+            if court_output_dir.exists():
+                for bench_dir in court_output_dir.iterdir():
+                    if bench_dir.is_dir():
+                        json_files = list(bench_dir.glob("**/*.json"))
+                        pdf_files = list(bench_dir.glob("**/*.pdf"))
+                        
+                        for json_file in json_files:
+                            downloaded_files['metadata'].append(str(json_file))
+                        
+                        for pdf_file in pdf_files:
+                            downloaded_files['data'].append(str(pdf_file))
+        
+        print(f"Collected {len(downloaded_files['metadata'])} metadata files and {len(downloaded_files['data'])} PDF files")
         return downloaded_files
         
     except Exception as e:
         print(f"Download failed {court_code_dl}: {e}")
+        traceback.print_exc()
         return {'metadata': [], 'data': []}
 
-def sync_to_s3():
+def sync_to_s3(max_workers=4):
     """Sync new data to S3 for all courts"""
     if not S3_AVAILABLE:
         print("ERROR: S3 dependencies not available")
@@ -460,13 +531,16 @@ def sync_to_s3():
     
     # Get current dates from S3 index files
     court_dates = get_court_dates_from_index_files()
-    
+    print(court_dates)
     if not court_dates:
         print("No existing data found in S3, exiting")
         return
     
     total_courts = len(court_dates)
     print(f"Found {total_courts} courts to process")
+    
+    # Filter for testing - only process court 10_8 
+    court_dates = {k: v for k, v in court_dates.items() if k == '20_7'}
     
     for s3_court_code, benches in court_dates.items():
         court_code = s3_court_code.replace('_', '~')
@@ -475,7 +549,7 @@ def sync_to_s3():
         latest_date = get_latest_court_date(benches)
         print(f"Latest date for court {court_code}: {latest_date}")
         
-        downloaded_files = download_court_data(s3_court_code, latest_date)
+        downloaded_files = download_court_data(s3_court_code, latest_date, max_workers)
         
         if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
             upload_files_to_s3(court_code, downloaded_files)
@@ -498,7 +572,7 @@ def get_latest_court_date(benches):
     return latest_date
 
 
-def download_court_data(court_code, latest_date):
+def download_court_data(court_code, latest_date, max_workers=4):
     """Download data for a specific court"""
     today = datetime.now().date()
     
@@ -521,8 +595,8 @@ def download_court_data(court_code, latest_date):
     
     print(f"Downloading: Court {court_code}: {start_date} to {end_date}")
     
-    # Run download
-    downloaded_files = run_incremental_download(court_code_dl, start_date, end_date)
+    # Run download with max_workers support
+    downloaded_files = run_incremental_download(court_code_dl, start_date, end_date, max_workers)
     
     # Update all bench index files
     court_dates = get_court_dates_from_index_files()
@@ -1064,6 +1138,7 @@ class Downloader:
 
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                         pdfs_downloaded = 0
+                        logger.info(f"Resetting session after {NO_CAPTCHA_BATCH_SIZE} downloads, continuing with same search parameters")
                         self.init_user_session()
                         search_payload["app_token"] = self.app_token
                         continue
@@ -1080,63 +1155,63 @@ class Downloader:
                 # results_available = False
 
 
-class FileTrackingDownloader(Downloader):
-    """Downloader that tracks downloaded files for S3 upload"""
+# class FileTrackingDownloader(Downloader):
+#     """Downloader that tracks downloaded files for S3 upload"""
     
-    def __init__(self, task: CourtDateTask, downloaded_files: dict, force_pdf_download=False):
-        super().__init__(task)
-        self.downloaded_files = downloaded_files
-        self.force_pdf_download = force_pdf_download
+#     def __init__(self, task: CourtDateTask, downloaded_files: dict, force_pdf_download=False):
+#         super().__init__(task)
+#         self.downloaded_files = downloaded_files
+#         self.force_pdf_download = force_pdf_download
     
-    def process_result_row(self, row, row_pos):
-        """Override to track downloaded files"""
-        html = row[1]
-        soup = BeautifulSoup(html, "html.parser")
+#     def process_result_row(self, row, row_pos):
+#         """Override to track downloaded files"""
+#         html = row[1]
+#         soup = BeautifulSoup(html, "html.parser")
         
-        if not (soup.button and "onclick" in soup.button.attrs):
-            logger.info(
-                f"No button found, likely multi language judgment, task: {self.task}"
-            )
-            with open("html-parse-failures.txt", "a") as f:
-                f.write(html + "\n")
-            return False
+#         if not (soup.button and "onclick" in soup.button.attrs):
+#             logger.info(
+#                 f"No button found, likely multi language judgment, task: {self.task}"
+#             )
+#             with open("html-parse-failures.txt", "a") as f:
+#                 f.write(html + "\n")
+#             return False
             
-        pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
-        pdf_output_path = self.get_pdf_output_path(pdf_fragment)
-        is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
+#         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
+#         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
+#         is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
         
-        # Force download PDFs even if they exist, or download if not present
-        if self.force_pdf_download or not is_pdf_present:
-            is_fresh_download = self.download_pdf(pdf_fragment, row_pos)
-            if is_fresh_download:
-                # Track the newly downloaded PDF
-                self.downloaded_files['data'].append(str(pdf_output_path))
-        else:
-            is_fresh_download = False
+#         # Force download PDFs even if they exist, or download if not present
+#         if self.force_pdf_download or not is_pdf_present:
+#             is_fresh_download = self.download_pdf(pdf_fragment, row_pos)
+#             if is_fresh_download:
+#                 # Track the newly downloaded PDF
+#                 self.downloaded_files['data'].append(str(pdf_output_path))
+#         else:
+#             is_fresh_download = False
             
-        # If PDF exists (even if not newly downloaded), track it for tar creation
-        if is_pdf_present or is_fresh_download:
-            if str(pdf_output_path) not in self.downloaded_files['data']:
-                self.downloaded_files['data'].append(str(pdf_output_path))
+#         # If PDF exists (even if not newly downloaded), track it for tar creation
+#         if is_pdf_present or is_fresh_download:
+#             if str(pdf_output_path) not in self.downloaded_files['data']:
+#                 self.downloaded_files['data'].append(str(pdf_output_path))
             
-        # Always create/update metadata
-        metadata_output = pdf_output_path.with_suffix(".json")
-        metadata = {
-            "court_code": self.court_code,
-            "court_name": self.court_name,
-            "raw_html": html,
-            "pdf_link": pdf_fragment,
-            "downloaded": is_pdf_present or is_fresh_download,
-        }
-        metadata_output.parent.mkdir(parents=True, exist_ok=True)
-        with open(metadata_output, "w") as f:
-            json.dump(metadata, f)
+#         # Always create/update metadata
+#         metadata_output = pdf_output_path.with_suffix(".json")
+#         metadata = {
+#             "court_code": self.court_code,
+#             "court_name": self.court_name,
+#             "raw_html": html,
+#             "pdf_link": pdf_fragment,
+#             "downloaded": is_pdf_present or is_fresh_download,
+#         }
+#         metadata_output.parent.mkdir(parents=True, exist_ok=True)
+#         with open(metadata_output, "w") as f:
+#             json.dump(metadata, f)
             
-        # Track the metadata file (avoid duplicates)
-        if str(metadata_output) not in self.downloaded_files['metadata']:
-            self.downloaded_files['metadata'].append(str(metadata_output))
+#         # Track the metadata file (avoid duplicates)
+#         if str(metadata_output) not in self.downloaded_files['metadata']:
+#             self.downloaded_files['metadata'].append(str(metadata_output))
         
-        return is_fresh_download
+#         return is_fresh_download
 
 
 def upload_files_to_s3(court_code, downloaded_files):
@@ -1160,20 +1235,41 @@ def upload_files_to_s3(court_code, downloaded_files):
     bench_files = {}
     
     # Process metadata files
+    failed_metadata = 0
     for metadata_file in downloaded_files['metadata']:
         bench = extract_bench_from_path(metadata_file)
         if bench:
             if bench not in bench_files:
                 bench_files[bench] = {'metadata': [], 'data': []}
             bench_files[bench]['metadata'].append(metadata_file)
+        else:
+            failed_metadata += 1
+            if failed_metadata <= 3:  # Show first few failures
+                print(f"Failed to extract bench from metadata file: {metadata_file}")
+    
+    if failed_metadata > 0:
+        print(f"Warning: {failed_metadata} metadata files failed bench extraction")
     
     # Process data files  
+    failed_data = 0
     for data_file in downloaded_files['data']:
         bench = extract_bench_from_path(data_file)
         if bench:
             if bench not in bench_files:
                 bench_files[bench] = {'metadata': [], 'data': []}
             bench_files[bench]['data'].append(data_file)
+        else:
+            failed_data += 1
+            if failed_data <= 3:  # Show first few failures
+                print(f"Failed to extract bench from data file: {data_file}")
+    
+    if failed_data > 0:
+        print(f"Warning: {failed_data} data files failed bench extraction")
+    
+    # Show final counts by bench
+    print(f"Organized files by bench:")
+    for bench_name, files in bench_files.items():
+        print(f"  {bench_name}: {len(files['metadata'])} metadata, {len(files['data'])} data")
     
     # Upload files by bench
     for bench, files in bench_files.items():
@@ -1211,6 +1307,112 @@ def upload_files_to_s3(court_code, downloaded_files):
         create_and_upload_parquet_files(s3_client, s3_court_code, bench, year, files)
     
     print(f"S3 upload completed for court {court_code}")
+
+
+def upload_large_file_to_s3(s3_client, file_path, bucket, key, content_type, chunk_size=100*1024*1024):
+    """
+    Upload a large file to S3 using multipart upload if necessary.
+    
+    Args:
+        s3_client: boto3 S3 client
+        file_path: Local file path to upload
+        bucket: S3 bucket name
+        key: S3 object key
+        content_type: MIME type of the file
+        chunk_size: Size of each part in bytes (default 100MB)
+    """
+    import math
+    
+    file_size = os.path.getsize(file_path)
+    print(f"  File size: {format_size(file_size)}")
+    
+    # Use regular upload for files smaller than chunk_size (100MB by default)
+    if file_size <= chunk_size:
+        print(f"  Using standard upload (file < {format_size(chunk_size)})")
+        try:
+            with open(file_path, 'rb') as f:
+                s3_client.put_object(
+                    Bucket=bucket,
+                    Key=key,
+                    Body=f,
+                    ContentType=content_type
+                )
+            print(f"  Standard upload completed successfully")
+            return True
+        except Exception as e:
+            print(f"  ERROR: Standard upload failed: {e}")
+            return False
+    
+    # Use multipart upload for large files
+    print(f"  Using multipart upload (file >= {format_size(chunk_size)})")
+    
+    try:
+        # Initialize multipart upload
+        mpu = s3_client.create_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            ContentType=content_type
+        )
+        upload_id = mpu['UploadId']
+        
+        parts = []
+        part_number = 1
+        total_parts = math.ceil(file_size / chunk_size)
+        
+        print(f"  Uploading {total_parts} parts...")
+        
+        with open(file_path, 'rb') as f:
+            with tqdm(total=total_parts, desc="  Uploading parts", unit="part") as pbar:
+                while True:
+                    # Read chunk
+                    data = f.read(chunk_size)
+                    if not data:
+                        break
+                    
+                    # Upload part
+                    part_response = s3_client.upload_part(
+                        Bucket=bucket,
+                        Key=key,
+                        PartNumber=part_number,
+                        UploadId=upload_id,
+                        Body=data
+                    )
+                    
+                    # Store part info
+                    parts.append({
+                        'PartNumber': part_number,
+                        'ETag': part_response['ETag']
+                    })
+                    
+                    part_number += 1
+                    pbar.update(1)
+        
+        # Complete multipart upload
+        s3_client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={'Parts': parts}
+        )
+        
+        print(f"  Multipart upload completed successfully")
+        return True
+        
+    except Exception as e:
+        print(f"  ERROR: Multipart upload failed: {e}")
+        
+        # Try to abort the multipart upload to clean up
+        try:
+            s3_client.abort_multipart_upload(
+                Bucket=bucket,
+                Key=key,
+                UploadId=upload_id
+            )
+            print(f"  Aborted incomplete multipart upload")
+        except Exception as abort_error:
+            print(f"  Warning: Failed to abort multipart upload: {abort_error}")
+        
+        return False
 
 
 def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
@@ -1275,21 +1477,25 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                 
                 print(f"  Added {new_files_added} new metadata files to tar")
         
-        # Upload updated tar to S3
+        # Upload updated tar to S3 (with multipart support for large files)
         print(f"  Uploading updated metadata tar...")
-        with open(temp_new_tar.name, 'rb') as f:
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=metadata_tar_key,
-                Body=f,
-                ContentType='application/gzip'
-            )
+        success = upload_large_file_to_s3(
+            s3_client, 
+            temp_new_tar.name, 
+            S3_BUCKET, 
+            metadata_tar_key, 
+            'application/gzip'
+        )
         
         # Clean up temp files
         os.unlink(temp_new_tar.name)
         if temp_existing_tar and os.path.exists(temp_existing_tar.name):
             os.unlink(temp_existing_tar.name)
-        print(f"  Successfully uploaded updated metadata tar")
+        
+        if success:
+            print(f"  Successfully uploaded updated metadata tar")
+        else:
+            print(f"  Failed to upload metadata tar")
     
     # Handle data/PDF tar file
     if files['data']:
@@ -1348,21 +1554,25 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                 
                 print(f"  Added {new_files_added} new data files to tar")
         
-        # Upload updated tar to S3
+        # Upload updated tar to S3 (with multipart support for large files)
         print(f"  Uploading updated data tar...")
-        with open(temp_new_tar.name, 'rb') as f:
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=data_tar_key,
-                Body=f,
-                ContentType='application/x-tar'
-            )
+        success = upload_large_file_to_s3(
+            s3_client, 
+            temp_new_tar.name, 
+            S3_BUCKET, 
+            data_tar_key, 
+            'application/x-tar'
+        )
         
         # Clean up temp files
         os.unlink(temp_new_tar.name)
         if temp_existing_tar and os.path.exists(temp_existing_tar.name):
             os.unlink(temp_existing_tar.name)
-        print(f"  Successfully uploaded updated data tar")
+        
+        if success:
+            print(f"  Successfully uploaded updated data tar")
+        else:
+            print(f"  Failed to upload data tar")
 
 
 
@@ -1544,7 +1754,7 @@ if __name__ == "__main__":
         court_dates = get_court_dates_from_index_files()
         print(f"Found dates for {len(court_dates)} courts")
     elif args.sync_s3:
-        sync_to_s3()
+        sync_to_s3(max_workers=args.max_workers)
     else:
         # Regular download mode
         if args.court_codes:
