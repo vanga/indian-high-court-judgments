@@ -37,15 +37,4 @@ jobs:
           mkdir -p ./data
 
       - name: Run court data pipeline
-        run: python download.py --sync-s3
-
-      - name: Upload logs as artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: my-artifact
-          path: |
-            *.log
-            captcha-failures/
-            captcha-tmp/
-            track.json
-          retention-days: 7
+        run: python download.py --sync-s3 --max_workers 4
