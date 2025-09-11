@@ -18,13 +18,11 @@ import concurrent.futures
 import urllib3
 import uuid
 import os
-import shutil
 import tempfile
 import tarfile
 
 # S3 imports - only imported when needed
 try:
-    import math
     import boto3
     from botocore import UNSIGNED
     from botocore.client import Config
@@ -269,7 +267,7 @@ def get_bench_codes():
 
 def get_court_dates_from_index_files():
     """Get updated_at dates from metadata index files"""
-    return {'20_7': {'jhar_pg': '2025-05-05T00:00:00'}}  # For testing, return fixed data
+    # return {'20_7': {'jhar_pg': '2025-05-05T00:00:00'}}  # For testing, return fixed data
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
         return {}
@@ -337,6 +335,7 @@ def read_updated_at_from_index(s3, bucket, key):
 
 def update_index_files_after_download(court_code, bench, new_files, to_date=None):
     """Update both metadata and data index files with new download information"""
+    print("TO_DATE from index.json updater : ", to_date)
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
         return
@@ -439,10 +438,10 @@ def run_incremental_download(court_code_dl, start_date, end_date=None, max_worke
         # Call run with the specific court and date range
         run(
             court_codes=[court_code_dl], 
-            start_date="2025-05-06",
-            end_date="2025-09-09", 
-            # start_date=start_date.strftime("%Y-%m-%d"), 
-            # end_date=end_date.strftime("%Y-%m-%d"), 
+            # start_date="2025-05-06",
+            # end_date=start_date.strftime("%Y-%m-%d")+3, 
+            start_date=start_date.strftime("%Y-%m-%d"), 
+            end_date=end_date.strftime("%Y-%m-%d"), 
 
             day_step=1, 
             max_workers=max_workers
@@ -540,7 +539,7 @@ def sync_to_s3(max_workers=4):
     print(f"Found {total_courts} courts to process")
     
     # Filter for testing - only process court 10_8 
-    court_dates = {k: v for k, v in court_dates.items() if k == '20_7'}
+    # court_dates = {k: v for k, v in court_dates.items() if k == '10_8'}
     
     for s3_court_code, benches in court_dates.items():
         court_code = s3_court_code.replace('_', '~')
@@ -552,7 +551,31 @@ def sync_to_s3(max_workers=4):
         downloaded_files = download_court_data(s3_court_code, latest_date, max_workers)
         
         if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
-            upload_files_to_s3(court_code, downloaded_files)
+            # Upload files to S3 first
+            upload_success = upload_files_to_s3(court_code, downloaded_files)
+            
+            # Only update index files if S3 upload was successful
+            if upload_success:
+                print(f"S3 upload successful, updating index files for court {court_code}")
+                today=datetime.now().date()
+                # Calculate end_date for index update (start_date + 3 for testing)
+                start_date = latest_date + timedelta(days=1)
+
+                # Download only 3 days after latest date (for testing/incremental updates)
+                # end_date = min(latest_date + timedelta(days=3), today)
+
+                # For full sync, download up to today
+                end_date = today
+
+                # Update all bench index files with successful S3 sync date
+                court_dates_fresh = get_court_dates_from_index_files()
+                benches = court_dates_fresh.get(s3_court_code, {})
+                for bench in benches.keys():
+                    update_index_files_after_download(s3_court_code, bench, downloaded_files, end_date)
+                
+                print(f"Index files updated for court {court_code}")
+            else:
+                print(f"S3 upload failed for court {court_code}, NOT updating index files")
         
         print(f"Completed court {court_code}")
     
@@ -578,9 +601,9 @@ def download_court_data(court_code, latest_date, max_workers=4):
     
     # Calculate the next date to download (latest_date + 1)
     start_date = latest_date + timedelta(days=1)
-    
-    # Download only 10 days after latest date (for testing/incremental updates)
-    # end_date = min(latest_date + timedelta(days=10), today)
+
+    # Download only 3 days after latest date (for testing/incremental updates)
+    # end_date = min(latest_date + timedelta(days=3), today)
 
     # For full sync, download up to today
     end_date = today
@@ -598,11 +621,8 @@ def download_court_data(court_code, latest_date, max_workers=4):
     # Run download with max_workers support
     downloaded_files = run_incremental_download(court_code_dl, start_date, end_date, max_workers)
     
-    # Update all bench index files
-    court_dates = get_court_dates_from_index_files()
-    benches = court_dates.get(court_code, {})
-    for bench in benches.keys():
-        update_index_files_after_download(court_code, bench, downloaded_files, end_date)
+    # DON'T update index files here - wait for S3 upload to complete successfully
+    # Index files will be updated in sync_to_s3() after successful upload
     
     return downloaded_files
 
@@ -1218,11 +1238,11 @@ def upload_files_to_s3(court_code, downloaded_files):
     """Upload downloaded files to S3 bucket with progress bars"""
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available for upload")
-        return
+        return False
     
     if not downloaded_files['metadata'] and not downloaded_files['data']:
         print(f"No files to upload for court {court_code}")
-        return
+        return True  # No files to upload is considered success
     
     s3_client = boto3.client('s3')
     current_time = datetime.now()
@@ -1271,6 +1291,8 @@ def upload_files_to_s3(court_code, downloaded_files):
     for bench_name, files in bench_files.items():
         print(f"  {bench_name}: {len(files['metadata'])} metadata, {len(files['data'])} data")
     
+    upload_success = True  # Track overall success
+    
     # Upload files by bench
     for bench, files in bench_files.items():
         print(f"Processing bench: {bench}")
@@ -1286,6 +1308,8 @@ def upload_files_to_s3(court_code, downloaded_files):
                     success = upload_single_file_to_s3(
                         s3_client, metadata_file, s3_court_code, bench, year, 'metadata'
                     )
+                    if not success:
+                        upload_success = False
                     pbar.update(1)
         
         # Upload data files with progress bar
@@ -1296,17 +1320,28 @@ def upload_files_to_s3(court_code, downloaded_files):
                     success = upload_single_file_to_s3(
                         s3_client, data_file, s3_court_code, bench, year, 'data'
                     )
+                    if not success:
+                        upload_success = False
                     pbar.update(1)
         
         print(f"Completed individual file upload for bench {bench}")
         
         # Create and upload tar files for this bench
-        create_and_upload_tar_files(s3_client, s3_court_code, bench, year, files)
+        tar_success = create_and_upload_tar_files(s3_client, s3_court_code, bench, year, files)
+        if not tar_success:
+            upload_success = False
         
         # Create and upload parquet files for this bench
-        create_and_upload_parquet_files(s3_client, s3_court_code, bench, year, files)
+        parquet_success = create_and_upload_parquet_files(s3_client, s3_court_code, bench, year, files)
+        if not parquet_success:
+            upload_success = False
     
-    print(f"S3 upload completed for court {court_code}")
+    if upload_success:
+        print(f"S3 upload completed successfully for court {court_code}")
+    else:
+        print(f"S3 upload had failures for court {court_code}")
+    
+    return upload_success
 
 
 def upload_large_file_to_s3(s3_client, file_path, bucket, key, content_type, chunk_size=100*1024*1024):
@@ -1420,6 +1455,8 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
     
     print(f"Creating/updating tar files for bench {bench}")
     
+    overall_success = True  # Track success for both metadata and data tar files
+    
     # Handle metadata tar file
     if files['metadata']:
         metadata_tar_key = f"metadata/tar/year={year}/court={court_code}/bench={bench}/metadata.tar.gz"
@@ -1496,6 +1533,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
             print(f"  Successfully uploaded updated metadata tar")
         else:
             print(f"  Failed to upload metadata tar")
+            overall_success = False
     
     # Handle data/PDF tar file
     if files['data']:
@@ -1573,6 +1611,9 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
             print(f"  Successfully uploaded updated data tar")
         else:
             print(f"  Failed to upload data tar")
+            overall_success = False
+    
+    return overall_success
 
 
 
@@ -1581,12 +1622,12 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
     if not PARQUET_AVAILABLE:
         print("  Parquet libraries not available, skipping parquet creation")
         print("  Install with: pip install pyarrow")
-        return
+        return True  # Consider this success since it's optional
         
     # Only process metadata files (JSON) for parquet conversion
     if not files['metadata']:
         print("  No metadata files to convert to parquet")
-        return
+        return True
     
     try:
         print(f"  Creating/updating parquet files for bench {bench}")
@@ -1677,11 +1718,13 @@ def create_and_upload_parquet_files(s3_client, court_code, bench, year, files):
                 )
             
             print(f"  Successfully uploaded updated parquet file")
+            return True
             
     except Exception as e:
         print(f"  Failed to create/update parquet file: {e}")
         import traceback
         traceback.print_exc()
+        return False
 
 
 def extract_bench_from_path(file_path):
