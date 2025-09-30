@@ -567,11 +567,29 @@ def sync_to_s3(max_workers=4):
                 # For full sync, download up to today
                 end_date = today
 
-                # Update all bench index files with successful S3 sync date
-                court_dates_fresh = get_court_dates_from_index_files()
-                benches = court_dates_fresh.get(s3_court_code, {})
-                for bench in benches.keys():
-                    update_index_files_after_download(s3_court_code, bench, downloaded_files, end_date)
+                # Organize files by bench before updating index files
+                bench_files = {}
+                
+                # Process metadata files
+                for metadata_file in downloaded_files['metadata']:
+                    bench = extract_bench_from_path(metadata_file)
+                    if bench:
+                        if bench not in bench_files:
+                            bench_files[bench] = {'metadata': [], 'data': []}
+                        bench_files[bench]['metadata'].append(metadata_file)
+                
+                # Process data files  
+                for data_file in downloaded_files['data']:
+                    bench = extract_bench_from_path(data_file)
+                    if bench:
+                        if bench not in bench_files:
+                            bench_files[bench] = {'metadata': [], 'data': []}
+                        bench_files[bench]['data'].append(data_file)
+
+                # Update each bench index file with only its specific files
+                for bench, bench_specific_files in bench_files.items():
+                    print(f"Updating index for bench {bench} with {len(bench_specific_files['metadata'])} metadata and {len(bench_specific_files['data'])} data files")
+                    update_index_files_after_download(s3_court_code, bench, bench_specific_files, end_date)
                 
                 print(f"Index files updated for court {court_code}")
             else:
@@ -1466,12 +1484,33 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         temp_existing_tar = None
         
         try:
-            print(f"  Downloading existing metadata tar...")
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_tar_key)
+            # Get file size first
+            head_response = s3_client.head_object(Bucket=S3_BUCKET, Key=metadata_tar_key)
+            file_size = head_response['ContentLength']
+            file_size_human = format_size(file_size)
             
-            # Download existing tar to temp file
+            print(f"  Downloading existing metadata tar ({file_size_human})...")
+            
+            # Create temp file on disk
             temp_existing_tar = tempfile.NamedTemporaryFile(suffix='.tar.gz', delete=False)
-            temp_existing_tar.write(response['Body'].read())
+            
+            # For smaller files, can download directly, for larger ones, stream
+            if file_size > 100 * 1024 * 1024:  # If larger than 100MB, stream it
+                response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_tar_key)
+                chunk_size = 64 * 1024 * 1024  # 64MB chunks
+                downloaded = 0
+                
+                for chunk in iter(lambda: response['Body'].read(chunk_size), b''):
+                    temp_existing_tar.write(chunk)
+                    downloaded += len(chunk)
+                    progress = (downloaded / file_size) * 100
+                    print(f"\r  Progress: {progress:.1f}% ({format_size(downloaded)}/{file_size_human})", end='', flush=True)
+                print()  # New line
+            else:
+                # For smaller files, download normally
+                response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_tar_key)
+                temp_existing_tar.write(response['Body'].read())
+            
             temp_existing_tar.close()
             
             # Read existing files list to avoid duplicates
@@ -1491,6 +1530,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                 # First, add existing files if we have them
                 if temp_existing_tar and os.path.exists(temp_existing_tar.name):
                     try:
+                        print(f"  Merging existing metadata tar content...")
                         with tarfile.open(temp_existing_tar.name, 'r:gz') as existing_tar:
                             for member in existing_tar.getmembers():
                                 file_obj = existing_tar.extractfile(member)
@@ -1539,20 +1579,39 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
     if files['data']:
         data_tar_key = f"data/tar/year={year}/court={court_code}/bench={bench}/pdfs.tar"
         
-        # Try to download existing tar file
+        # Check existing tar file size first
         existing_files_set = set()
         temp_existing_tar = None
         
         try:
-            print(f"  Downloading existing data tar...")
-            response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_tar_key)
+            # Get file metadata to check size
+            head_response = s3_client.head_object(Bucket=S3_BUCKET, Key=data_tar_key)
+            file_size = head_response['ContentLength']
+            file_size_human = format_size(file_size)
             
-            # Download existing tar to temp file
+            print(f"  Existing data tar size: {file_size_human}")
+            print(f"  Downloading existing data tar to disk (streaming)...")
+            
+            # Create temp file for existing tar (on disk, not in RAM)
             temp_existing_tar = tempfile.NamedTemporaryFile(suffix='.tar', delete=False)
-            temp_existing_tar.write(response['Body'].read())
+            
+            # Stream download in chunks to avoid loading entire file into RAM
+            response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_tar_key)
+            chunk_size = 64 * 1024 * 1024  # 64MB chunks
+            downloaded = 0
+            
+            print(f"  Downloading {file_size_human} in {chunk_size // (1024*1024)}MB chunks...")
+            for chunk in iter(lambda: response['Body'].read(chunk_size), b''):
+                temp_existing_tar.write(chunk)
+                downloaded += len(chunk)
+                progress = (downloaded / file_size) * 100
+                print(f"\r  Progress: {progress:.1f}% ({format_size(downloaded)}/{file_size_human})", end='', flush=True)
+            
+            print()  # New line after progress
             temp_existing_tar.close()
             
-            # Read existing files list to avoid duplicates
+            # Now read the tar file list (this is fast, just reads the index)
+            print(f"  Reading existing tar file index...")
             with tarfile.open(temp_existing_tar.name, 'r') as existing_tar:
                 existing_files_set = set(existing_tar.getnames())
                 print(f"  Found existing data tar with {len(existing_files_set)} files")
@@ -1569,11 +1628,13 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
                 # First, add existing files if we have them
                 if temp_existing_tar and os.path.exists(temp_existing_tar.name):
                     try:
+                        print(f"  Merging existing data tar content...")
                         with tarfile.open(temp_existing_tar.name, 'r') as existing_tar:
                             for member in existing_tar.getmembers():
                                 file_obj = existing_tar.extractfile(member)
                                 if file_obj:
                                     new_tar.addfile(member, file_obj)
+                        print(f"  Merged {len(existing_files_set)} existing files")
                     except Exception as e:
                         print(f"  Warning: Could not read existing tar content: {e}")
                 
