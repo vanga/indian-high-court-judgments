@@ -564,24 +564,45 @@ def sync_to_s3(max_workers=4):
             downloaded_files = download_bench_data(s3_court_code, bench_name, bench_latest_date, max_workers)
             
             if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
-                # Upload files to S3 first
-                upload_success = upload_files_to_s3(court_code, downloaded_files)
+                # Upload files to S3 - returns dict of bench -> success status
+                bench_upload_status = upload_files_to_s3(court_code, downloaded_files)
                 
-                # Only update index files if S3 upload was successful
-                if upload_success:
-                    print(f"    S3 upload successful, updating index files for bench {bench_name}")
-                    today = datetime.now().date()
-                    
-                    # Calculate end_date for index update
-                    start_date = bench_latest_date + timedelta(days=1)
-                    end_date = today
-                    
-                    # Update index files for this specific bench
-                    update_index_files_after_download(s3_court_code, bench_name, downloaded_files, end_date)
-                    
-                    print(f"    Index files updated for bench {bench_name}")
-                else:
-                    print(f"    S3 upload failed for bench {bench_name}, NOT updating index files")
+                # Update index files for each bench that was successfully uploaded
+                today = datetime.now().date()
+                
+                for uploaded_bench, upload_success in bench_upload_status.items():
+                    if upload_success:
+                        print(f"    S3 upload successful, updating index files for bench {uploaded_bench}")
+                        
+                        # Calculate end_date for index update
+                        # Get the latest date for this uploaded bench
+                        if uploaded_bench in benches:
+                            uploaded_bench_latest_str = benches[uploaded_bench]
+                            try:
+                                uploaded_bench_latest_date = datetime.fromisoformat(uploaded_bench_latest_str.replace('Z', '+00:00')).date()
+                            except:
+                                uploaded_bench_latest_date = bench_latest_date  # Fallback to current bench date
+                        else:
+                            uploaded_bench_latest_date = bench_latest_date  # Fallback to current bench date
+                        
+                        start_date = uploaded_bench_latest_date + timedelta(days=1)
+                        end_date = today
+                        
+                        # Filter files for this specific bench before updating index
+                        bench_specific_files = {'metadata': [], 'data': []}
+                        for metadata_file in downloaded_files.get('metadata', []):
+                            if extract_bench_from_path(metadata_file) == uploaded_bench:
+                                bench_specific_files['metadata'].append(metadata_file)
+                        for data_file in downloaded_files.get('data', []):
+                            if extract_bench_from_path(data_file) == uploaded_bench:
+                                bench_specific_files['data'].append(data_file)
+                        
+                        # Update index files for this specific bench
+                        update_index_files_after_download(s3_court_code, uploaded_bench, bench_specific_files, end_date)
+                        
+                        print(f"    Index files updated for bench {uploaded_bench}")
+                    else:
+                        print(f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files")
             else:
                 print(f"    No new data found for bench {bench_name}")
         
@@ -1185,14 +1206,14 @@ class Downloader:
 
 
 def upload_files_to_s3(court_code, downloaded_files):
-    """Upload downloaded files to S3 bucket with progress bars"""
+    """Upload downloaded files to S3 bucket with progress bars. Returns dict of bench -> success status"""
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available for upload")
-        return False
+        return {}
     
     if not downloaded_files['metadata'] and not downloaded_files['data']:
         print(f"No files to upload for court {court_code}")
-        return True  # No files to upload is considered success
+        return {}  # Empty dict means no benches to upload
     
     s3_client = boto3.client('s3')
     current_time = datetime.now()
@@ -1241,11 +1262,13 @@ def upload_files_to_s3(court_code, downloaded_files):
     for bench_name, files in bench_files.items():
         print(f"  {bench_name}: {len(files['metadata'])} metadata, {len(files['data'])} data")
     
-    upload_success = True  # Track overall success
+    bench_upload_status = {}  # Track success per bench
     
     # Upload files by bench
     for bench, files in bench_files.items():
         print(f"Processing bench: {bench}")
+        
+        bench_success = True  # Track this bench's upload success
         
         # Convert court code to S3 format
         s3_court_code = court_code.replace('~', '_')
@@ -1259,7 +1282,7 @@ def upload_files_to_s3(court_code, downloaded_files):
                         s3_client, metadata_file, s3_court_code, bench, year, 'metadata'
                     )
                     if not success:
-                        upload_success = False
+                        bench_success = False
                     pbar.update(1)
         
         # Upload data files with progress bar
@@ -1271,7 +1294,7 @@ def upload_files_to_s3(court_code, downloaded_files):
                         s3_client, data_file, s3_court_code, bench, year, 'data'
                     )
                     if not success:
-                        upload_success = False
+                        bench_success = False
                     pbar.update(1)
         
         print(f"Completed individual file upload for bench {bench}")
@@ -1279,19 +1302,31 @@ def upload_files_to_s3(court_code, downloaded_files):
         # Create and upload tar files for this bench
         tar_success = create_and_upload_tar_files(s3_client, s3_court_code, bench, year, files)
         if not tar_success:
-            upload_success = False
+            bench_success = False
         
         # Create and upload parquet files for this bench
         parquet_success = create_and_upload_parquet_files(s3_client, s3_court_code, bench, year, files)
         if not parquet_success:
-            upload_success = False
+            bench_success = False
+        
+        # Store this bench's upload status
+        bench_upload_status[bench] = bench_success
+        
+        if bench_success:
+            print(f"  Successfully uploaded all files for bench {bench}")
+        else:
+            print(f"  Some files failed to upload for bench {bench}")
     
-    if upload_success:
-        print(f"S3 upload completed successfully for court {court_code}")
-    else:
-        print(f"S3 upload had failures for court {court_code}")
+    # Print overall summary
+    successful_benches = [b for b, success in bench_upload_status.items() if success]
+    failed_benches = [b for b, success in bench_upload_status.items() if not success]
     
-    return upload_success
+    if successful_benches:
+        print(f"S3 upload completed successfully for benches: {', '.join(successful_benches)}")
+    if failed_benches:
+        print(f"S3 upload had failures for benches: {', '.join(failed_benches)}")
+    
+    return bench_upload_status
 
 
 def upload_large_file_to_s3(s3_client, file_path, bucket, key, content_type, chunk_size=100*1024*1024):
