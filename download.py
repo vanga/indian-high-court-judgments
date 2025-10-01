@@ -266,7 +266,7 @@ def get_bench_codes():
 
 
 def get_court_dates_from_index_files():
-    """Get updated_at dates from metadata index files"""
+    """Get updated_at dates from data index files"""
     # return {'20_7': {'jhar_pg': '2025-05-05T00:00:00'}}  # For testing, return fixed data
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
@@ -275,9 +275,9 @@ def get_court_dates_from_index_files():
     s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
     
     year = datetime.now().year
-    prefix = f"metadata/tar/year={year}/"
+    prefix = f"data/tar/year={year}/"
     
-    print(f"Reading dates from index files: {S3_BUCKET}/{prefix}")
+    print(f"Reading dates from data index files: {S3_BUCKET}/{prefix}")
     
     result = {}
     try:
@@ -285,7 +285,7 @@ def get_court_dates_from_index_files():
         for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
-                if not key.endswith("metadata.index.json"):
+                if not key.endswith("data.index.json"):
                     continue
                     
                 # Extract court and bench from path
@@ -535,114 +535,103 @@ def sync_to_s3(max_workers=4):
         print("No existing data found in S3, exiting")
         return
     
-    total_courts = len(court_dates)
-    print(f"Found {total_courts} courts to process")
+
     
     # Filter for testing - only process court 10_8 
     # court_dates = {k: v for k, v in court_dates.items() if k == '10_8'}
     
+    # Count total benches across all courts  
+    total_benches = sum(len(benches) for benches in court_dates.values())
+    print(f"Found {len(court_dates)} courts with {total_benches} total benches to process")
+    
     for s3_court_code, benches in court_dates.items():
         court_code = s3_court_code.replace('_', '~')
-        print(f"Processing court {court_code}")
+        print(f"Processing court {court_code} with {len(benches)} benches")
         
-        latest_date = get_latest_court_date(benches)
-        print(f"Latest date for court {court_code}: {latest_date}")
-        
-        downloaded_files = download_court_data(s3_court_code, latest_date, max_workers)
-        
-        if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
-            # Upload files to S3 first
-            upload_success = upload_files_to_s3(court_code, downloaded_files)
+        # Process each bench individually
+        for bench_name, updated_at_str in benches.items():
+            print(f"  Processing bench: {bench_name}")
             
-            # Only update index files if S3 upload was successful
-            if upload_success:
-                print(f"S3 upload successful, updating index files for court {court_code}")
-                today=datetime.now().date()
-                # Calculate end_date for index update (start_date + 3 for testing)
-                start_date = latest_date + timedelta(days=1)
-
-                # Download only 3 days after latest date (for testing/incremental updates)
-                # end_date = min(latest_date + timedelta(days=3), today)
-
-                # For full sync, download up to today
-                end_date = today
-
-                # Organize files by bench before updating index files
-                bench_files = {}
+            # Get the latest date for this specific bench
+            try:
+                bench_latest_date = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00')).date()
+                print(f"    Latest date for bench {bench_name}: {bench_latest_date}")
+            except Exception as e:
+                print(f"    Warning: Invalid date {updated_at_str} for bench {bench_name}: {e}")
+                continue
+            
+            # Download data for this specific bench
+            downloaded_files = download_bench_data(s3_court_code, bench_name, bench_latest_date, max_workers)
+            
+            if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
+                # Upload files to S3 first
+                upload_success = upload_files_to_s3(court_code, downloaded_files)
                 
-                # Process metadata files
-                for metadata_file in downloaded_files['metadata']:
-                    bench = extract_bench_from_path(metadata_file)
-                    if bench:
-                        if bench not in bench_files:
-                            bench_files[bench] = {'metadata': [], 'data': []}
-                        bench_files[bench]['metadata'].append(metadata_file)
-                
-                # Process data files  
-                for data_file in downloaded_files['data']:
-                    bench = extract_bench_from_path(data_file)
-                    if bench:
-                        if bench not in bench_files:
-                            bench_files[bench] = {'metadata': [], 'data': []}
-                        bench_files[bench]['data'].append(data_file)
-
-                # Update each bench index file with only its specific files
-                for bench, bench_specific_files in bench_files.items():
-                    print(f"Updating index for bench {bench} with {len(bench_specific_files['metadata'])} metadata and {len(bench_specific_files['data'])} data files")
-                    update_index_files_after_download(s3_court_code, bench, bench_specific_files, end_date)
-                
-                print(f"Index files updated for court {court_code}")
+                # Only update index files if S3 upload was successful
+                if upload_success:
+                    print(f"    S3 upload successful, updating index files for bench {bench_name}")
+                    today = datetime.now().date()
+                    
+                    # Calculate end_date for index update
+                    start_date = bench_latest_date + timedelta(days=1)
+                    end_date = today
+                    
+                    # Update index files for this specific bench
+                    update_index_files_after_download(s3_court_code, bench_name, downloaded_files, end_date)
+                    
+                    print(f"    Index files updated for bench {bench_name}")
+                else:
+                    print(f"    S3 upload failed for bench {bench_name}, NOT updating index files")
             else:
-                print(f"S3 upload failed for court {court_code}, NOT updating index files")
+                print(f"    No new data found for bench {bench_name}")
         
         print(f"Completed court {court_code}")
     
     print("S3 sync completed for all courts")
 
 
-def get_latest_court_date(benches):
-    """Get the most recent date from all benches"""
-    latest_date = None
-    for bench, updated_at_str in benches.items():
-        try:
-            date = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00')).date()
-            if latest_date is None or date > latest_date:
-                latest_date = date
-        except Exception as e:
-            print(f"Warning: Invalid date {updated_at_str}: {e}")
-    return latest_date
 
-
-def download_court_data(court_code, latest_date, max_workers=4):
-    """Download data for a specific court"""
+def download_bench_data(court_code, bench_name, latest_date, max_workers=4):
+    """Download data for a specific bench of a court"""
     today = datetime.now().date()
     
     # Calculate the next date to download (latest_date + 1)
     start_date = latest_date + timedelta(days=1)
-
-    # Download only 3 days after latest date (for testing/incremental updates)
-    # end_date = min(latest_date + timedelta(days=3), today)
 
     # For full sync, download up to today
     end_date = today
 
     # Check if we need to download anything
     if start_date > end_date:
-        print(f"Court {court_code}: No data to download (start_date {start_date} > end_date {end_date})")
+        print(f"    Court {court_code}, bench {bench_name}: No data to download (start_date {start_date} > end_date {end_date})")
         return {'metadata': [], 'data': []}
     
     # Convert court code for download (replace _ with ~)
     court_code_dl = court_code.replace('_', '~')
     
-    print(f"Downloading: Court {court_code}: {start_date} to {end_date}")
+    print(f"    Downloading: Court {court_code}, bench {bench_name}: {start_date} to {end_date}")
     
-    # Run download with max_workers support
-    downloaded_files = run_incremental_download(court_code_dl, start_date, end_date, max_workers)
+    # Run download with max_workers support (this downloads for entire court)
+    all_downloaded_files = run_incremental_download(court_code_dl, start_date, end_date, max_workers)
     
-    # DON'T update index files here - wait for S3 upload to complete successfully
-    # Index files will be updated in sync_to_s3() after successful upload
+    # Filter files to only include those from the specific bench we're processing
+    bench_filtered_files = {'metadata': [], 'data': []}
     
-    return downloaded_files
+    # Filter metadata files
+    for metadata_file in all_downloaded_files.get('metadata', []):
+        file_bench = extract_bench_from_path(metadata_file)
+        if file_bench == bench_name:
+            bench_filtered_files['metadata'].append(metadata_file)
+    
+    # Filter data files
+    for data_file in all_downloaded_files.get('data', []):
+        file_bench = extract_bench_from_path(data_file)
+        if file_bench == bench_name:
+            bench_filtered_files['data'].append(data_file)
+    
+    print(f"    Filtered to {len(bench_filtered_files['metadata'])} metadata and {len(bench_filtered_files['data'])} data files for bench {bench_name}")
+    
+    return bench_filtered_files
 
 
 class Downloader:
@@ -1193,63 +1182,6 @@ class Downloader:
                 # results_available = False
 
 
-# class FileTrackingDownloader(Downloader):
-#     """Downloader that tracks downloaded files for S3 upload"""
-    
-#     def __init__(self, task: CourtDateTask, downloaded_files: dict, force_pdf_download=False):
-#         super().__init__(task)
-#         self.downloaded_files = downloaded_files
-#         self.force_pdf_download = force_pdf_download
-    
-#     def process_result_row(self, row, row_pos):
-#         """Override to track downloaded files"""
-#         html = row[1]
-#         soup = BeautifulSoup(html, "html.parser")
-        
-#         if not (soup.button and "onclick" in soup.button.attrs):
-#             logger.info(
-#                 f"No button found, likely multi language judgment, task: {self.task}"
-#             )
-#             with open("html-parse-failures.txt", "a") as f:
-#                 f.write(html + "\n")
-#             return False
-            
-#         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
-#         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
-#         is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
-        
-#         # Force download PDFs even if they exist, or download if not present
-#         if self.force_pdf_download or not is_pdf_present:
-#             is_fresh_download = self.download_pdf(pdf_fragment, row_pos)
-#             if is_fresh_download:
-#                 # Track the newly downloaded PDF
-#                 self.downloaded_files['data'].append(str(pdf_output_path))
-#         else:
-#             is_fresh_download = False
-            
-#         # If PDF exists (even if not newly downloaded), track it for tar creation
-#         if is_pdf_present or is_fresh_download:
-#             if str(pdf_output_path) not in self.downloaded_files['data']:
-#                 self.downloaded_files['data'].append(str(pdf_output_path))
-            
-#         # Always create/update metadata
-#         metadata_output = pdf_output_path.with_suffix(".json")
-#         metadata = {
-#             "court_code": self.court_code,
-#             "court_name": self.court_name,
-#             "raw_html": html,
-#             "pdf_link": pdf_fragment,
-#             "downloaded": is_pdf_present or is_fresh_download,
-#         }
-#         metadata_output.parent.mkdir(parents=True, exist_ok=True)
-#         with open(metadata_output, "w") as f:
-#             json.dump(metadata, f)
-            
-#         # Track the metadata file (avoid duplicates)
-#         if str(metadata_output) not in self.downloaded_files['metadata']:
-#             self.downloaded_files['metadata'].append(str(metadata_output))
-        
-#         return is_fresh_download
 
 
 def upload_files_to_s3(court_code, downloaded_files):
