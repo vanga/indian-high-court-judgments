@@ -548,63 +548,88 @@ def sync_to_s3(max_workers=4):
         court_code = s3_court_code.replace('_', '~')
         print(f"Processing court {court_code} with {len(benches)} benches")
         
-        # Process each bench individually
+        # Step 1: Find the earliest date among all benches for this court
+        earliest_date = None
+        bench_dates = {}  # Store each bench's latest date for later use
+        
         for bench_name, updated_at_str in benches.items():
-            print(f"  Processing bench: {bench_name}")
-            
-            # Get the latest date for this specific bench
             try:
                 bench_latest_date = datetime.fromisoformat(updated_at_str.replace('Z', '+00:00')).date()
-                print(f"    Latest date for bench {bench_name}: {bench_latest_date}")
+                bench_dates[bench_name] = bench_latest_date
+                print(f"  Bench {bench_name}: latest date = {bench_latest_date}")
+                
+                if earliest_date is None or bench_latest_date < earliest_date:
+                    earliest_date = bench_latest_date
             except Exception as e:
-                print(f"    Warning: Invalid date {updated_at_str} for bench {bench_name}: {e}")
+                print(f"  Warning: Invalid date {updated_at_str} for bench {bench_name}: {e}")
+                continue
+        
+        if not bench_dates:
+            print(f"  No valid bench dates found for court {court_code}, skipping")
+            continue
+        
+        print(f"  Earliest date across all benches: {earliest_date}")
+        
+        # Step 2: Download for entire court from earliest date to today (ONCE)
+        today = datetime.now().date()
+        start_date = earliest_date + timedelta(days=1)
+        
+        if start_date > today:
+            print(f"  No data to download for court {court_code} (start_date {start_date} > today {today})")
+            continue
+        
+        print(f"  Downloading court {court_code}: {start_date} to {today}")
+        all_downloaded_files = run_incremental_download(court_code, start_date, today, max_workers)
+        
+        if not all_downloaded_files or (not all_downloaded_files['metadata'] and not all_downloaded_files['data']):
+            print(f"  No files downloaded for court {court_code}")
+            continue
+        
+        print(f"  Downloaded {len(all_downloaded_files['metadata'])} metadata and {len(all_downloaded_files['data'])} data files")
+        
+        # Step 3: Split downloaded files by bench
+        bench_files = {}
+        for bench_name in bench_dates.keys():
+            bench_files[bench_name] = {'metadata': [], 'data': []}
+        
+        # Distribute metadata files to benches
+        for metadata_file in all_downloaded_files.get('metadata', []):
+            file_bench = extract_bench_from_path(metadata_file)
+            if file_bench and file_bench in bench_files:
+                bench_files[file_bench]['metadata'].append(metadata_file)
+        
+        # Distribute data files to benches
+        for data_file in all_downloaded_files.get('data', []):
+            file_bench = extract_bench_from_path(data_file)
+            if file_bench and file_bench in bench_files:
+                bench_files[file_bench]['data'].append(data_file)
+        
+        # Show what we found for each bench
+        for bench_name, files in bench_files.items():
+            print(f"  Found {len(files['metadata'])} metadata and {len(files['data'])} data files for bench {bench_name}")
+        
+        # Step 4: Upload and update index for each bench that has files
+        for bench_name, files in bench_files.items():
+            if not files['metadata'] and not files['data']:
+                print(f"  No new files for bench {bench_name}, skipping")
                 continue
             
-            # Download data for this specific bench
-            downloaded_files = download_bench_data(s3_court_code, bench_name, bench_latest_date, max_workers)
+            print(f"  Uploading files for bench {bench_name}...")
             
-            if downloaded_files and (downloaded_files['metadata'] or downloaded_files['data']):
-                # Upload files to S3 - returns dict of bench -> success status
-                bench_upload_status = upload_files_to_s3(court_code, downloaded_files)
-                
-                # Update index files for each bench that was successfully uploaded
-                today = datetime.now().date()
-                
-                for uploaded_bench, upload_success in bench_upload_status.items():
-                    if upload_success:
-                        print(f"    S3 upload successful, updating index files for bench {uploaded_bench}")
-                        
-                        # Calculate end_date for index update
-                        # Get the latest date for this uploaded bench
-                        if uploaded_bench in benches:
-                            uploaded_bench_latest_str = benches[uploaded_bench]
-                            try:
-                                uploaded_bench_latest_date = datetime.fromisoformat(uploaded_bench_latest_str.replace('Z', '+00:00')).date()
-                            except:
-                                uploaded_bench_latest_date = bench_latest_date  # Fallback to current bench date
-                        else:
-                            uploaded_bench_latest_date = bench_latest_date  # Fallback to current bench date
-                        
-                        start_date = uploaded_bench_latest_date + timedelta(days=1)
-                        end_date = today
-                        
-                        # Filter files for this specific bench before updating index
-                        bench_specific_files = {'metadata': [], 'data': []}
-                        for metadata_file in downloaded_files.get('metadata', []):
-                            if extract_bench_from_path(metadata_file) == uploaded_bench:
-                                bench_specific_files['metadata'].append(metadata_file)
-                        for data_file in downloaded_files.get('data', []):
-                            if extract_bench_from_path(data_file) == uploaded_bench:
-                                bench_specific_files['data'].append(data_file)
-                        
-                        # Update index files for this specific bench
-                        update_index_files_after_download(s3_court_code, uploaded_bench, bench_specific_files, end_date)
-                        
-                        print(f"    Index files updated for bench {uploaded_bench}")
-                    else:
-                        print(f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files")
-            else:
-                print(f"    No new data found for bench {bench_name}")
+            # Upload files to S3 - returns dict of bench -> success status
+            bench_upload_status = upload_files_to_s3(court_code, files)
+            
+            # Update index files for successfully uploaded benches
+            for uploaded_bench, upload_success in bench_upload_status.items():
+                if upload_success:
+                    print(f"    S3 upload successful, updating index files for bench {uploaded_bench}")
+                    
+                    # Use today as the end_date for index update (we downloaded up to today)
+                    update_index_files_after_download(s3_court_code, uploaded_bench, files, today)
+                    
+                    print(f"    Index files updated for bench {uploaded_bench}")
+                else:
+                    print(f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files")
         
         print(f"Completed court {court_code}")
     
