@@ -1371,9 +1371,13 @@ def upload_large_file_to_s3(s3_client, file_path, bucket, key, content_type, chu
     file_size = os.path.getsize(file_path)
     print(f"  File size: {format_size(file_size)}")
     
-    # Use regular upload for files smaller than chunk_size (100MB by default)
-    if file_size <= chunk_size:
-        print(f"  Using standard upload (file < {format_size(chunk_size)})")
+    # AWS S3 limits: Single PUT max 5GB, Multipart parts can be 5MB-5GB
+    STANDARD_UPLOAD_THRESHOLD = 5 * 1024 * 1024 * 1024  # 5GB (AWS single PUT limit)
+    LARGE_MULTIPART_CHUNK = 5 * 1024 * 1024 * 1024  # 5GB per part for very large files
+    
+    # Use regular upload for files smaller than 5GB (AWS limit for single PUT)
+    if file_size < STANDARD_UPLOAD_THRESHOLD:
+        print(f"  Using standard upload (file < 5GB)")
         try:
             with open(file_path, 'rb') as f:
                 s3_client.put_object(
@@ -1388,8 +1392,10 @@ def upload_large_file_to_s3(s3_client, file_path, bucket, key, content_type, chu
             print(f"  ERROR: Standard upload failed: {e}")
             return False
     
-    # Use multipart upload for large files
-    print(f"  Using multipart upload (file >= {format_size(chunk_size)})")
+    # Use multipart upload for large files (>= 5GB)
+    # For files >= 5GB, use 5GB chunks to minimize part count and API calls
+    chunk_size = LARGE_MULTIPART_CHUNK
+    print(f"  Using multipart upload with 5GB chunks (file >= 5GB)")
     
     try:
         # Initialize multipart upload
@@ -1589,7 +1595,7 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
             
             # Stream download in chunks to avoid loading entire file into RAM
             response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_tar_key)
-            chunk_size = 64 * 1024 * 1024  # 64MB chunks
+            chunk_size = 256 * 1024 * 1024  # 256MB chunks (optimized for faster downloads)
             downloaded = 0
             
             print(f"  Downloading {file_size_human} in {chunk_size // (1024*1024)}MB chunks...")
