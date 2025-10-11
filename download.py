@@ -1619,52 +1619,71 @@ def create_and_upload_tar_files(s3_client, court_code, bench, year, files):
         except Exception as e:
             print(f"  Warning: Could not download existing data tar: {e}")
         
-        # Create new tar file with both existing and new content
-        with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as temp_new_tar:
-            with tarfile.open(temp_new_tar.name, 'w') as new_tar:
+        # Use APPEND mode for existing tar or CREATE mode for new tar
+        if temp_existing_tar and os.path.exists(temp_existing_tar.name):
+            # APPEND MODE - only adds new files to end of existing tar
+            print(f"  Using APPEND mode to add new files to existing tar...")
+            with tarfile.open(temp_existing_tar.name, 'a') as tar:  # 'a' = APPEND mode
+                # Get existing files list (fast - just reads index)
+                existing_files = set(tar.getnames())
+                print(f"  Existing tar contains {len(existing_files)} files")
                 
-                # First, add existing files if we have them
-                if temp_existing_tar and os.path.exists(temp_existing_tar.name):
-                    try:
-                        print(f"  Merging existing data tar content...")
-                        with tarfile.open(temp_existing_tar.name, 'r') as existing_tar:
-                            for member in existing_tar.getmembers():
-                                file_obj = existing_tar.extractfile(member)
-                                if file_obj:
-                                    new_tar.addfile(member, file_obj)
-                        print(f"  Merged {len(existing_files_set)} existing files")
-                    except Exception as e:
-                        print(f"  Warning: Could not read existing tar content: {e}")
-                
-                # Then add new files (skip duplicates)
+                # Append only new files to the end
                 new_files_added = 0
-                with tqdm(total=len(files['data']), desc="Adding to data tar", unit="file") as pbar:
+                with tqdm(total=len(files['data']), desc="Appending to data tar", unit="file") as pbar:
                     for data_file in files['data']:
                         arcname = os.path.basename(data_file)
-                        if arcname not in existing_files_set:
-                            new_tar.add(data_file, arcname=arcname)
+                        if arcname not in existing_files:
+                            tar.add(data_file, arcname=arcname)  # Appends to END of tar
                             new_files_added += 1
-                            pbar.set_postfix_str(f"Added {new_files_added}")
+                            pbar.set_postfix_str(f"Appended {new_files_added}")
                         else:
                             pbar.set_postfix_str(f"Skipped duplicate")
                         pbar.update(1)
                 
-                print(f"  Added {new_files_added} new data files to tar")
-        
-        # Upload updated tar to S3 (with multipart support for large files)
-        print(f"  Uploading updated data tar...")
-        success = upload_large_file_to_s3(
-            s3_client, 
-            temp_new_tar.name, 
-            S3_BUCKET, 
-            data_tar_key, 
-            'application/x-tar'
-        )
-        
-        # Clean up temp files
-        os.unlink(temp_new_tar.name)
-        if temp_existing_tar and os.path.exists(temp_existing_tar.name):
+                print(f"  Appended {new_files_added} new files to existing tar")
+            
+            # Upload the modified tar (same file, with new data appended)
+            print(f"  Uploading updated data tar...")
+            success = upload_large_file_to_s3(
+                s3_client, 
+                temp_existing_tar.name,  # Upload the appended tar
+                S3_BUCKET, 
+                data_tar_key, 
+                'application/x-tar'
+            )
+            
+            # Clean up temp file
             os.unlink(temp_existing_tar.name)
+            
+        else:
+            # CREATE MODE - no existing tar, create new one
+            print(f"  Creating new data tar file...")
+            with tempfile.NamedTemporaryFile(suffix='.tar', delete=False) as temp_new_tar:
+                with tarfile.open(temp_new_tar.name, 'w') as tar:  # 'w' = CREATE mode
+                    new_files_added = 0
+                    with tqdm(total=len(files['data']), desc="Creating data tar", unit="file") as pbar:
+                        for data_file in files['data']:
+                            arcname = os.path.basename(data_file)
+                            tar.add(data_file, arcname=arcname)
+                            new_files_added += 1
+                            pbar.set_postfix_str(f"Added {new_files_added}")
+                            pbar.update(1)
+                    
+                    print(f"  Created new tar with {new_files_added} files")
+            
+            # Upload new tar to S3
+            print(f"  Uploading new data tar...")
+            success = upload_large_file_to_s3(
+                s3_client, 
+                temp_new_tar.name, 
+                S3_BUCKET, 
+                data_tar_key, 
+                'application/x-tar'
+            )
+            
+            # Clean up temp file
+            os.unlink(temp_new_tar.name)
         
         if success:
             print(f"  Successfully uploaded updated data tar")
