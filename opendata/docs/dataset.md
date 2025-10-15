@@ -5,8 +5,8 @@ This dataset contains judgements from the Indian High Courts, downloaded from [e
 
 ## Data
  * 25 high courts
- * ~16M judgments
- * ~1TB of data
+ * ~16.7M judgments
+ * ~1.11 TB of data
  * Code used to download and process the data is [here](https://github.com/vanga/indian-high-court-judgments)
 
 #### Update cadence
