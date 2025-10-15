@@ -76,6 +76,9 @@ LOCAL_DIR = "./local_hc_metadata"
 BENCH_CODES_FILE = "bench-codes.json"
 OUTPUT_DIR = output_dir  # Reuse existing output_dir
 
+# Global cache for existing files in S3 (used during sync_s3 to avoid re-downloads)
+_existing_files_cache = {}
+
 
 def format_size(size_bytes):
     """Format bytes into human readable string"""
@@ -217,7 +220,9 @@ def generate_tasks(
 def process_task(task):
     """Process a single court-date task"""
     try:
-        downloader = Downloader(task)
+        # Use global cache if available (set during sync_s3)
+        global _existing_files_cache
+        downloader = Downloader(task, existing_files_cache=_existing_files_cache if _existing_files_cache else None)
         downloader.download()
     except Exception as e:
         court_codes = get_court_codes()
@@ -331,6 +336,62 @@ def read_updated_at_from_index(s3, bucket, key):
     except Exception as e:
         print(f"Warning: Failed to read {key}: {e}")
         return None
+
+
+def get_existing_files_from_s3(court_code, benches):
+    """
+    Fetch existing filenames from S3 index files for all benches of a court.
+    Returns a dict: {bench_name: {'metadata': set(), 'data': set()}}
+    """
+    if not S3_AVAILABLE:
+        return {}
+    
+    s3 = boto3.client('s3', config=Config(signature_version=UNSIGNED))
+    year = datetime.now().year
+    
+    existing_files = {}
+    
+    for bench_name in benches.keys():
+        existing_files[bench_name] = {'metadata': set(), 'data': set()}
+        
+        # Fetch metadata index
+        metadata_key = f"metadata/tar/year={year}/court={court_code}/bench={bench_name}/metadata.index.json"
+        try:
+            response = s3.get_object(Bucket=S3_BUCKET, Key=metadata_key)
+            index_data = json.loads(response['Body'].read().decode('utf-8'))
+            
+            # Extract filenames (without .json extension for comparison)
+            for file_info in index_data.get('files', []):
+                filename = file_info.get('name', '')
+                if filename:
+                    # Store without extension for easier comparison
+                    base_name = filename.replace('.json', '')
+                    existing_files[bench_name]['metadata'].add(base_name)
+        except Exception as e:
+            # Index file might not exist yet, that's okay
+            pass
+        
+        # Fetch data index
+        data_key = f"data/tar/year={year}/court={court_code}/bench={bench_name}/data.index.json"
+        try:
+            response = s3.get_object(Bucket=S3_BUCKET, Key=data_key)
+            index_data = json.loads(response['Body'].read().decode('utf-8'))
+            
+            # Extract filenames
+            for file_info in index_data.get('files', []):
+                filename = file_info.get('name', '')
+                if filename:
+                    existing_files[bench_name]['data'].add(filename)
+        except Exception as e:
+            # Index file might not exist yet, that's okay
+            pass
+    
+    # Print summary
+    total_metadata = sum(len(bench['metadata']) for bench in existing_files.values())
+    total_data = sum(len(bench['data']) for bench in existing_files.values())
+    print(f"  Found {total_metadata} existing metadata files and {total_data} existing PDFs in S3")
+    
+    return existing_files
 
 
 def update_index_files_after_download(court_code, bench, new_files, to_date=None):
@@ -548,6 +609,11 @@ def sync_to_s3(max_workers=4):
         court_code = s3_court_code.replace('_', '~')
         print(f"Processing court {court_code} with {len(benches)} benches")
         
+        # **NEW: Fetch existing files from S3 to avoid re-downloading**
+        print(f"  Fetching existing files from S3 for optimization...")
+        global _existing_files_cache
+        _existing_files_cache = get_existing_files_from_s3(s3_court_code, benches)
+        
         # Step 1: Find the earliest date among all benches for this court
         earliest_date = None
         bench_dates = {}  # Store each bench's latest date for later use
@@ -571,6 +637,7 @@ def sync_to_s3(max_workers=4):
         print(f"  Earliest date across all benches: {earliest_date}")
         
         # Step 2: Download for entire court from earliest date to today (ONCE)
+        # Files already in S3 will be skipped automatically via existing_files_cache
         today = datetime.now().date()
         start_date = earliest_date + timedelta(days=1)
         
@@ -579,6 +646,7 @@ def sync_to_s3(max_workers=4):
             continue
         
         print(f"  Downloading court {court_code}: {start_date} to {today}")
+        print(f"  (Files already in S3 will be automatically skipped)")
         all_downloaded_files = run_incremental_download(court_code, start_date, today, max_workers)
         
         if not all_downloaded_files or (not all_downloaded_files['metadata'] and not all_downloaded_files['data']):
@@ -631,6 +699,9 @@ def sync_to_s3(max_workers=4):
                 else:
                     print(f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files")
         
+        # Clear cache for this court
+        _existing_files_cache = {}
+        
         print(f"Completed court {court_code}")
     
     print("S3 sync completed for all courts")
@@ -681,7 +752,7 @@ def download_bench_data(court_code, bench_name, latest_date, max_workers=4):
 
 
 class Downloader:
-    def __init__(self, task: CourtDateTask):
+    def __init__(self, task: CourtDateTask, existing_files_cache=None):
         self.task = task
         self.root_url = "https://judgments.ecourts.gov.in"
         self.search_url = f"{self.root_url}/pdfsearch/?p=pdf_search/home/"
@@ -700,6 +771,9 @@ class Downloader:
         self.session_id = None
         self.ecourts_token = None
         self.app_token = "490a7e9b99e4553980213a8b86b3235abc51612b038dbdb1f9aa706b633bbd6c"  # not lint skip/
+        
+        # NEW: Cache of existing files in S3 to avoid re-downloading
+        self.existing_files_cache = existing_files_cache or {}
 
     def _results_exist_in_search_response(self, res_dict):
 
@@ -823,6 +897,25 @@ class Downloader:
             # TODO: requires special parsing
             return False
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
+        
+        # **NEW: Check if file already exists in S3 (for sync_s3 optimization)**
+        if self.existing_files_cache:
+            file_bench = extract_bench_from_path(pdf_fragment)
+            filename = os.path.basename(pdf_fragment)
+            
+            # Check in cache for this bench
+            if file_bench in self.existing_files_cache:
+                bench_cache = self.existing_files_cache[file_bench]
+                
+                # Extract just the filename without extension for comparison
+                base_filename = filename.replace('.pdf', '')
+                
+                # Check if this file already exists in S3
+                if base_filename in bench_cache.get('metadata', set()) or \
+                   filename in bench_cache.get('data', set()):
+                    logger.debug(f"Skipping {filename} - already exists in S3 for bench {file_bench}")
+                    return False
+        
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
         pdf_needs_download = not is_pdf_present
