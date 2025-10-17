@@ -10,6 +10,9 @@ import concurrent.futures
 import os
 import shutil
 
+# Import shared HTML parsing utilities
+from html_utils import parse_case_details_from_html
+
 ADD_PDF_METADATA = False
 
 src = Path("./data")
@@ -157,59 +160,9 @@ class MetadataProcessor:
             "raw_html": metadata["raw_html"],
         }
 
-        # Wrap XPath queries in try-except to handle missing elements
-        try:
-            case_details_elements = html_element.xpath(
-                '//strong[@class="caseDetailsTD"]'
-            )[0]
-
-            # Handle potential missing fields with default empty strings
-            try:
-                case_details["cnr"] = case_details_elements.xpath(
-                    './/span[contains(text(), "CNR")]/following-sibling::font/text()'
-                )[0].strip()
-            except (IndexError, KeyError):
-                case_details["cnr"] = ""
-
-            try:
-                case_details["date_of_registration"] = case_details_elements.xpath(
-                    './/span[contains(text(), "Date of registration")]/following-sibling::font/text()'
-                )[0].strip()
-            except (IndexError, KeyError):
-                case_details["date_of_registration"] = ""
-
-            try:
-                case_details["decision_date"] = case_details_elements.xpath(
-                    './/span[contains(text(), "Decision Date")]/following-sibling::font/text()'
-                )[0].strip()
-            except (IndexError, KeyError):
-                case_details["decision_date"] = None
-
-            try:
-                case_details["disposal_nature"] = case_details_elements.xpath(
-                    './/span[contains(text(), "Disposal Nature")]/following-sibling::font/text()'
-                )[0].strip()
-            except (IndexError, KeyError):
-                case_details["disposal_nature"] = ""
-
-            try:
-                case_details["court"] = (
-                    case_details_elements.xpath(
-                        './/span[contains(text(), "Court")]/text()'
-                    )[0]
-                    .split(":")[1]
-                    .strip()
-                )
-            except (IndexError, KeyError):
-                case_details["court"] = ""
-
-        except (IndexError, KeyError):
-            # If we can't find the case details element, set all fields to empty strings
-            case_details["cnr"] = ""
-            case_details["date_of_registration"] = ""
-            case_details["decision_date"] = None
-            case_details["disposal_nature"] = ""
-            case_details["court"] = ""
+        # Use shared HTML parsing utility to extract case details
+        parsed_details = parse_case_details_from_html(metadata["raw_html"])
+        case_details.update(parsed_details)
 
         return case_details
 
@@ -266,13 +219,17 @@ class MetadataProcessor:
         }
 
         # Handle date conversion with proper format
-        if 'decision_date' in df.columns:
+        if "decision_date" in df.columns:
             # Convert decision_date with dayfirst=True for DD-MM-YYYY format
-            df['decision_date'] = pd.to_datetime(df['decision_date'], format='mixed', dayfirst=True, errors='coerce')
-        
+            df["decision_date"] = pd.to_datetime(
+                df["decision_date"], format="mixed", dayfirst=True, errors="coerce"
+            )
+
         # Apply the dtypes
         for col, dtype in dtypes.items():
-            if col in df.columns and col != 'decision_date':  # Skip decision_date as we handled it above
+            if (
+                col in df.columns and col != "decision_date"
+            ):  # Skip decision_date as we handled it above
                 df[col] = df[col].astype(dtype)
 
         # Convert to PyArrow Table

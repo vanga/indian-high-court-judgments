@@ -1,0 +1,26 @@
+{
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Python Debugger: Current File",
+      "type": "debugpy",
+      "request": "launch",
+      "program": "${workspaceFolder}/download.py",
+      "python": "${workspaceFolder}/venv/bin/python",
+      "args": [
+        "--court_code",
+        "33_10",
+        "--max_workers",
+        "4",
+        "--start_date",
+        "2011-01-01",
+        "--end_date",
+        "2011-02-28"
+      ],
+      "console": "integratedTerminal"
+    }
+  ]
+}
