@@ -46,11 +46,11 @@ S3_WRITE_BUCKET = "indian-high-court-judgments-test"
 def is_gzipped_tar(file_path: str) -> bool:
     """Check if a tar file is gzipped/compressed by examining the file header."""
     try:
-        with open(file_path, 'rb') as f:
+        with open(file_path, "rb") as f:
             # Read the first 2 bytes to check for gzip magic number
             header = f.read(2)
             # Gzip files start with 0x1f 0x8b
-            return header == b'\x1f\x8b'
+            return header == b"\x1f\x8b"
     except Exception:
         return False
 
@@ -59,8 +59,9 @@ def extract_gzipped_tar(gzipped_tar_path: str, output_tar_path: str) -> bool:
     """Extract a gzipped tar file to an uncompressed tar file."""
     try:
         import gzip
-        with gzip.open(gzipped_tar_path, 'rb') as gz_file:
-            with open(output_tar_path, 'wb') as tar_file:
+
+        with gzip.open(gzipped_tar_path, "rb") as gz_file:
+            with open(output_tar_path, "wb") as tar_file:
                 shutil.copyfileobj(gz_file, tar_file)
         return True
     except Exception as e:
@@ -711,16 +712,24 @@ def create_and_upload_tar_files(
 
             # Check if the downloaded tar is gzipped
             if is_gzipped_tar(temp_existing_tar.name):
-                print(f"  Detected gzipped tar file, extracting to uncompressed format...")
+                print(
+                    f"  Detected gzipped tar file, extracting to uncompressed format..."
+                )
                 # Create a new temp file for the uncompressed tar
-                temp_uncompressed_tar = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
+                temp_uncompressed_tar = tempfile.NamedTemporaryFile(
+                    suffix=".tar", delete=False
+                )
                 temp_uncompressed_tar.close()
-                
-                if extract_gzipped_tar(temp_existing_tar.name, temp_uncompressed_tar.name):
+
+                if extract_gzipped_tar(
+                    temp_existing_tar.name, temp_uncompressed_tar.name
+                ):
                     # Replace the gzipped file with the uncompressed one
                     Path(temp_existing_tar.name).unlink()
                     shutil.move(temp_uncompressed_tar.name, temp_existing_tar.name)
-                    print(f"  Successfully extracted gzipped tar to uncompressed format")
+                    print(
+                        f"  Successfully extracted gzipped tar to uncompressed format"
+                    )
                 else:
                     print(f"  Failed to extract gzipped tar, will create new tar")
                     Path(temp_existing_tar.name).unlink()
@@ -733,7 +742,9 @@ def create_and_upload_tar_files(
                 print(f"  Reading existing tar file index...")
                 with tarfile.open(temp_existing_tar.name, "r") as existing_tar:
                     existing_files_set = set(existing_tar.getnames())
-                    print(f"  Found existing data tar with {len(existing_files_set)} files")
+                    print(
+                        f"  Found existing data tar with {len(existing_files_set)} files"
+                    )
 
         except s3_client.exceptions.NoSuchKey:
             print(f"  No existing data tar found, will create new one")

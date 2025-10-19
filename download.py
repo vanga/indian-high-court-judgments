@@ -13,12 +13,12 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Optional, Generator, List, Dict
 
-import easyocr
 import lxml.html as LH
 import requests
 import urllib3
 from bs4 import BeautifulSoup
 from tqdm import tqdm
+from src.captcha_solver.main import get_text
 
 from html_utils import parse_decision_date_from_html
 from models import IndexFile
@@ -34,7 +34,6 @@ from court_utils import (
     load_court_bench_mapping,
 )
 from s3_utils import (
-    S3_AVAILABLE,
     S3_READ_BUCKET,
     S3_WRITE_BUCKET,
     format_size,
@@ -47,6 +46,9 @@ from s3_utils import (
     create_and_upload_tar_files,
     create_and_upload_parquet_files,
 )
+
+# S3 control flag - set to False by default, enable with --s3-sync
+S3_ENABLED = False
 from file_utils import (
     extract_decision_date_from_json,
     extract_bench_from_path,
@@ -55,17 +57,12 @@ from file_utils import (
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-warnings.filterwarnings(
-    "ignore",
-    message="'pin_memory' argument is set as true but not supported on MPS now, then device pinned memory won't be used.",
-)
+warnings.filterwarnings("ignore")
 
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 logger.setLevel("INFO")
-
-reader = easyocr.Reader(["en"])
 
 root_url = "https://judgments.ecourts.gov.in"
 output_dir = Path("./data")
@@ -288,7 +285,7 @@ def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_worker
             f"Downloading for specified date range: {start_date} to {end_date or start_date}"
         )
 
-        if S3_AVAILABLE and court_codes:
+        if S3_ENABLED and court_codes:
             year_to_check = None
             if start_date:
                 try:
@@ -315,7 +312,7 @@ def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_worker
             logger.info("No tasks to process")
             return
 
-        if S3_AVAILABLE and court_codes and len(court_codes) == 1:
+        if S3_ENABLED and court_codes and len(court_codes) == 1:
             end_date_obj = (
                 datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
             )
@@ -350,8 +347,8 @@ def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
         max_workers: Number of parallel workers
         end_date: End date of the download range (for index timestamp)
     """
-    if not S3_AVAILABLE:
-        print("WARNING: S3 not available, will only download locally")
+    if not S3_ENABLED:
+        print("INFO: S3 disabled, will only download locally")
         _run_tasks(tasks, max_workers)
         return
 
@@ -604,8 +601,8 @@ def run_incremental_download(court_code_dl, start_date, end_date=None, max_worke
 
 def sync_to_s3(max_workers=4, court_codes=None):
     """Sync new data to S3 for all courts or specific court_codes"""
-    if not S3_AVAILABLE:
-        print("ERROR: S3 dependencies not available")
+    if not S3_ENABLED:
+        print("ERROR: S3 disabled by S3_ENABLED flag")
         return
 
     if court_codes:
@@ -1113,23 +1110,20 @@ class Downloader:
         )
         with open(captcha_filename, "wb") as f:
             f.write(captcha_response.content)
-        result = reader.readtext(str(captcha_filename))
-        if not result:
-            logger.warning(
-                f"No result from captcha, task: {self.task.id}, retries: {retries}"
-            )
-            return self.solve_captcha(retries + 1, captcha_url)
-        captch_text = result[0][1].strip()
+
+        captcha_text = get_text(str(captcha_filename))
+
+        captcha_text = captcha_text.strip()
 
         if MATH_CAPTCHA:
-            if self.is_math_expression(captch_text):
+            if self.is_math_expression(captcha_text):
                 try:
-                    answer = self.solve_math_expression(captch_text)
+                    answer = self.solve_math_expression(captcha_text)
                     captcha_filename.unlink()
                     return answer
                 except Exception as e:
                     logger.error(
-                        f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captch_text}, Error: {e}"
+                        f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captcha_text}, Error: {e}"
                     )
                     # move the captcha image to a new folder for debugging
                     new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
@@ -1142,7 +1136,7 @@ class Downloader:
                 captcha_filename.unlink()  # Clean up the file
                 return self.solve_captcha(retries + 1, captcha_url)
         else:
-            captcha_text = "".join([c for c in captch_text if c.isalnum()])
+            captcha_text = captcha_text.strip()
             if len(captcha_text) != 6:
                 if retries > 10:
                     raise Exception("Captcha not solved")
@@ -1452,7 +1446,19 @@ Examples:
         action="store_true",
         help="Just display latest dates from S3 index files without downloading",
     )
+    parser.add_argument(
+        "--s3-sync",
+        action="store_true",
+        help="Enable S3 integration (uploads to S3, checks existing files, syncs dates)",
+    )
     args = parser.parse_args()
+
+    if args.s3_sync:
+        S3_ENABLED = True
+        print("INFO: S3 integration enabled by --s3-sync flag")
+    else:
+        S3_ENABLED = False
+        print("INFO: S3 integration disabled (use --s3-sync to enable)")
 
     # Handle different modes
     if args.fetch_dates:

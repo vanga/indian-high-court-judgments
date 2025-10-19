@@ -45,7 +45,8 @@ def parse_decision_date_from_html(raw_html):
 
         return None, None
 
-    except Exception:
+    except Exception as e:
+        print(f"Error parsing decision date from HTML: {e}")
         return None, None
 
 
