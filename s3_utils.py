@@ -3,11 +3,13 @@
 import shutil
 import tarfile
 import tempfile
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from models import IndexFile
+import json
+
+from models import IndexFileV2, IndexPart
 
 try:
     import boto3
@@ -103,16 +105,63 @@ def extract_court_bench_from_path(key):
 
 
 def read_updated_at_from_index(s3, bucket, key):
-    """Get updated_at timestamp from index file"""
+    """Get updated_at timestamp from index file (V2 only)."""
     try:
         response = s3.get_object(Bucket=bucket, Key=key)
-        index_file = IndexFile.model_validate_json(
-            response["Body"].read().decode("utf-8")
-        )
-        return index_file.updated_at
+        body = response["Body"].read().decode("utf-8")
+        data = json.loads(body)
+        return data.get("updated_at")
     except Exception as e:
         print(f"Warning: Failed to read {key}: {e}")
         return None
+
+
+def _utc_now_iso() -> str:
+    return (
+        datetime.now(timezone.utc)
+        .replace(tzinfo=timezone.utc)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
+def _generate_part_name(now_iso: str) -> str:
+    # Use compact timestamp: YYYYMMDDThhmmssZ
+    ts = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).strftime(
+        "%Y%m%dT%H%M%SZ"
+    )
+    return f"part-{ts}.tar"
+
+
+def _format_human_size_from_bytes(size_bytes: int) -> str:
+    return format_size(size_bytes)
+
+
+def _load_index_v2(
+    s3_unsigned,
+    read_bucket: str,
+    index_key: str,
+    file_type: str,
+    court_code: str,
+    bench: str,
+    year: int,
+) -> IndexFileV2:
+    """Load index file (V2). If missing, return empty V2."""
+    try:
+        resp = s3_unsigned.get_object(Bucket=read_bucket, Key=index_key)
+        raw = resp["Body"].read().decode("utf-8")
+        data = json.loads(raw)
+        return IndexFileV2.model_validate(data)
+    except Exception:
+        # No existing index -> create empty V2
+        now_iso = _utc_now_iso()
+        return IndexFileV2(
+            file_count=0,
+            tar_size=0,
+            tar_size_human="0 B",
+            updated_at=now_iso,
+            parts=[],
+        )
 
 
 def get_court_dates_from_index_files(year=None):
@@ -178,11 +227,13 @@ def get_existing_files_from_s3(court_code, benches, year=None):
         metadata_key = f"metadata/tar/year={year}/court={court_code}/bench={bench_name}/metadata.index.json"
         try:
             response = s3.get_object(Bucket=S3_READ_BUCKET, Key=metadata_key)
-            index_file = IndexFile.model_validate_json(
-                response["Body"].read().decode("utf-8")
-            )
+            raw = response["Body"].read().decode("utf-8")
+            data = json.loads(raw)
+            files_iter = []
+            for part in data.get("parts", []):
+                files_iter.extend(part.get("files", []))
 
-            for filename in index_file.files:
+            for filename in files_iter:
                 if filename:
                     base_name = filename.replace(".json", "")
                     existing_files[bench_name]["metadata"].add(base_name)
@@ -192,11 +243,13 @@ def get_existing_files_from_s3(court_code, benches, year=None):
         data_key = f"data/tar/year={year}/court={court_code}/bench={bench_name}/data.index.json"
         try:
             response = s3.get_object(Bucket=S3_READ_BUCKET, Key=data_key)
-            index_file = IndexFile.model_validate_json(
-                response["Body"].read().decode("utf-8")
-            )
+            raw = response["Body"].read().decode("utf-8")
+            data = json.loads(raw)
+            files_iter = []
+            for part in data.get("parts", []):
+                files_iter.extend(part.get("files", []))
 
-            for filename in index_file.files:
+            for filename in files_iter:
                 if filename:
                     existing_files[bench_name]["data"].add(filename)
         except Exception:
@@ -212,7 +265,11 @@ def get_existing_files_from_s3(court_code, benches, year=None):
 
 
 def update_index_files_after_download(court_code, bench, new_files, to_date=None):
-    """Update both metadata and data index files with new download information"""
+    """Update index files after download.
+
+    Parts-based (V2) index updates occur during tar part creation for all years.
+    This function is a no-op and preserved for compatibility with call sites.
+    """
     if not S3_AVAILABLE:
         print("[ERROR] S3 not available")
         return
@@ -220,89 +277,7 @@ def update_index_files_after_download(court_code, bench, new_files, to_date=None
     s3_client = boto3.client("s3")
     s3_unsigned = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
-    if to_date:
-        if isinstance(to_date, str):
-            to_date_dt = datetime.strptime(to_date, "%Y-%m-%d")
-        else:
-            to_date_dt = (
-                to_date
-                if hasattr(to_date, "hour")
-                else datetime.combine(to_date, datetime.min.time())
-            )
-        update_time = to_date_dt.isoformat()
-        year = to_date_dt.year
-    else:
-        current_time = datetime.now()
-        update_time = current_time.isoformat()
-        year = current_time.year
-
-    updates = [
-        {
-            "type": "metadata",
-            "key": f"metadata/tar/year={year}/court={court_code}/bench={bench}/metadata.index.json",
-            "tar_key": f"metadata/tar/year={year}/court={court_code}/bench={bench}/metadata.tar.gz",
-            "files": new_files.get("metadata", []),
-        },
-        {
-            "type": "data",
-            "key": f"data/tar/year={year}/court={court_code}/bench={bench}/data.index.json",
-            "tar_key": f"data/tar/year={year}/court={court_code}/bench={bench}/pdfs.tar",
-            "files": new_files.get("data", []),
-        },
-    ]
-
-    for update in updates:
-        if not update["files"]:
-            continue
-
-        try:
-            try:
-                response = s3_unsigned.get_object(
-                    Bucket=S3_READ_BUCKET, Key=update["key"]
-                )
-                index_file = IndexFile.model_validate_json(
-                    response["Body"].read().decode("utf-8")
-                )
-            except Exception:
-                index_file = IndexFile(
-                    files=[],
-                    file_count=0,
-                    tar_size=0,
-                    tar_size_human="0 B",
-                    updated_at=update_time,
-                )
-
-            existing_files = set(index_file.files)
-            for new_file in update["files"]:
-                filename = Path(new_file).name
-                if filename not in existing_files:
-                    index_file.files.append(filename)
-
-            index_file.file_count = len(index_file.files)
-            index_file.updated_at = update_time
-
-            try:
-                tar_response = s3_unsigned.head_object(
-                    Bucket=S3_READ_BUCKET, Key=update["tar_key"]
-                )
-                tar_size = tar_response["ContentLength"]
-                index_file.tar_size = tar_size
-                index_file.tar_size_human = format_size(tar_size)
-            except Exception as e:
-                print(f"Warning: Could not get tar size for {update['tar_key']}: {e}")
-                index_file.tar_size = 0
-                index_file.tar_size_human = "0 B"
-
-            s3_client.put_object(
-                Bucket=S3_WRITE_BUCKET,
-                Key=update["key"],
-                Body=index_file.model_dump_json(indent=2),
-                ContentType="application/json",
-            )
-            print(f"Updated {update['type']} index with {len(update['files'])} files")
-
-        except Exception as e:
-            print(f"Failed to update {update['type']} index: {e}")
+    return
 
 
 def upload_large_file_to_s3(
@@ -536,300 +511,165 @@ def upload_files_to_s3(
 def create_and_upload_tar_files(
     s3_client, court_code: str, bench: str, year: int, files: Dict[str, List[Path]]
 ) -> bool:
-    """Download existing tar files, append new content, and upload back to S3"""
+    """Create/upload tar part files for all years and update V2 indexes."""
 
     print(f"Creating/updating tar files for bench {bench}")
 
     overall_success = True  # Track success for both metadata and data tar files
 
-    # Handle metadata tar file
+    now_iso = _utc_now_iso()
+    s3_unsigned = boto3.client("s3", config=Config(signature_version=UNSIGNED))
+
+    # PARTS MODE (all years)
+    # Handle metadata part
     if files["metadata"]:
-        metadata_tar_key = (
-            f"metadata/tar/year={year}/court={court_code}/bench={bench}/metadata.tar.gz"
-        )
+        parts_prefix = f"metadata/tar/year={year}/court={court_code}/bench={bench}/"
+        part_name = _generate_part_name(now_iso)
+        part_key = parts_prefix + part_name
 
-        # Try to download existing tar file
-        existing_files_set = set()
-        temp_existing_tar = None
-
-        try:
-            # Get file size first
-            head_response = s3_client.head_object(
-                Bucket=S3_READ_BUCKET, Key=metadata_tar_key
-            )
-            file_size = head_response["ContentLength"]
-            file_size_human = format_size(file_size)
-
-            print(f"  Downloading existing metadata tar ({file_size_human})...")
-
-            # Create temp file on disk
-            temp_existing_tar = tempfile.NamedTemporaryFile(
-                suffix=".tar.gz", delete=False
-            )
-
-            # For smaller files, can download directly, for larger ones, stream
-            if file_size > 100 * 1024 * 1024:  # If larger than 100MB, stream it
-                response = s3_client.get_object(
-                    Bucket=S3_READ_BUCKET, Key=metadata_tar_key
-                )
-                chunk_size = 64 * 1024 * 1024  # 64MB chunks
-                downloaded = 0
-
-                for chunk in iter(lambda: response["Body"].read(chunk_size), b""):
-                    temp_existing_tar.write(chunk)
-                    downloaded += len(chunk)
-                    progress = (downloaded / file_size) * 100
-                    print(
-                        f"\r  Progress: {progress:.1f}% ({format_size(downloaded)}/{file_size_human})",
-                        end="",
-                        flush=True,
-                    )
-                print()  # New line
-            else:
-                # For smaller files, download normally
-                response = s3_client.get_object(
-                    Bucket=S3_READ_BUCKET, Key=metadata_tar_key
-                )
-                temp_existing_tar.write(response["Body"].read())
-
-            temp_existing_tar.close()
-
-            # Read existing files list to avoid duplicates
-            with tarfile.open(temp_existing_tar.name, "r:gz") as existing_tar:
-                existing_files_set = set(existing_tar.getnames())
-                print(
-                    f"  Found existing metadata tar with {len(existing_files_set)} files"
-                )
-
-        except s3_client.exceptions.NoSuchKey:
-            print(f"  No existing metadata tar found, will create new one")
-        except Exception as e:
-            print(f"  Warning: Could not download existing metadata tar: {e}")
-
-        # Create new tar file with both existing and new content
-        with tempfile.NamedTemporaryFile(
-            suffix=".tar.gz", delete=False
-        ) as temp_new_tar:
-            with tarfile.open(temp_new_tar.name, "w:gz") as new_tar:
-                # First, add existing files if we have them
-                if temp_existing_tar and Path(temp_existing_tar.name).exists():
-                    try:
-                        print(f"  Merging existing metadata tar content...")
-                        with tarfile.open(
-                            temp_existing_tar.name, "r:gz"
-                        ) as existing_tar:
-                            for member in existing_tar.getmembers():
-                                file_obj = existing_tar.extractfile(member)
-                                if file_obj:
-                                    new_tar.addfile(member, file_obj)
-                    except Exception as e:
-                        print(f"  Warning: Could not read existing tar content: {e}")
-
-                # Then add new files (skip duplicates)
-                new_files_added = 0
+        print(f"  Creating metadata part: {part_name}")
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as temp_tar:
+            with tarfile.open(temp_tar.name, "w") as tar:
+                added = 0
+                seen = set()
                 with tqdm(
                     total=len(files["metadata"]),
-                    desc="Adding to metadata tar",
+                    desc="Creating metadata part",
                     unit="file",
                 ) as pbar:
                     for metadata_file in files["metadata"]:
                         arcname = Path(metadata_file).name
-                        if arcname not in existing_files_set:
-                            new_tar.add(metadata_file, arcname=arcname)
-                            new_files_added += 1
-                            pbar.set_postfix_str(f"Added {new_files_added}")
-                        else:
-                            pbar.set_postfix_str(f"Skipped duplicate")
+                        if arcname in seen:
+                            pbar.update(1)
+                            continue
+                        seen.add(arcname)
+                        tar.add(metadata_file, arcname=arcname)
+                        added += 1
+                        pbar.set_postfix_str(f"Added {added}")
                         pbar.update(1)
 
-                print(f"  Added {new_files_added} new metadata files to tar")
-
-        # Upload updated tar to S3 (with multipart support for large files)
-        print(f"  Uploading updated metadata tar...")
+        # Upload part
+        print(f"  Uploading metadata part {part_name}...")
         success = upload_large_file_to_s3(
             s3_client,
-            temp_new_tar.name,
+            temp_tar.name,
             S3_WRITE_BUCKET,
-            metadata_tar_key,
-            "application/gzip",
+            part_key,
+            "application/x-tar",
         )
-
-        # Clean up temp files
-        Path(temp_new_tar.name).unlink()
-        if temp_existing_tar and Path(temp_existing_tar.name).exists():
-            Path(temp_existing_tar.name).unlink()
-
-        if success:
-            print(f"  Successfully uploaded updated metadata tar")
-        else:
-            print(f"  Failed to upload metadata tar")
+        size_bytes = Path(temp_tar.name).stat().st_size
+        Path(temp_tar.name).unlink()
+        if not success:
+            print("  Failed to upload metadata part")
             overall_success = False
+        else:
+            print("  Uploaded metadata part")
+            # Update index V2
+            index_key = f"metadata/tar/year={year}/court={court_code}/bench={bench}/metadata.index.json"
+            index_v2 = _load_index_v2(
+                s3_unsigned,
+                S3_READ_BUCKET,
+                index_key,
+                "metadata",
+                court_code,
+                bench,
+                year,
+            )
+            new_part = IndexPart(
+                name=part_name,
+                files=[Path(p).name for p in files["metadata"]],
+                size=size_bytes,
+                size_human=_format_human_size_from_bytes(size_bytes),
+                created_at=now_iso,
+            )
+            index_v2.parts.append(new_part)
+            # Recompute aggregates
+            index_v2.file_count = sum(p.file_count for p in index_v2.parts)
+            index_v2.tar_size = sum(p.size for p in index_v2.parts)
+            index_v2.tar_size_human = _format_human_size_from_bytes(index_v2.tar_size)
+            index_v2.updated_at = now_iso
 
-    # Handle data/PDF tar file
+            s3_client.put_object(
+                Bucket=S3_WRITE_BUCKET,
+                Key=index_key,
+                Body=index_v2.model_dump_json(indent=2),
+                ContentType="application/json",
+            )
+
+    # Handle data part
     if files["data"]:
-        data_tar_key = f"data/tar/year={year}/court={court_code}/bench={bench}/pdfs.tar"
+        parts_prefix = f"data/tar/year={year}/court={court_code}/bench={bench}/"
+        part_name = _generate_part_name(now_iso)
+        part_key = parts_prefix + part_name
 
-        # Check existing tar file size first
-        existing_files_set = set()
-        temp_existing_tar = None
-
-        try:
-            # Get file metadata to check size
-            head_response = s3_client.head_object(
-                Bucket=S3_READ_BUCKET, Key=data_tar_key
-            )
-            file_size = head_response["ContentLength"]
-            file_size_human = format_size(file_size)
-
-            print(f"  Existing data tar size: {file_size_human}")
-            print(f"  Downloading existing data tar to disk (streaming)...")
-
-            # Create temp file for existing tar (on disk, not in RAM)
-            temp_existing_tar = tempfile.NamedTemporaryFile(suffix=".tar", delete=False)
-
-            # Stream download in chunks to avoid loading entire file into RAM
-            response = s3_client.get_object(Bucket=S3_READ_BUCKET, Key=data_tar_key)
-            chunk_size = (
-                256 * 1024 * 1024
-            )  # 256MB chunks (optimized for faster downloads)
-            downloaded = 0
-
-            print(
-                f"  Downloading {file_size_human} in {chunk_size // (1024 * 1024)}MB chunks..."
-            )
-            for chunk in iter(lambda: response["Body"].read(chunk_size), b""):
-                temp_existing_tar.write(chunk)
-                downloaded += len(chunk)
-                progress = (downloaded / file_size) * 100
-                print(
-                    f"\r  Progress: {progress:.1f}% ({format_size(downloaded)}/{file_size_human})",
-                    end="",
-                    flush=True,
-                )
-
-            print()  # New line after progress
-            temp_existing_tar.close()
-
-            # Check if the downloaded tar is gzipped
-            if is_gzipped_tar(temp_existing_tar.name):
-                print(
-                    f"  Detected gzipped tar file, extracting to uncompressed format..."
-                )
-                # Create a new temp file for the uncompressed tar
-                temp_uncompressed_tar = tempfile.NamedTemporaryFile(
-                    suffix=".tar", delete=False
-                )
-                temp_uncompressed_tar.close()
-
-                if extract_gzipped_tar(
-                    temp_existing_tar.name, temp_uncompressed_tar.name
-                ):
-                    # Replace the gzipped file with the uncompressed one
-                    Path(temp_existing_tar.name).unlink()
-                    shutil.move(temp_uncompressed_tar.name, temp_existing_tar.name)
-                    print(
-                        f"  Successfully extracted gzipped tar to uncompressed format"
-                    )
-                else:
-                    print(f"  Failed to extract gzipped tar, will create new tar")
-                    Path(temp_existing_tar.name).unlink()
-                    temp_existing_tar = None
-            else:
-                print(f"  Tar file is not gzipped, proceeding with append mode")
-
-            # Now read the tar file list (this is fast, just reads the index)
-            if temp_existing_tar and Path(temp_existing_tar.name).exists():
-                print(f"  Reading existing tar file index...")
-                with tarfile.open(temp_existing_tar.name, "r") as existing_tar:
-                    existing_files_set = set(existing_tar.getnames())
-                    print(
-                        f"  Found existing data tar with {len(existing_files_set)} files"
-                    )
-
-        except s3_client.exceptions.NoSuchKey:
-            print(f"  No existing data tar found, will create new one")
-        except Exception as e:
-            print(f"  Warning: Could not download existing data tar: {e}")
-
-        # Use APPEND mode for existing tar or CREATE mode for new tar
-        if temp_existing_tar and Path(temp_existing_tar.name).exists():
-            # APPEND MODE - only adds new files to end of existing tar
-            print(
-                f"  Using APPEND mode to add new files to existing tar, temp file: {temp_existing_tar}"
-            )
-            with tarfile.open(temp_existing_tar.name, "a") as tar:  # 'a' = APPEND mode
-                # Get existing files list (fast - just reads index)
-                existing_files = set(tar.getnames())
-                print(f"  Existing tar contains {len(existing_files)} files")
-
-                # Append only new files to the end
-                new_files_added = 0
+        print(f"  Creating data part: {part_name}")
+        with tempfile.NamedTemporaryFile(suffix=".tar", delete=False) as temp_tar:
+            with tarfile.open(temp_tar.name, "w") as tar:
+                added = 0
+                seen = set()
                 with tqdm(
-                    total=len(files["data"]), desc="Appending to data tar", unit="file"
+                    total=len(files["data"]), desc="Creating data part", unit="file"
                 ) as pbar:
                     for data_file in files["data"]:
                         arcname = Path(data_file).name
-                        if arcname not in existing_files:
-                            tar.add(data_file, arcname=arcname)  # Appends to END of tar
-                            new_files_added += 1
-                            pbar.set_postfix_str(f"Appended {new_files_added}")
-                        else:
-                            pbar.set_postfix_str(f"Skipped duplicate")
+                        if arcname in seen:
+                            pbar.update(1)
+                            continue
+                        seen.add(arcname)
+                        tar.add(data_file, arcname=arcname)
+                        added += 1
+                        pbar.set_postfix_str(f"Added {added}")
                         pbar.update(1)
 
-                print(f"  Appended {new_files_added} new files to existing tar")
-
-            # Upload the modified tar (same file, with new data appended)
-            print(f"  Uploading updated data tar (uncompressed)...")
-            success = upload_large_file_to_s3(
-                s3_client,
-                temp_existing_tar.name,  # Upload the appended tar
-                S3_WRITE_BUCKET,
-                data_tar_key,
-                "application/x-tar",  # Uncompressed tar content type
-            )
-
-            # Clean up temp file
-            Path(temp_existing_tar.name).unlink()
-
-        else:
-            # CREATE MODE - no existing tar, create new one
-            print(f"  Creating new data tar file...")
-            with tempfile.NamedTemporaryFile(
-                suffix=".tar", delete=False
-            ) as temp_new_tar:
-                with tarfile.open(temp_new_tar.name, "w") as tar:  # 'w' = CREATE mode
-                    new_files_added = 0
-                    with tqdm(
-                        total=len(files["data"]), desc="Creating data tar", unit="file"
-                    ) as pbar:
-                        for data_file in files["data"]:
-                            arcname = Path(data_file).name
-                            tar.add(data_file, arcname=arcname)
-                            new_files_added += 1
-                            pbar.set_postfix_str(f"Added {new_files_added}")
-                            pbar.update(1)
-
-                    print(f"  Created new tar with {new_files_added} files")
-
-            # Upload new tar to S3
-            print(f"  Uploading new data tar...")
-            success = upload_large_file_to_s3(
-                s3_client,
-                temp_new_tar.name,
-                S3_WRITE_BUCKET,
-                data_tar_key,
-                "application/x-tar",
-            )
-
-            # Clean up temp file
-            Path(temp_new_tar.name).unlink()
-
-        if success:
-            print(f"  Successfully uploaded updated data tar")
-        else:
-            print(f"  Failed to upload data tar")
+        # Upload part
+        print(f"  Uploading data part {part_name}...")
+        success = upload_large_file_to_s3(
+            s3_client,
+            temp_tar.name,
+            S3_WRITE_BUCKET,
+            part_key,
+            "application/x-tar",
+        )
+        size_bytes = Path(temp_tar.name).stat().st_size
+        Path(temp_tar.name).unlink()
+        if not success:
+            print("  Failed to upload data part")
             overall_success = False
+        else:
+            print("  Uploaded data part")
+            # Update index V2
+            index_key = (
+                f"data/tar/year={year}/court={court_code}/bench={bench}/data.index.json"
+            )
+            index_v2 = _load_index_v2(
+                s3_unsigned,
+                S3_READ_BUCKET,
+                index_key,
+                "data",
+                court_code,
+                bench,
+                year,
+            )
+            new_part = IndexPart(
+                name=part_name,
+                files=[Path(p).name for p in files["data"]],
+                size=size_bytes,
+                size_human=_format_human_size_from_bytes(size_bytes),
+                created_at=now_iso,
+            )
+            index_v2.parts.append(new_part)
+            # Recompute aggregates
+            index_v2.file_count = sum(p.file_count for p in index_v2.parts)
+            index_v2.tar_size = sum(p.size for p in index_v2.parts)
+            index_v2.tar_size_human = _format_human_size_from_bytes(index_v2.tar_size)
+            index_v2.updated_at = now_iso
+
+            s3_client.put_object(
+                Bucket=S3_WRITE_BUCKET,
+                Key=index_key,
+                Body=index_v2.model_dump_json(indent=2),
+                ContentType="application/json",
+            )
 
     return overall_success
 

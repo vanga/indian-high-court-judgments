@@ -59,6 +59,47 @@ class IndexFile(BaseModel):
         self.file_count = len(self.files)
 
 
+class IndexPart(BaseModel):
+    """
+    Represents a single incremental tar "part" for a bench/year.
+
+    Each part corresponds to one tar archive created during a run and
+    contains only the files added in that run.
+    """
+
+    name: str = Field(
+        description="Tar part filename, e.g., 'part-20250101T120000Z.tar'"
+    )
+    files: List[str] = Field(
+        default_factory=list, description="Files contained in this part"
+    )
+    file_count: int = Field(default=0, ge=0, description="Number of files in this part")
+    size: int = Field(default=0, ge=0, description="Part size in bytes")
+    size_human: str = Field(default="0 B", description="Human-readable size")
+    created_at: str = Field(description="ISO datetime when this part was created")
+
+    def model_post_init(self, __context):
+        self.file_count = len(self.files)
+
+
+class IndexFileV2(BaseModel):
+    """
+    New index format with aggregated stats and per-part details.
+
+    Notes:
+    - "files" are not tracked at the top-level to avoid duplication; only per-part.
+    - Aggregated counters are sums across parts.
+    """
+
+    file_count: int = Field(default=0, ge=0, description="Total files across all parts")
+    tar_size: int = Field(
+        default=0, ge=0, description="Total size across all parts in bytes"
+    )
+    tar_size_human: str = Field(default="0 B", description="Human-readable total size")
+    updated_at: str = Field(description="ISO datetime when index was last updated")
+    parts: List[IndexPart] = Field(default_factory=list, description="List of parts")
+
+
 class JudgmentMetadata(BaseModel):
     """
     Model for individual judgment metadata JSON files
