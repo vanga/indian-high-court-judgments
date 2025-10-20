@@ -3,13 +3,14 @@
 import shutil
 import tarfile
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
 import json
 
 from models import IndexFileV2, IndexPart
+from shared_utils import format_size, utc_now_iso, generate_part_name
 
 try:
     import boto3
@@ -45,51 +46,6 @@ S3_READ_BUCKET = "indian-high-court-judgments"
 S3_WRITE_BUCKET = "indian-high-court-judgments-test"
 
 
-def is_gzipped_tar(file_path: str) -> bool:
-    """Check if a tar file is gzipped/compressed by examining the file header."""
-    try:
-        with open(file_path, "rb") as f:
-            # Read the first 2 bytes to check for gzip magic number
-            header = f.read(2)
-            # Gzip files start with 0x1f 0x8b
-            return header == b"\x1f\x8b"
-    except Exception:
-        return False
-
-
-def extract_gzipped_tar(gzipped_tar_path: str, output_tar_path: str) -> bool:
-    """Extract a gzipped tar file to an uncompressed tar file."""
-    try:
-        import gzip
-
-        with gzip.open(gzipped_tar_path, "rb") as gz_file:
-            with open(output_tar_path, "wb") as tar_file:
-                shutil.copyfileobj(gz_file, tar_file)
-        return True
-    except Exception as e:
-        print(f"Error extracting gzipped tar: {e}")
-        return False
-
-
-def format_size(size_bytes):
-    """Format bytes into human readable string"""
-    if size_bytes == 0:
-        return "0 B"
-
-    size_units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(size_bytes)
-    unit_index = 0
-
-    while size >= 1024.0 and unit_index < len(size_units) - 1:
-        size /= 1024.0
-        unit_index += 1
-
-    if unit_index == 0:
-        return f"{int(size)} {size_units[unit_index]}"
-    else:
-        return f"{size:.2f} {size_units[unit_index]}"
-
-
 def extract_court_bench_from_path(key):
     """Extract court and bench from S3 key path"""
     parts = key.split("/")
@@ -116,27 +72,6 @@ def read_updated_at_from_index(s3, bucket, key):
         return None
 
 
-def _utc_now_iso() -> str:
-    return (
-        datetime.now(timezone.utc)
-        .replace(tzinfo=timezone.utc)
-        .isoformat()
-        .replace("+00:00", "Z")
-    )
-
-
-def _generate_part_name(now_iso: str) -> str:
-    # Use compact timestamp: YYYYMMDDThhmmssZ
-    ts = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).strftime(
-        "%Y%m%dT%H%M%SZ"
-    )
-    return f"part-{ts}.tar"
-
-
-def _format_human_size_from_bytes(size_bytes: int) -> str:
-    return format_size(size_bytes)
-
-
 def _load_index_v2(
     s3_unsigned,
     read_bucket: str,
@@ -154,7 +89,7 @@ def _load_index_v2(
         return IndexFileV2.model_validate(data)
     except Exception:
         # No existing index -> create empty V2
-        now_iso = _utc_now_iso()
+        now_iso = utc_now_iso()
         return IndexFileV2(
             file_count=0,
             tar_size=0,
@@ -517,14 +452,14 @@ def create_and_upload_tar_files(
 
     overall_success = True  # Track success for both metadata and data tar files
 
-    now_iso = _utc_now_iso()
+    now_iso = utc_now_iso()
     s3_unsigned = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
     # PARTS MODE (all years)
     # Handle metadata part
     if files["metadata"]:
         parts_prefix = f"metadata/tar/year={year}/court={court_code}/bench={bench}/"
-        part_name = _generate_part_name(now_iso)
+        part_name = generate_part_name(now_iso)
         part_key = parts_prefix + part_name
 
         print(f"  Creating metadata part: {part_name}")
@@ -579,14 +514,14 @@ def create_and_upload_tar_files(
                 name=part_name,
                 files=[Path(p).name for p in files["metadata"]],
                 size=size_bytes,
-                size_human=_format_human_size_from_bytes(size_bytes),
+                size_human=format_size(size_bytes),
                 created_at=now_iso,
             )
             index_v2.parts.append(new_part)
             # Recompute aggregates
             index_v2.file_count = sum(p.file_count for p in index_v2.parts)
             index_v2.tar_size = sum(p.size for p in index_v2.parts)
-            index_v2.tar_size_human = _format_human_size_from_bytes(index_v2.tar_size)
+            index_v2.tar_size_human = format_size(index_v2.tar_size)
             index_v2.updated_at = now_iso
 
             s3_client.put_object(
@@ -599,7 +534,7 @@ def create_and_upload_tar_files(
     # Handle data part
     if files["data"]:
         parts_prefix = f"data/tar/year={year}/court={court_code}/bench={bench}/"
-        part_name = _generate_part_name(now_iso)
+        part_name = generate_part_name(now_iso)
         part_key = parts_prefix + part_name
 
         print(f"  Creating data part: {part_name}")
@@ -654,14 +589,14 @@ def create_and_upload_tar_files(
                 name=part_name,
                 files=[Path(p).name for p in files["data"]],
                 size=size_bytes,
-                size_human=_format_human_size_from_bytes(size_bytes),
+                size_human=format_size(size_bytes),
                 created_at=now_iso,
             )
             index_v2.parts.append(new_part)
             # Recompute aggregates
             index_v2.file_count = sum(p.file_count for p in index_v2.parts)
             index_v2.tar_size = sum(p.size for p in index_v2.parts)
-            index_v2.tar_size_human = _format_human_size_from_bytes(index_v2.tar_size)
+            index_v2.tar_size_human = format_size(index_v2.tar_size)
             index_v2.updated_at = now_iso
 
             s3_client.put_object(

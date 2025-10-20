@@ -31,12 +31,9 @@ from court_utils import (
     load_court_bench_mapping,
 )
 from s3_utils import (
-    S3_READ_BUCKET,
-    S3_WRITE_BUCKET,
     S3_AVAILABLE,
     get_court_dates_from_index_files,
     get_existing_files_from_s3,
-    update_index_files_after_download,
     upload_files_to_s3,
 )
 
@@ -480,29 +477,7 @@ def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
             print(f"\nUploading files to S3 for {court_code}...")
             bench_upload_status = upload_files_to_s3(court_code, downloaded_files)
 
-            s3_court_code = to_s3_format(court_code)
-
-            files_by_year_bench = group_files_by_year_and_bench(downloaded_files)
-
-            for year_bench_key, success in bench_upload_status.items():
-                if success:
-                    year_str, bench = year_bench_key.split("/", 1)
-                    year = int(year_str)
-
-                    if (
-                        year in files_by_year_bench
-                        and bench in files_by_year_bench[year]
-                    ):
-                        bench_files = files_by_year_bench[year][bench]
-
-                        if bench_files["metadata"] or bench_files["data"]:
-                            update_index_files_after_download(
-                                s3_court_code,
-                                bench,
-                                bench_files,
-                                to_date=datetime(year, 12, 31),
-                            )
-                            print(f"Updated index files for {year}/{bench}")
+            # Index files are automatically updated by create_and_upload_tar_files
 
     except Exception as e:
         print(f"Error during S3 upload: {e}")
@@ -747,16 +722,7 @@ def sync_to_s3(max_workers=4, court_codes=None):
             # Update index files for successfully uploaded benches
             for uploaded_bench, upload_success in bench_upload_status.items():
                 if upload_success:
-                    print(
-                        f"    S3 upload successful, updating index files for bench {uploaded_bench}"
-                    )
-
-                    # Use today as the end_date for index update (we downloaded up to today)
-                    update_index_files_after_download(
-                        s3_court_code, uploaded_bench, files, today
-                    )
-
-                    print(f"    Index files updated for bench {uploaded_bench}")
+                    print(f"    S3 upload successful for bench {uploaded_bench}")
                 else:
                     print(
                         f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files"
