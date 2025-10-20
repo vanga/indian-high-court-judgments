@@ -20,15 +20,12 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from src.captcha_solver.main import get_text
 
-from html_utils import parse_decision_date_from_html
-from models import IndexFile
 from court_utils import (
     to_s3_format,
     from_s3_format,
     get_json_file,
     get_court_codes,
     get_tracking_data,
-    save_tracking_data,
     save_court_tracking_date,
     get_bench_codes,
     load_court_bench_mapping,
@@ -36,24 +33,19 @@ from court_utils import (
 from s3_utils import (
     S3_READ_BUCKET,
     S3_WRITE_BUCKET,
-    format_size,
+    S3_AVAILABLE,
     get_court_dates_from_index_files,
     get_existing_files_from_s3,
     update_index_files_after_download,
-    upload_large_file_to_s3,
-    upload_single_file_to_s3,
     upload_files_to_s3,
-    create_and_upload_tar_files,
-    create_and_upload_parquet_files,
 )
 
-# S3 control flag - set to False by default, enable with --s3-sync
+
 S3_ENABLED = False
 from file_utils import (
     extract_decision_date_from_json,
     extract_bench_from_path,
     group_files_by_year_and_bench,
-    cleanup_uploaded_files,
 )
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -101,7 +93,7 @@ def get_new_date_range(
         return None, None
 
     if new_to_date_dt.date() > datetime.now().date():
-        new_to_date_dt = datetime.now().date()
+        new_to_date_dt = datetime.now()
     new_from_date = new_from_date_dt.strftime("%Y-%m-%d")
     new_to_date = new_to_date_dt.strftime("%Y-%m-%d")
     return new_from_date, new_to_date
@@ -161,11 +153,11 @@ def generate_tasks(
     if not court_codes:
         court_codes = all_court_codes
     else:
-        normalized_codes = {}
+        normalized_codes = []
         for court_code in court_codes:
             normalized_code = from_s3_format(court_code)
             if normalized_code in all_court_codes:
-                normalized_codes[normalized_code] = all_court_codes[normalized_code]
+                normalized_codes.append(normalized_code)
             else:
                 raise ValueError(
                     f"Court code {court_code} (normalized to {normalized_code}) not found in court-codes.json"
@@ -285,42 +277,59 @@ def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_worker
             f"Downloading for specified date range: {start_date} to {end_date or start_date}"
         )
 
-        if S3_ENABLED and court_codes:
-            year_to_check = None
-            if start_date:
-                try:
-                    year_to_check = datetime.strptime(start_date, "%Y-%m-%d").year
-                    print(f"Loading cache from S3 for year {year_to_check}...")
-                except Exception:
-                    pass
+        # Determine which courts to process
+        if court_codes is None:
+            # Process all courts
+            target_courts = list(get_court_codes().keys())
+        else:
+            # Process specified courts
+            target_courts = court_codes
 
-            s3_court_dates = get_court_dates_from_index_files(year=year_to_check)
-            for cc in court_codes:
-                s3_format = to_s3_format(cc)
+        print(f"Processing {len(target_courts)} court(s): {', '.join(target_courts)}")
+
+        # Process each court individually for proper S3 handling
+        for court_code in target_courts:
+            print(f"\nProcessing court {court_code}...")
+
+            # Load S3 cache for this court if S3 is enabled
+            if S3_ENABLED:
+                year_to_check = None
+                if start_date:
+                    try:
+                        year_to_check = datetime.strptime(start_date, "%Y-%m-%d").year
+                    except Exception:
+                        pass
+
+                s3_court_dates = get_court_dates_from_index_files(year=year_to_check)
+                s3_format = to_s3_format(court_code)
                 if s3_format in s3_court_dates:
-                    print(f"Loading existing files cache for {cc} from S3...")
+                    print(f"Loading existing files cache for {court_code} from S3...")
                     _existing_files_cache = get_existing_files_from_s3(
                         s3_format, s3_court_dates[s3_format], year=year_to_check
                     )
-                    break
 
-        print("Generating tasks...")
-        tasks = list(generate_tasks(court_codes, start_date, end_date, day_step))
-        print(f"Generated {len(tasks)} tasks to process")
+            # Generate tasks for this specific court
+            tasks = list(generate_tasks([court_code], start_date, end_date, day_step))
 
-        if not tasks:
-            logger.info("No tasks to process")
-            return
+            if not tasks:
+                print(f"No tasks to process for court {court_code}")
+                continue
 
-        if S3_ENABLED and court_codes and len(court_codes) == 1:
-            end_date_obj = (
-                datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
-            )
-            _run_tasks_and_upload_to_s3(
-                tasks, court_codes[0], max_workers, end_date_obj
-            )
-        else:
-            _run_tasks(tasks, max_workers)
+            print(f"Generated {len(tasks)} tasks for court {court_code}")
+
+            # Run tasks with S3 upload if enabled
+            if S3_ENABLED:
+                end_date_obj = (
+                    datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+                )
+                _run_tasks_and_upload_to_s3(
+                    tasks, court_code, max_workers, end_date_obj
+                )
+            else:
+                _run_tasks(tasks, max_workers)
+
+            # Clear cache after each court
+            _existing_files_cache = {}
 
     logger.info("All tasks completed")
 
@@ -1407,7 +1416,7 @@ Examples:
   python download.py
   
   # Just check what dates are in S3
-  python download.py --fetch-dates
+  python download.py --fetch_dates
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -1442,23 +1451,24 @@ Examples:
         "--max_workers", type=int, default=2, help="Number of parallel workers"
     )
     parser.add_argument(
-        "--fetch-dates",
+        "--fetch_dates",
         action="store_true",
         help="Just display latest dates from S3 index files without downloading",
     )
     parser.add_argument(
-        "--s3-sync",
+        "--s3_sync",
         action="store_true",
+        default=False,
         help="Enable S3 integration (uploads to S3, checks existing files, syncs dates)",
     )
     args = parser.parse_args()
 
     if args.s3_sync:
         S3_ENABLED = True
-        print("INFO: S3 integration enabled by --s3-sync flag")
+        print("INFO: S3 integration enabled by --s3_sync flag")
     else:
         S3_ENABLED = False
-        print("INFO: S3 integration disabled (use --s3-sync to enable)")
+        print("INFO: S3 integration disabled (use --s3_sync to enable)")
 
     # Handle different modes
     if args.fetch_dates:
