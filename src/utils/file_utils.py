@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from html_utils import parse_decision_date_from_html
+from src.utils.html_utils import parse_decision_date_from_html
 
 
 def extract_decision_date_from_json(json_file_path: Path) -> Optional[int]:
@@ -29,11 +29,14 @@ def extract_decision_date_from_json(json_file_path: Path) -> Optional[int]:
 
         return None
     except Exception as e:
-        print(f"Warning: Error extracting decision date from {json_file_path}: {e}")
+        print(
+            f"Warning: Error extracting decision date from {json_file_path}: {e}")
         return None
 
 
-def extract_bench_from_path(file_path: Path) -> Optional[str]:
+def extract_bench_from_path(file_path: str | Path) -> Optional[str]:
+    if isinstance(file_path, str):
+        file_path = Path(file_path)
     """Extract bench name from file path like data/court/cnrorders/sikkimhc_pg/orders/..."""
     parts = Path(file_path).parts
 
@@ -141,4 +144,3 @@ def cleanup_uploaded_files(files: Dict[str, List[Path]]) -> tuple[int, int]:
             pass
 
     return deleted_count, failed_count
-

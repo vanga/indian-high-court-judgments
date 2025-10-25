@@ -3,7 +3,6 @@
 * AWS sponsors the storage and data transfer costs of the data.
 * Join [discord server](https://discord.gg/mQhghxCRJU) if you want to collaborate on this repo or have any questions.
 * **Be responsible, considerate, and think about the maintainers of the ecourts website. Avoid scraping with high concurrency.**
-* **track.json** is broken and not working as expected.
 
 
 # Indian Court Judgments Downloader
@@ -128,7 +127,7 @@ The following table lists the court codes used in the system:
    - Solves the expressions and submits the answers
    - After 25 downloads, the script refreshes the session to avoid CAPTCHA challenges
 
-5. **Progress Tracking**: The script maintains a tracking file (`track.json`) to record the last downloaded date for each court, allowing it to resume from where it left off.
+5. **Date Range Processing**: The script processes judgments for the specified date range, with support for parallel processing across multiple courts.
 
 ## Output Structure
 

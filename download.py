@@ -1,8 +1,15 @@
+import shutil
+from src.gs import compress_pdf
+from src.utils.file_utils import (
+    extract_decision_date_from_json,
+    extract_bench_from_path,
+)
 import argparse
 import concurrent.futures
 import json
 import logging
 import re
+import sys
 import threading
 import traceback
 import urllib.parse
@@ -20,42 +27,106 @@ from bs4 import BeautifulSoup
 from tqdm import tqdm
 from src.captcha_solver.main import get_text
 
-from court_utils import (
+from src.utils.court_utils import (
     to_s3_format,
     from_s3_format,
     get_json_file,
     get_court_codes,
-    get_tracking_data,
-    save_court_tracking_date,
     get_bench_codes,
     load_court_bench_mapping,
 )
-from s3_utils import (
+from src.utils.s3_utils import (
     S3_AVAILABLE,
+    create_and_upload_parquet_files,
     get_court_dates_from_index_files,
-    get_existing_files_from_s3,
-    upload_files_to_s3,
+    get_existing_files_from_s3_v2,
+    upload_files_to_s3_v2,
 )
 
 
 S3_ENABLED = False
-from file_utils import (
-    extract_decision_date_from_json,
-    extract_bench_from_path,
-    group_files_by_year_and_bench,
-)
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
 
+# Import compression functions
 
-logging.basicConfig(level=logging.INFO)
+# Check if Ghostscript is available on the system
+
+
+def check_ghostscript_available():
+    """Check if Ghostscript is available on the system"""
+    import subprocess
+    try:
+        result = subprocess.run(['gs', '--version'],
+                                capture_output=True, text=True, timeout=5)
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError, OSError):
+        return False
+
+
+COMPRESSION_AVAILABLE = check_ghostscript_available()
+if not COMPRESSION_AVAILABLE:
+    print("WARNING: PDF compression not available (Ghostscript not found)")
+
+
 logger = logging.getLogger(__name__)
 logger.setLevel("INFO")
+handler = logging.StreamHandler(sys.stdout)
+handler.setLevel(logging.INFO)
+handler.setFormatter(logging.Formatter(
+    '%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+logger.addHandler(handler)
+
+
+def compress_pdf_if_enabled(pdf_path):
+    """
+    Compress a PDF file if compression is enabled and available.
+    Returns the path to the final PDF (original or compressed).
+    """
+    if not COMPRESSION_AVAILABLE:
+        return pdf_path
+
+    try:
+        # Create temporary compressed file
+        compressed_path = pdf_path.with_suffix('.compressed.pdf')
+
+        # Compress the PDF
+        success, message = compress_pdf(pdf_path, compressed_path)
+
+        if success and compressed_path.exists():
+            original_size = pdf_path.stat().st_size
+            compressed_size = compressed_path.stat().st_size
+
+            # Only replace if compressed version is smaller
+            if compressed_size < original_size:
+                # Replace original with compressed version
+                pdf_path.unlink()  # Remove original
+                # Rename compressed to original name
+                compressed_path.rename(pdf_path)
+                logger.debug(
+                    f"Compressed PDF: {pdf_path.name} ({original_size} → {compressed_size} bytes)")
+                return pdf_path
+            else:
+                # Keep original, remove compressed version
+                compressed_path.unlink()
+                logger.debug(
+                    f"Skipped compression for {pdf_path.name}: no size reduction")
+                return pdf_path
+        else:
+            # Compression failed, keep original
+            if compressed_path.exists():
+                compressed_path.unlink()
+            logger.debug(f"Compression failed for {pdf_path.name}: {message}")
+            return pdf_path
+
+    except Exception as e:
+        logger.warning(f"Error compressing {pdf_path.name}: {e}")
+        return pdf_path
+
 
 root_url = "https://judgments.ecourts.gov.in"
 output_dir = Path("./data")
-START_DATE = "2008-01-01"
 
 
 payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=100&mDataProp_0=0&sSearch_0=&bRegex_0=false&bSearchable_0=true&bSortable_0=true&mDataProp_1=1&sSearch_1=&bRegex_1=false&bSearchable_1=true&bSortable_1=true&sSearch=&bRegex=false&iSortCol_0=0&sSortDir_0=asc&iSortingCols=1&search_txt1=&search_txt2=&search_txt3=&search_txt4=&search_txt5=&pet_res=&state_code=27~1&state_code_li=&dist_code=null&case_no=&case_year=&from_date=&to_date=&judge_name=&reg_year=&fulltext_case_type=&int_fin_party_val=undefined&int_fin_case_val=undefined&int_fin_court_val=undefined&int_fin_decision_val=undefined&act=&sel_search_by=undefined&sections=undefined&judge_txt=&act_txt=&section_txt=&judge_val=&act_val=&year_val=&judge_arr=&flag=&disp_nature=&search_opt=PHRASE&date_val=ALL&fcourt_type=2&citation_yr=&citation_vol=&citation_supl=&citation_page=&case_no1=&case_year1=&pet_res1=&fulltext_case_type1=&citation_keyword=&sel_lang=&proximity=&neu_cit_year=&neu_no=&ajax_req=true&app_token=1fbc7fbb840eb95975c684565909fe6b3b82b8119472020ff10f40c0b1c901fe"
@@ -77,7 +148,25 @@ S3_PREFIX = "metadata/json/"
 LOCAL_DIR = "./local_hc_metadata"
 OUTPUT_DIR = output_dir
 
-_existing_files_cache = {}
+
+class S3FileListCacheStore:
+    # given a year, court code, bench and data type, return the list of files in S3, maintaining reusability of existing cache if needed. If the cache is not available, fetch the files from S3.
+    def __init__(self):
+        self.cache = {}
+
+    def get(self, year: int, court_code: str, bench: str, data_type: str):
+        s3_court_code = to_s3_format(court_code)
+        key = (year, s3_court_code, bench, data_type)
+        if key in self.cache:
+            return self.cache[key]
+        else:
+            files = get_existing_files_from_s3_v2(
+                data_type, year, s3_court_code, bench)
+            self.cache[key] = files
+            return files
+
+
+cache_store = S3FileListCacheStore()
 
 
 def get_new_date_range(
@@ -96,40 +185,27 @@ def get_new_date_range(
     return new_from_date, new_to_date
 
 
-def get_date_ranges_to_process(court_code, start_date=None, end_date=None, day_step=1):
+def get_date_ranges_to_process(court_code, start_date, end_date, day_step=1):
     """
     Generate date ranges to process for a given court.
-    If start_date is provided but no end_date, use current date as end_date.
-    If neither is provided, use tracking data to determine the next date range.
+    Requires explicit start_date and end_date parameters.
     """
-    if start_date and not end_date:
-        end_date = datetime.now().strftime("%Y-%m-%d")
+    if not start_date or not end_date:
+        raise ValueError("Both start_date and end_date are required")
 
-    if start_date and end_date:
-        start_date_dt = datetime.strptime(start_date, "%Y-%m-%d")
-        end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
+    start_date_dt = datetime.strptime(start_date, "%Y-%m-%d")
+    end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
-        current_date = start_date_dt
-        while current_date <= end_date_dt:
-            range_end = min(current_date + timedelta(days=day_step - 1), end_date_dt)
-            yield (current_date.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d"))
-            current_date = range_end + timedelta(days=1)
-    else:
-        tracking_data = get_tracking_data()
-        court_tracking = tracking_data.get(court_code, {})
-        last_date = court_tracking.get("last_date", START_DATE)
-
-        current_date = datetime.strptime(last_date, "%Y-%m-%d") + timedelta(days=1)
-        end_date_dt = datetime.now()
-
-        while current_date <= end_date_dt:
-            range_end = min(current_date + timedelta(days=day_step - 1), end_date_dt)
-            yield (current_date.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d"))
-            current_date = range_end + timedelta(days=1)
+    current_date = start_date_dt
+    while current_date <= end_date_dt:
+        range_end = min(
+            current_date + timedelta(days=day_step - 1), end_date_dt)
+        yield (current_date.strftime("%Y-%m-%d"), range_end.strftime("%Y-%m-%d"))
+        current_date = range_end + timedelta(days=1)
 
 
 class CourtDateTask:
-    def __init__(self, court_code, from_date, to_date):
+    def __init__(self, court_code: str, from_date: str, to_date: str):
         self.id = str(uuid.uuid4())
         self.court_code = court_code
         self.from_date = from_date
@@ -168,15 +244,12 @@ def generate_tasks(
             yield CourtDateTask(code, from_date, to_date)
 
 
-def process_task(task):
+def process_task(task: CourtDateTask, compression_enabled=False):
     """Process a single court-date task"""
     try:
-        global _existing_files_cache
         downloader = Downloader(
             task,
-            existing_files_cache=_existing_files_cache
-            if _existing_files_cache
-            else None,
+            compression_enabled=compression_enabled,
         )
         downloader.download()
     except Exception as e:
@@ -187,155 +260,91 @@ def process_task(task):
         traceback.print_exc()
 
 
-def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_workers=2):
+def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_workers=2,
+        compress_pdfs=False):
     """
-    Run the downloader with intelligent date detection and S3 integration.
+    Run the downloader with explicit date ranges.
 
     Behavior:
-    - If no dates provided: Read dates from S3 index files and download from next day
-    - If dates provided: Download for specified range, skipping already-downloaded files
+    - Requires explicit start_date and end_date parameters
+    - Downloads for specified range, skipping already-downloaded files
     - Always checks S3 for existing files to avoid re-downloading
     - Appends to existing tar files in S3 after download
     """
-    global _existing_files_cache
 
     if isinstance(court_codes, str):
         court_codes = [court_codes]
 
-    if start_date is None and end_date is None:
-        print("No dates provided, fetching latest dates from S3 index files...")
-        if not S3_AVAILABLE:
-            print("ERROR: S3 not available, cannot fetch dates")
-            return
+    if start_date is None or end_date is None:
+        print("ERROR: Both start_date and end_date are required")
+        print("Usage: python download.py --start_date 2024-01-01 --end_date 2024-01-31")
+        return
 
-        s3_court_dates = get_court_dates_from_index_files()
+    print(
+        f"Downloading for specified date range: {start_date} to {end_date or start_date}"
+    )
 
-        if not s3_court_dates:
-            print("No dates found in S3, please provide start_date manually")
-            return
-
-        if court_codes:
-            filtered_dates = {}
-            for cc in court_codes:
-                s3_format = to_s3_format(cc)
-                if s3_format in s3_court_dates:
-                    filtered_dates[s3_format] = s3_court_dates[s3_format]
-            s3_court_dates = filtered_dates
-
-        if not s3_court_dates:
-            print("No matching courts found in S3")
-            return
-
-        print(f"Found {len(s3_court_dates)} courts to process")
-        for s3_court_code, benches in s3_court_dates.items():
-            court_code = from_s3_format(s3_court_code)
-
-            earliest_date = None
-            for bench_name, updated_at_str in benches.items():
-                try:
-                    bench_date = datetime.fromisoformat(
-                        updated_at_str.replace("Z", "+00:00")
-                    ).date()
-                    if earliest_date is None or bench_date < earliest_date:
-                        earliest_date = bench_date
-                except Exception as e:
-                    print(f"Warning: Invalid date for {bench_name}: {e}")
-                    continue
-
-            if not earliest_date:
-                print(f"Skipping {court_code}: no valid dates found")
-                continue
-
-            start_from = earliest_date + timedelta(days=1)
-            today = datetime.now().date()
-
-            if start_from > today:
-                print(f"Skipping {court_code}: already up to date")
-                continue
-
-            print(f"\nProcessing court {court_code}: {start_from} to {today}")
-
-            _existing_files_cache = get_existing_files_from_s3(s3_court_code, benches)
-
-            tasks = list(
-                generate_tasks(
-                    [court_code],
-                    start_from.strftime("%Y-%m-%d"),
-                    today.strftime("%Y-%m-%d"),
-                    day_step,
-                )
-            )
-            _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, today)
-
-            _existing_files_cache = {}
-
+    # Determine which courts to process
+    if court_codes is None:
+        # Process all courts
+        target_courts = list(get_court_codes().keys())
     else:
-        print(
-            f"Downloading for specified date range: {start_date} to {end_date or start_date}"
-        )
+        # Process specified courts
+        target_courts = court_codes
 
-        # Determine which courts to process
-        if court_codes is None:
-            # Process all courts
-            target_courts = list(get_court_codes().keys())
+    print(
+        f"Processing {len(target_courts)} court(s): {', '.join(target_courts)}")
+
+    # Process each court individually for proper S3 handling
+    for court_code in target_courts:
+        print(f"\nProcessing court {court_code}...")
+
+        # Load S3 cache for this court if S3 is enabled
+        if S3_ENABLED:
+            year_to_check = None
+            if start_date:
+                try:
+                    year_to_check = datetime.strptime(
+                        start_date, "%Y-%m-%d").year
+                except Exception:
+                    pass
+
+        # Generate tasks for this specific court
+        tasks = list[CourtDateTask](generate_tasks(
+            [court_code], start_date, end_date, day_step))
+
+        if not tasks:
+            print(f"No tasks to process for court {court_code}")
+            continue
+
+        print(f"Generated {len(tasks)} tasks for court {court_code}")
+
+        # Run tasks with S3 upload if enabled
+        if S3_ENABLED:
+            end_date_obj = (
+                datetime.strptime(
+                    end_date, "%Y-%m-%d").date() if end_date else None
+            )
+            _run_tasks_and_upload_to_s3(
+                tasks, court_code, max_workers, end_date_obj,
+                compress_pdfs
+            )
         else:
-            # Process specified courts
-            target_courts = court_codes
+            _run_tasks(tasks, max_workers,
+                       compress_pdfs)
 
-        print(f"Processing {len(target_courts)} court(s): {', '.join(target_courts)}")
-
-        # Process each court individually for proper S3 handling
-        for court_code in target_courts:
-            print(f"\nProcessing court {court_code}...")
-
-            # Load S3 cache for this court if S3 is enabled
-            if S3_ENABLED:
-                year_to_check = None
-                if start_date:
-                    try:
-                        year_to_check = datetime.strptime(start_date, "%Y-%m-%d").year
-                    except Exception:
-                        pass
-
-                s3_court_dates = get_court_dates_from_index_files(year=year_to_check)
-                s3_format = to_s3_format(court_code)
-                if s3_format in s3_court_dates:
-                    print(f"Loading existing files cache for {court_code} from S3...")
-                    _existing_files_cache = get_existing_files_from_s3(
-                        s3_format, s3_court_dates[s3_format], year=year_to_check
-                    )
-
-            # Generate tasks for this specific court
-            tasks = list(generate_tasks([court_code], start_date, end_date, day_step))
-
-            if not tasks:
-                print(f"No tasks to process for court {court_code}")
-                continue
-
-            print(f"Generated {len(tasks)} tasks for court {court_code}")
-
-            # Run tasks with S3 upload if enabled
-            if S3_ENABLED:
-                end_date_obj = (
-                    datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
-                )
-                _run_tasks_and_upload_to_s3(
-                    tasks, court_code, max_workers, end_date_obj
-                )
-            else:
-                _run_tasks(tasks, max_workers)
-
-            # Clear cache after each court
-            _existing_files_cache = {}
-
-    logger.info("All tasks completed")
+    logger.info("All download tasks completed")
 
 
-def _run_tasks(tasks, max_workers):
+def _run_tasks(tasks, max_workers, compression_enabled=False):
     """Run download tasks without S3 upload"""
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         with tqdm(total=len(tasks), desc="Processing tasks", unit="task") as pbar:
-            for i, result in enumerate(executor.map(process_task, tasks)):
+            for i, result in enumerate(executor.map(
+                lambda task: process_task(
+                    task, compression_enabled),
+                tasks
+            )):
                 task = tasks[i]
                 pbar.set_description(
                     f"Processing {task.court_code} ({task.from_date} to {task.to_date})"
@@ -343,7 +352,23 @@ def _run_tasks(tasks, max_workers):
                 pbar.update(1)
 
 
-def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
+def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
+    """Group files by year"""
+    files_by_year: Dict[int, List[Path]] = {}
+    for file in files:
+        json_file = file.with_suffix(".json")
+        year = extract_decision_date_from_json(json_file)
+        if year is None:
+            continue
+            # maybe they need to be handled instead of skipping?
+        if year not in files_by_year:
+            files_by_year[year] = []
+        files_by_year[year].append(file)
+    return files_by_year
+
+
+def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None,
+                                compression_enabled=False):
     """
     Run download tasks and upload results to S3
 
@@ -352,13 +377,14 @@ def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
         court_code: Court code being processed
         max_workers: Number of parallel workers
         end_date: End date of the download range (for index timestamp)
+        compression_enabled: Whether to compress PDFs during download
     """
     if not S3_ENABLED:
         print("INFO: S3 disabled, will only download locally")
-        _run_tasks(tasks, max_workers)
+        _run_tasks(tasks, max_workers, compression_enabled)
         return
 
-    _run_tasks(tasks, max_workers)
+    _run_tasks(tasks, max_workers, compression_enabled)
 
     if end_date is None and tasks:
         end_date = max(task.to_date for task in tasks)
@@ -419,22 +445,6 @@ def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
         f"Loading S3 index files for {len(years_in_local_files)} year partition(s)..."
     )
 
-    global _existing_files_cache
-    if not _existing_files_cache:
-        _existing_files_cache = {}
-        for year in sorted(years_in_local_files):
-            print(f"  Loading S3 index for year {year}...")
-            year_cache = get_existing_files_from_s3(
-                court_code_underscore, {b: None for b in target_benches}, year
-            )
-            for bench, files in year_cache.items():
-                if bench not in _existing_files_cache:
-                    _existing_files_cache[bench] = {"metadata": set(), "data": set()}
-                _existing_files_cache[bench]["metadata"].update(
-                    files.get("metadata", set())
-                )
-                _existing_files_cache[bench]["data"].update(files.get("data", set()))
-
     total_on_disk = 0
     total_new = 0
 
@@ -448,368 +458,91 @@ def _run_tasks_and_upload_to_s3(tasks, court_code, max_workers, end_date=None):
             pdf_files = list(bench_path.glob("**/*.pdf"))
 
             total_on_disk += len(json_files) + len(pdf_files)
+            json_files_by_year_partition = group_files_by_year(json_files)
+            pdf_files_by_year_partition = group_files_by_year(pdf_files)
 
-            bench_cache = _existing_files_cache.get(
-                bench, {"metadata": set(), "data": set()}
-            )
+            bench_files = {}
 
-            for json_file in json_files:
-                filename = json_file.name
-                base_name = filename.replace(".json", "")
+            for year in json_files_by_year_partition.keys():
+                # get cached files from S3
+                existing_files = get_existing_files_from_s3_v2(
+                    "metadata", year, court_code_underscore, bench)
 
-                if base_name not in bench_cache.get("metadata", set()):
-                    downloaded_files["metadata"].append(json_file)
-                    total_new += 1
+                new_files = set(
+                    json_files_by_year_partition[year]) - set(existing_files)
 
-            for pdf_file in pdf_files:
-                filename = pdf_file.name
+                if year not in bench_files:
+                    bench_files[year] = {
+                        "metadata": set(),
+                        "data": set()
+                    }
 
-                if filename not in bench_cache.get("data", set()):
-                    downloaded_files["data"].append(pdf_file)
-                    total_new += 1
+                bench_files[year]["metadata"] = new_files
+            for year in pdf_files_by_year_partition.keys():
+                existing_pdf_files = get_existing_files_from_s3_v2(
+                    "data", year, court_code_underscore, bench)
 
-        print(f"Found {total_on_disk} total files on disk")
-        print(
-            f"Filtered to {total_new} NEW files not yet in S3: {len(downloaded_files['metadata'])} metadata, {len(downloaded_files['data'])} PDF"
-        )
+                new_pdf_files = set(
+                    pdf_files_by_year_partition[year]) - set(existing_pdf_files)
 
-        if downloaded_files["metadata"] or downloaded_files["data"]:
-            print(f"\nUploading files to S3 for {court_code}...")
-            bench_upload_status = upload_files_to_s3(court_code, downloaded_files)
+                logger.info(
+                    f"New PDF files: {len(new_pdf_files)}, for year {year}, bench {bench}, court {court_code_underscore}")
 
-            # Index files are automatically updated by create_and_upload_tar_files
+                if year not in bench_files:
+                    bench_files[year] = {
+                        "metadata": set(),
+                        "data": set()
+                    }
+
+                bench_files[year]["data"] = new_pdf_files
+
+            for year, year_files in bench_files.items():
+                if year_files["metadata"]:
+                    upload_files_to_s3_v2(
+                        "metadata", year, court_code_underscore, bench, year_files["metadata"])
+
+                if year_files["data"]:
+                    upload_files_to_s3_v2(
+                        "data", year, court_code_underscore, bench, year_files["data"])
+
+                # upload parquet files
+                success = create_and_upload_parquet_files(
+                    year, court_code_underscore, bench, year_files)
+                if not success:
+                    logger.error(
+                        f"Failed to upload parquet files for year {year}, bench {bench}, court {court_code_underscore}")
+
+            # clean up local files, remove the bench directory
+            shutil.rmtree(bench_path)
 
     except Exception as e:
         print(f"Error during S3 upload: {e}")
         traceback.print_exc()
 
 
-def run_incremental_download(court_code_dl, start_date, end_date=None, max_workers=4):
-    """Run download for specific court and date range with multiprocessing support"""
-    # If no end_date provided, make it same as start_date
-    if end_date is None:
-        end_date = start_date
-
-    print(f"Downloading {court_code_dl}: {start_date} → {end_date}")
-
-    try:
-        downloaded_files = {"metadata": [], "data": []}
-
-        print(f"Starting multi-threaded download with {max_workers} workers...")
-
-        run(
-            court_codes=[court_code_dl],
-            start_date=start_date.strftime("%Y-%m-%d"),
-            end_date=end_date.strftime("%Y-%m-%d"),
-            day_step=1,
-            max_workers=max_workers,
-        )
-
-        print(f"Multi-threaded download completed: {court_code_dl}")
-
-        court_code_underscore = to_s3_format(court_code_dl)
-
-        print(
-            f"Debug: court_code_dl = {court_code_dl}, court_code_underscore = {court_code_underscore}"
-        )
-
-        # Load bench codes to find the bench name
-        try:
-            with open("bench-codes.json", "r") as f:
-                bench_codes = json.load(f)
-
-            # Find ALL bench names for this court code (not just the first one)
-            target_benches = []
-            for bench_name, court_code in bench_codes.items():
-                if court_code == court_code_underscore:
-                    target_benches.append(bench_name)
-
-            if target_benches:
-                print(
-                    f"Targeting {len(target_benches)} bench directories for court {court_code_underscore}: {target_benches}"
-                )
-                # Get files from ALL bench directories for this court
-                for target_bench in target_benches:
-                    bench_path = Path(f"./data/court/cnrorders/{target_bench}")
-                    if bench_path.exists():
-                        json_files = list(bench_path.glob("**/*.json"))
-                        pdf_files = list(bench_path.glob("**/*.pdf"))
-
-                        # Add all files from this bench
-                        for json_file in json_files:
-                            downloaded_files["metadata"].append(str(json_file))
-
-                        for pdf_file in pdf_files:
-                            downloaded_files["data"].append(str(pdf_file))
-
-                        print(
-                            f"Found {len(json_files)} JSON and {len(pdf_files)} PDF files in {target_bench}"
-                        )
-                    else:
-                        print(f"Warning: Bench directory {bench_path} does not exist")
-            else:
-                print(
-                    f"Warning: Could not find any bench for court code {court_code_underscore}"
-                )
-                print(
-                    f"Available court codes in bench-codes.json: {list(bench_codes.values())}"
-                )
-
-        except Exception as e:
-            print(f"Warning: Could not load bench codes: {e}")
-            # Fallback to scanning all directories (old behavior)
-            print("Falling back to scanning all bench directories...")
-            court_output_dir = Path(f"./data/court/cnrorders")
-            if court_output_dir.exists():
-                for bench_dir in court_output_dir.iterdir():
-                    if bench_dir.is_dir():
-                        json_files = list(bench_dir.glob("**/*.json"))
-                        pdf_files = list(bench_dir.glob("**/*.pdf"))
-
-                        for json_file in json_files:
-                            downloaded_files["metadata"].append(str(json_file))
-
-                        for pdf_file in pdf_files:
-                            downloaded_files["data"].append(str(pdf_file))
-
-        print(
-            f"Collected {len(downloaded_files['metadata'])} metadata files and {len(downloaded_files['data'])} PDF files"
-        )
-        return downloaded_files
-
-    except Exception as e:
-        print(f"Download failed {court_code_dl}: {e}")
-        traceback.print_exc()
-        return {"metadata": [], "data": []}
-
-
-def sync_to_s3(max_workers=4, court_codes=None):
-    """Sync new data to S3 for all courts or specific court_codes"""
-    if not S3_ENABLED:
-        print("ERROR: S3 disabled by S3_ENABLED flag")
-        return
-
-    if court_codes:
-        print(f"Starting S3 sync for courts: {court_codes}")
-    else:
-        print("Starting S3 sync for all courts")
-
-    # Get current dates from S3 index files
-    court_dates = get_court_dates_from_index_files()
-    print(court_dates)
-    if not court_dates:
-        print("No existing data found in S3, exiting")
-        return
-
-    # Filter by court_codes if provided
-    if court_codes:
-        # Convert court_codes from format like '33_10' to match keys in court_dates
-        filtered_court_dates = {}
-        for cc in court_codes:
-            s3_format = cc.replace("~", "_")
-            if s3_format in court_dates:
-                filtered_court_dates[s3_format] = court_dates[s3_format]
-            else:
-                print(f"Warning: Court code {cc} not found in S3 data")
-        court_dates = filtered_court_dates
-
-    if not court_dates:
-        print("No courts to process after filtering")
-        return
-
-    # Count total benches across all courts
-    total_benches = sum(len(benches) for benches in court_dates.values())
-    print(
-        f"Found {len(court_dates)} courts with {total_benches} total benches to process"
-    )
-
-    for s3_court_code, benches in court_dates.items():
-        court_code = s3_court_code.replace("_", "~")
-        print(f"Processing court {court_code} with {len(benches)} benches")
-
-        # **NEW: Fetch existing files from S3 to avoid re-downloading**
-        print(f"  Fetching existing files from S3 for optimization...")
-        global _existing_files_cache
-        _existing_files_cache = get_existing_files_from_s3(s3_court_code, benches)
-
-        # Step 1: Find the earliest date among all benches for this court
-        earliest_date = None
-        bench_dates = {}  # Store each bench's latest date for later use
-
-        for bench_name, updated_at_str in benches.items():
-            try:
-                bench_latest_date = datetime.fromisoformat(
-                    updated_at_str.replace("Z", "+00:00")
-                ).date()
-                bench_dates[bench_name] = bench_latest_date
-                print(f"  Bench {bench_name}: latest date = {bench_latest_date}")
-
-                if earliest_date is None or bench_latest_date < earliest_date:
-                    earliest_date = bench_latest_date
-            except Exception as e:
-                print(
-                    f"  Warning: Invalid date {updated_at_str} for bench {bench_name}: {e}"
-                )
-                continue
-
-        if not bench_dates:
-            print(f"  No valid bench dates found for court {court_code}, skipping")
-            continue
-
-        print(f"  Earliest date across all benches: {earliest_date}")
-
-        # Step 2: Download for entire court from earliest date to today (ONCE)
-        # Files already in S3 will be skipped automatically via existing_files_cache
-        today = datetime.now().date()
-        start_date = earliest_date + timedelta(days=1)
-
-        if start_date > today:
-            print(
-                f"  No data to download for court {court_code} (start_date {start_date} > today {today})"
-            )
-            continue
-
-        print(f"  Downloading court {court_code}: {start_date} to {today}")
-        print(f"  (Files already in S3 will be automatically skipped)")
-        all_downloaded_files = run_incremental_download(
-            court_code, start_date, today, max_workers
-        )
-
-        if not all_downloaded_files or (
-            not all_downloaded_files["metadata"] and not all_downloaded_files["data"]
-        ):
-            print(f"  No files downloaded for court {court_code}")
-            continue
-
-        print(
-            f"  Downloaded {len(all_downloaded_files['metadata'])} metadata and {len(all_downloaded_files['data'])} data files"
-        )
-
-        # Step 3: Split downloaded files by bench
-        bench_files = {}
-        for bench_name in bench_dates.keys():
-            bench_files[bench_name] = {"metadata": [], "data": []}
-
-        # Distribute metadata files to benches
-        for metadata_file in all_downloaded_files.get("metadata", []):
-            file_bench = extract_bench_from_path(metadata_file)
-            if file_bench and file_bench in bench_files:
-                bench_files[file_bench]["metadata"].append(metadata_file)
-
-        # Distribute data files to benches
-        for data_file in all_downloaded_files.get("data", []):
-            file_bench = extract_bench_from_path(data_file)
-            if file_bench and file_bench in bench_files:
-                bench_files[file_bench]["data"].append(data_file)
-
-        # Show what we found for each bench
-        for bench_name, files in bench_files.items():
-            print(
-                f"  Found {len(files['metadata'])} metadata and {len(files['data'])} data files for bench {bench_name}"
-            )
-
-        # Step 4: Upload and update index for each bench that has files
-        for bench_name, files in bench_files.items():
-            if not files["metadata"] and not files["data"]:
-                print(f"  No new files for bench {bench_name}, skipping")
-                continue
-
-            print(f"  Uploading files for bench {bench_name}...")
-
-            # Upload files to S3 - returns dict of bench -> success status
-            bench_upload_status = upload_files_to_s3(court_code, files)
-
-            # Update index files for successfully uploaded benches
-            for uploaded_bench, upload_success in bench_upload_status.items():
-                if upload_success:
-                    print(f"    S3 upload successful for bench {uploaded_bench}")
-                else:
-                    print(
-                        f"    S3 upload failed for bench {uploaded_bench}, NOT updating index files"
-                    )
-
-        # Clear cache for this court
-        _existing_files_cache = {}
-
-        print(f"Completed court {court_code}")
-
-    print("S3 sync completed for all courts")
-
-
-def download_bench_data(court_code, bench_name, latest_date, max_workers=4):
-    """Download data for a specific bench of a court"""
-    today = datetime.now().date()
-
-    # Calculate the next date to download (latest_date + 1)
-    start_date = latest_date + timedelta(days=1)
-
-    # For full sync, download up to today
-    end_date = today
-
-    # Check if we need to download anything
-    if start_date > end_date:
-        print(
-            f"    Court {court_code}, bench {bench_name}: No data to download (start_date {start_date} > end_date {end_date})"
-        )
-        return {"metadata": [], "data": []}
-
-    # Convert court code for download (replace _ with ~)
-    court_code_dl = court_code.replace("_", "~")
-
-    print(
-        f"    Downloading: Court {court_code}, bench {bench_name}: {start_date} to {end_date}"
-    )
-
-    # Run download with max_workers support (this downloads for entire court)
-    all_downloaded_files = run_incremental_download(
-        court_code_dl, start_date, end_date, max_workers
-    )
-
-    # Filter files to only include those from the specific bench we're processing
-    bench_filtered_files = {"metadata": [], "data": []}
-
-    # Filter metadata files
-    for metadata_file in all_downloaded_files.get("metadata", []):
-        file_bench = extract_bench_from_path(metadata_file)
-        if file_bench == bench_name:
-            bench_filtered_files["metadata"].append(metadata_file)
-
-    # Filter data files
-    for data_file in all_downloaded_files.get("data", []):
-        file_bench = extract_bench_from_path(data_file)
-        if file_bench == bench_name:
-            bench_filtered_files["data"].append(data_file)
-
-    print(
-        f"    Filtered to {len(bench_filtered_files['metadata'])} metadata and {len(bench_filtered_files['data'])} data files for bench {bench_name}"
-    )
-
-    return bench_filtered_files
-
-
 class Downloader:
-    def __init__(self, task: CourtDateTask, existing_files_cache=None):
+    def __init__(self, task: CourtDateTask, compression_enabled=False):
         self.task = task
         self.root_url = "https://judgments.ecourts.gov.in"
         self.search_url = f"{self.root_url}/pdfsearch/?p=pdf_search/home/"
-        self.captcha_url = f"{self.root_url}/pdfsearch/vendor/securimage/securimage_show.php"  # not lint skip/
+        # not lint skip/
+        self.captcha_url = f"{self.root_url}/pdfsearch/vendor/securimage/securimage_show.php"
         self.captcha_token_url = f"{self.root_url}/pdfsearch/?p=pdf_search/checkCaptcha"
         self.pdf_link_url = f"{self.root_url}/pdfsearch/?p=pdf_search/openpdfcaptcha"
         self.pdf_link_url_wo_captcha = f"{root_url}/pdfsearch/?p=pdf_search/openpdf"
 
         self.court_code = task.court_code
-        self.tracking_data = get_tracking_data()
         self.court_codes = get_court_codes()
         self.court_name = self.court_codes[self.court_code]
-        self.court_tracking = self.tracking_data.get(self.court_code, {})
         self.session_cookie_name = "JUDGEMENTSSEARCH_SESSID"
         self.ecourts_token_cookie_name = "JSESSION"
         self.session_id = None
         self.ecourts_token = None
-        self.app_token = "490a7e9b99e4553980213a8b86b3235abc51612b038dbdb1f9aa706b633bbd6c"  # not lint skip/
+        # not lint skip/
+        self.app_token = "490a7e9b99e4553980213a8b86b3235abc51612b038dbdb1f9aa706b633bbd6c"
 
-        # NEW: Cache of existing files in S3 to avoid re-downloading
-        self.existing_files_cache = existing_files_cache or {}
+        # PDF compression settings
+        self.compression_enabled = compression_enabled and COMPRESSION_AVAILABLE
 
     def _results_exist_in_search_response(self, res_dict):
         results_exist = (
@@ -831,11 +564,10 @@ class Downloader:
         return search_payload
 
     def process_court(self):
-        last_date = self.court_tracking.get("last_date", START_DATE)
-        from_date, to_date = get_new_date_range(last_date)
-        if from_date is None:
-            logger.info(f"No more data to download for: task: {self.task.id}")
-            return
+        """Process court data for the specific date range in the task."""
+        from_date = self.task.from_date
+        to_date = self.task.to_date
+
         search_payload = self.default_search_payload()
         search_payload["from_date"] = from_date
         search_payload["to_date"] = to_date
@@ -847,7 +579,8 @@ class Downloader:
 
         while results_available:
             try:
-                response = self.request_api("POST", self.search_url, search_payload)
+                response = self.request_api(
+                    "POST", self.search_url, search_payload)
                 res_dict = response.json()
                 if self._results_exist_in_search_response(res_dict):
                     for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
@@ -857,14 +590,7 @@ class Downloader:
                             )
                             if is_pdf_downloaded:
                                 pdfs_downloaded += 1
-                            else:
-                                self.court_tracking["failed_dates"] = (
-                                    self.court_tracking.get("failed_dates", [])
-                                )
-                                if from_date not in self.court_tracking["failed_dates"]:
-                                    self.court_tracking["failed_dates"].append(
-                                        from_date
-                                    )
+
                             if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                 # after 25 downloads, need to solve captcha for every pdf link request. Starting with a fresh session would be faster so that we get another 25 downloads without captcha
                                 logger.info(
@@ -884,34 +610,32 @@ class Downloader:
                         continue
                         # we are skipping the rest of the loop, meaning we fetch the 1000 results again for the same page, with a new session and process. Already downloaded pdfs will be skipped. This continues until we hve downloaded the whole page.
                     # prepare next iteration
-                    search_payload = self._prepare_next_iteration(search_payload)
+                    search_payload = self._prepare_next_iteration(
+                        search_payload)
                 else:
-                    last_date = to_date
-                    self.court_tracking["last_date"] = last_date
-                    save_court_tracking_date(self.court_code, self.court_tracking)
-                    from_date, to_date = get_new_date_range(to_date)
-                    if from_date is None:
-                        logger.info(f"No more data to download for: task: {self.task}")
-                        results_available = False
-                    else:
-                        search_payload["from_date"] = from_date
-                        search_payload["to_date"] = to_date
-                        search_payload["sEcho"] = 1
-                        search_payload["iDisplayStart"] = 0
-                        search_payload["iDisplayLength"] = page_size
-                        logger.info(f"Downloading data for task: {self.task}")
+                    logger.info(
+                        f"No more data to download for: task: {self.task}")
+                    results_available = False
 
             except Exception as e:
                 logger.error(f"Error processing task: {self.task}, Error: {e}")
                 traceback.print_exc()
-                self.court_tracking["failed_dates"] = self.court_tracking.get(
-                    "failed_dates", []
-                )
-                if from_date not in self.court_tracking["failed_dates"]:
-                    self.court_tracking["failed_dates"].append(
-                        from_date
-                    )  # TODO: should be all the dates from from_date to to_date in case step date > 1
-                save_court_tracking_date(self.court_code, self.court_tracking)
+                results_available = False
+
+    def does_result_exist_in_s3(self, pdf_path: str | Path):
+        if isinstance(pdf_path, str):
+            pdf_path = Path(pdf_path)
+        start_year = datetime.strptime(self.task.from_date, "%Y-%m-%d").year
+        end_year = datetime.strptime(self.task.to_date, "%Y-%m-%d").year
+        # assuming the date range falls in two years at max
+        years = set([start_year, end_year])
+        bench = extract_bench_from_path(pdf_path)
+        if not bench:
+            return False
+        for year in years:
+            if pdf_path.name in cache_store.get(year, self.court_code, bench, "data"):
+                return True
+        return False
 
     def process_result_row(self, row, row_pos):
         html = row[1]
@@ -932,26 +656,11 @@ class Downloader:
             return False
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
-        # **NEW: Check if file already exists in S3 (for sync_s3 optimization)**
-        if self.existing_files_cache:
-            file_bench = extract_bench_from_path(pdf_fragment)
-            filename = Path(pdf_fragment).name
-
-            # Check in cache for this bench
-            if file_bench in self.existing_files_cache:
-                bench_cache = self.existing_files_cache[file_bench]
-
-                # Extract just the filename without extension for comparison
-                base_filename = filename.replace(".pdf", "")
-
-                # Check if this file already exists in S3
-                if base_filename in bench_cache.get(
-                    "metadata", set()
-                ) or filename in bench_cache.get("data", set()):
-                    logger.debug(
-                        f"Skipping {filename} - already exists in S3 for bench {file_bench}"
-                    )
-                    return False
+        if self.does_result_exist_in_s3(pdf_fragment):
+            logger.debug(
+                f"Skipping {pdf_fragment} - already exists in S3"
+            )
+            return False
 
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
@@ -1016,8 +725,19 @@ class Downloader:
             return False
         with open(pdf_output_path, "wb") as f:
             f.write(pdf_response.content)
+
+        # Compress PDF if compression is enabled
+        if hasattr(self, 'compression_enabled') and self.compression_enabled:
+            original_size = pdf_output_path.stat().st_size
+            pdf_output_path = compress_pdf_if_enabled(
+                pdf_output_path)
+            compressed_size = pdf_output_path.stat().st_size
+            if compressed_size < original_size:
+                logger.debug(
+                    f"Compressed PDF: {pdf_output_path.name} ({original_size} → {compressed_size} bytes)")
+
         logger.debug(
-            f"Downloaded, task: {self.task}, output path: {pdf_output_path}, size: {no_of_bytes}"
+            f"Downloaded, task: {self.task}, output path: {pdf_output_path}, size: {pdf_output_path.stat().st_size}"
         )
         return True
 
@@ -1050,7 +770,8 @@ class Downloader:
             or "×" in expression
         ):
             expression = (
-                expression.replace("x", "*").replace("×", "*").replace("X", "*")
+                expression.replace("x", "*").replace("×",
+                                                     "*").replace("X", "*")
             )
             nums = expression.split("*")
             return str(int(nums[0]) * int(nums[1]))
@@ -1059,7 +780,8 @@ class Downloader:
             nums = expression.split("/")
             return str(int(nums[0]) // int(nums[1]))
         else:
-            raise ValueError(f"Unsupported mathematical expression: {expression}")
+            raise ValueError(
+                f"Unsupported mathematical expression: {expression}")
 
     def is_math_expression(self, expression):
         separators = ["+", "-", "*", "/", "÷", "x", "×", "X"]
@@ -1069,7 +791,8 @@ class Downloader:
         return False
 
     def solve_captcha(self, retries=0, captcha_url=None):
-        logger.debug(f"Solving captcha, retries: {retries}, task: {self.task.id}")
+        logger.debug(
+            f"Solving captcha, retries: {retries}, task: {self.task.id}")
         if retries > 10:
             raise ValueError("Failed to solve captcha")
         if captcha_url is None:
@@ -1144,7 +867,8 @@ class Downloader:
         return pdf_link_response
 
     def refresh_token(self, with_app_token=False):
-        logger.debug(f"Current session id {self.session_id}, token {self.app_token}")
+        logger.debug(
+            f"Current session id {self.session_id}, token {self.app_token}")
         answer = self.solve_captcha()
         captcha_check_payload = {
             "captcha": answer,
@@ -1217,7 +941,8 @@ class Downloader:
         return output_dir / pdf_fragment.split("#")[0]
 
     def is_pdf_downloaded(self, pdf_fragment):
-        pdf_metadata_path = self.get_pdf_output_path(pdf_fragment).with_suffix(".json")
+        pdf_metadata_path = self.get_pdf_output_path(
+            pdf_fragment).with_suffix(".json")
         if pdf_metadata_path.exists():
             pdf_metadata = get_json_file(pdf_metadata_path)
             return pdf_metadata["downloaded"]
@@ -1305,7 +1030,8 @@ class Downloader:
 
         while results_available:
             try:
-                response = self.request_api("POST", self.search_url, search_payload)
+                response = self.request_api(
+                    "POST", self.search_url, search_payload)
                 res_dict = response.json()
                 if self._results_exist_in_search_response(res_dict):
                     results = res_dict["reportrow"]["aaData"]
@@ -1324,7 +1050,8 @@ class Downloader:
                                 )
                                 if is_pdf_downloaded:
                                     pdfs_downloaded += 1
-                                    result_pbar.set_postfix(downloaded=pdfs_downloaded)
+                                    result_pbar.set_postfix(
+                                        downloaded=pdfs_downloaded)
 
                                 result_pbar.update(1)
 
@@ -1351,7 +1078,8 @@ class Downloader:
                         continue
 
                     # prepare next iteration
-                    search_payload = self._prepare_next_iteration(search_payload)
+                    search_payload = self._prepare_next_iteration(
+                        search_payload)
                 else:
                     # No more results for this date range
                     results_available = False
@@ -1374,13 +1102,19 @@ SMART DATE DETECTION:
 Examples:
   # Auto-detect dates and download for specific court
   python download.py --court_code 33_10
-  
+
   # Download specific date range for a court
   python download.py --court_code 33_10 --start_date 2025-01-01 --end_date 2025-01-31
-  
+
+  # Download with PDF compression enabled
+  python download.py --court_code 33_10 --compress-pdfs --compression-level screen
+
+  # Download with S3 sync and PDF compression
+  python download.py --court_code 33_10 --s3_sync --compress-pdfs --compression-workers 8
+
   # Download for all courts (auto-detect dates)
   python download.py
-  
+
   # Just check what dates are in S3
   python download.py --fetch_dates
         """,
@@ -1427,6 +1161,13 @@ Examples:
         default=False,
         help="Enable S3 integration (uploads to S3, checks existing files, syncs dates)",
     )
+    parser.add_argument(
+        "--compress-pdfs",
+        action="store_true",
+        default=False,
+        help="Enable PDF compression during download (requires Ghostscript to be installed)",
+    )
+
     args = parser.parse_args()
 
     if args.s3_sync:
@@ -1435,6 +1176,16 @@ Examples:
     else:
         S3_ENABLED = False
         print("INFO: S3 integration disabled (use --s3_sync to enable)")
+
+    # Handle PDF compression settings
+    if args.compress_pdfs:
+        if not COMPRESSION_AVAILABLE:
+            print("ERROR: PDF compression requested but Ghostscript not available")
+            print("Please install Ghostscript: sudo apt-get install ghostscript")
+            sys.exit(1)
+        print("INFO: PDF compression enabled")
+    else:
+        print("INFO: PDF compression disabled (use --compress-pdfs to enable)")
 
     # Handle different modes
     if args.fetch_dates:
@@ -1455,7 +1206,8 @@ Examples:
             court_codes = None
 
         run(
-            court_codes, args.start_date, args.end_date, args.day_step, args.max_workers
+            court_codes, args.start_date, args.end_date, args.day_step, args.max_workers,
+            compress_pdfs=args.compress_pdfs,
         )
 
 """

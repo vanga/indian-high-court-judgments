@@ -30,24 +30,6 @@ def get_court_codes():
     return court_codes
 
 
-def get_tracking_data():
-    tracking_data = get_json_file("./track.json")
-    return tracking_data
-
-
-def save_tracking_data(tracking_data):
-    with open("./track.json", "w") as f:
-        json.dump(tracking_data, f)
-
-
-def save_court_tracking_date(court_code, court_tracking):
-    lock.acquire()
-    tracking_data = get_tracking_data()
-    tracking_data[court_code] = court_tracking
-    save_tracking_data(tracking_data)
-    lock.release()
-
-
 def get_bench_codes():
     """Load bench to court mappings from bench-codes.json"""
     with open(BENCH_CODES_FILE, "r") as f:
@@ -61,7 +43,7 @@ def load_court_bench_mapping():
     """
     csv_path = Path("opendata/docs/high_courts.csv")
     mapping = {}
-    
+
     with open(csv_path, "r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
@@ -71,4 +53,3 @@ def load_court_bench_mapping():
 
     print(f"Loaded {len(mapping)} bench-to-court mappings from {csv_path}")
     return mapping
-

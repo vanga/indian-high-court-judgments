@@ -11,7 +11,7 @@ import os
 import shutil
 
 # Import shared HTML parsing utilities
-from html_utils import parse_case_details_from_html
+from src.utils.html_utils import parse_case_details_from_html
 
 ADD_PDF_METADATA = False
 
@@ -46,6 +46,7 @@ class MetadataProcessor:
             "disposal_nature",
             "court",
             "raw_html",
+            "pdf_exists",
         ]
 
         if ADD_PDF_METADATA:
@@ -67,10 +68,11 @@ class MetadataProcessor:
             yield file
 
     def _add_pdf_metadata(self, processed, pdf_path: Path):
+        import exiftool
         if not pdf_path.exists():
             print(f"Skipping {pdf_path} because it has no pdf")
             return
-        pdf_metadata = et.get_metadata(pdf_path)
+        pdf_metadata = exiftool.get_metadata(pdf_path)
         if len(pdf_metadata) != 1:
             print(
                 f"Error processing {pdf_path} for exif metadata, count: {len(pdf_metadata)}"
@@ -81,7 +83,8 @@ class MetadataProcessor:
             processed["file_type"] = pdf_metadata.get("File:FileType", None)
             processed["mime_type"] = pdf_metadata.get("File:MIMEType", None)
             processed["pdf_version"] = pdf_metadata.get("PDF:PDFVersion", None)
-            processed["pdf_linearized"] = pdf_metadata.get("PDF:Linearized", None)
+            processed["pdf_linearized"] = pdf_metadata.get(
+                "PDF:Linearized", None)
             processed["pdf_pages"] = pdf_metadata.get("PDF:PageCount", None)
             processed["pdf_producer"] = pdf_metadata.get("PDF:Producer", None)
             processed["pdf_language"] = pdf_metadata.get("PDF:Language", None)
@@ -96,7 +99,8 @@ class MetadataProcessor:
                             metadata = self.load_metadata(file)
                             processed = self.process_metadata(metadata)
                             if not processed:
-                                print(f"Skipping {file} because it has no raw_html")
+                                print(
+                                    f"Skipping {file} because it has no raw_html")
                                 continue
                         except Exception as e:
                             print(f"Error processing {file}: {e}")
@@ -118,6 +122,17 @@ class MetadataProcessor:
                     try:
                         metadata = self.load_metadata(file)
                         processed = self.process_metadata(metadata)
+                        if not processed:
+                            print(
+                                f"Skipping {file} because it has no raw_html")
+                            continue
+
+                        pdf_path = file.with_suffix(".pdf")
+                        if not pdf_path.exists():
+                            processed["pdf_exists"] = False
+                        else:
+                            processed["pdf_exists"] = True
+
                         self.add_record(processed)
                     except Exception as e:
                         print(f"Error processing {file}: {e}")
@@ -128,7 +143,8 @@ class MetadataProcessor:
                 self.write_batch()
             if hasattr(self, "writer") and self.writer is not None:
                 self.writer.close()
-                print(f"Wrote {self.record_count} records to {self.output_path}")
+                print(
+                    f"Wrote {self.record_count} records to {self.output_path}")
 
     def process_metadata(self, metadata: dict) -> dict:
         if "raw_html" not in metadata:
@@ -208,6 +224,8 @@ class MetadataProcessor:
             "decision_date": "date32[day][pyarrow]",
             "disposal_nature": "string",
             "court": "string",
+            "raw_html": "string",
+            "pdf_exists": "boolean",
             "size": "Int64",  # Nullable integer
             "file_type": "string",
             "mime_type": "string",
@@ -272,7 +290,8 @@ class MetadataProcessor:
 
     def process_parallel(self, max_workers=None):
         """Process all court directories in parallel."""
-        court_dirs = [d for d in self.src.glob("court/cnrorders/*") if d.is_dir()]
+        court_dirs = [d for d in self.src.glob(
+            "court/cnrorders/*") if d.is_dir()]
 
         if not court_dirs:
             print("No court directories found!")
@@ -346,6 +365,7 @@ class MetadataProcessor:
 
 
 if __name__ == "__main__":
-    processor = MetadataProcessor(src, batch_size=1000, output_dir="processed_data")
+    processor = MetadataProcessor(
+        src, batch_size=1000, output_dir="processed_data")
 
     processor.process_parallel(max_workers=32)

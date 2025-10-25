@@ -2,9 +2,10 @@
 
 from lxml import html
 from datetime import datetime
+from typing import Optional, Tuple
 
 
-def parse_decision_date_from_html(raw_html):
+def parse_decision_date_from_html(raw_html) -> Tuple[Optional[str], Optional[int]]:
     """
     Extract decision date from judgment HTML.
 

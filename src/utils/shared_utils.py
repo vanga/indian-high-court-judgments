@@ -94,17 +94,20 @@ def extract_gzipped_tar(gzipped_tar_path: Path, output_tar_path: Path) -> bool:
 
 
 def generate_part_name(now_iso: str) -> str:
-    """
-    Generate part name with compact timestamp.
-
-    Args:
-        now_iso: ISO format datetime string
-
-    Returns:
-        Part name string (e.g., "part-20250127T103045Z.tar")
-    """
     # Use compact timestamp: YYYYMMDDThhmmssZ
     ts = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).strftime(
         "%Y%m%dT%H%M%SZ"
     )
-    return f"part-{ts}.tar"
+    return f"part-{ts}"
+
+
+def get_bench_partition_key(data_type: str, storage_type: str, year: int, court_code: str, bench: str) -> str:
+    return f"{data_type}/{storage_type}/year={year}/court={court_code}/bench={bench}/"
+
+
+def get_metadata_index_key(year: int, court_code: str, bench: str) -> str:
+    return f"{get_bench_partition_key('metadata', 'tar', year, court_code, bench)}metadata.index.json"
+
+
+def get_data_index_key(year: int, court_code: str, bench: str) -> str:
+    return f"{get_bench_partition_key('data', 'tar', year, court_code, bench)}data.index.json"
