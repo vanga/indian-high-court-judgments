@@ -366,6 +366,6 @@ class MetadataProcessor:
 
 if __name__ == "__main__":
     processor = MetadataProcessor(
-        src, batch_size=1000, output_dir="processed_data")
+        src, batch_size=1000, output_path="processed_data/metadata.parquet")
 
     processor.process_parallel(max_workers=32)

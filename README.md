@@ -15,8 +15,7 @@ This script automates the downloading of court judgments from the Indian eCourts
 - Specify date ranges for downloading or continue from last downloaded date
 - Process date ranges in parallel for faster downloading
 - Automatic CAPTCHA solving using OCR
-- Robust error handling and session management
-- Tracking of download progress
+- compresses PDFs using Ghostscript (on an average, we get about 50% compression)
 
 ## Installation
 
@@ -129,9 +128,9 @@ The following table lists the court codes used in the system:
 
 5. **Date Range Processing**: The script processes judgments for the specified date range, with support for parallel processing across multiple courts.
 
-## Output Structure
+## File Structure
 
-Downloaded judgments are stored in the `./data` directory, organized by their original path structure from the eCourts website. For each judgment, the script saves:
+Downloaded judgments are stored in the `./data` directory locally, organized by their original path structure from the eCourts website. For each judgment, the script saves:
 
 - The PDF file
 - A JSON metadata file containing details about the judgment
