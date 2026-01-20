@@ -6,7 +6,7 @@ This module consolidates common functions that were duplicated across multiple f
 
 import gzip
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
 
@@ -39,16 +39,15 @@ def format_size(size_bytes: int) -> str:
 
 def utc_now_iso() -> str:
     """
-    Get current UTC time in ISO format.
+    Get current ISO time in ISO format.
 
     Returns:
-        ISO format datetime string with Z suffix (e.g., "2025-01-27T10:30:45Z")
+        ISO format datetime string (e.g., "2025-01-27T10:30:45.163482")
     """
     return (
-        datetime.now(timezone.utc)
+        (datetime.now(timezone.utc)+ timedelta(hours=5, minutes=30))
         .replace(tzinfo=timezone.utc)
         .isoformat()
-        .replace("+00:00", "Z")
     )
 
 
@@ -94,9 +93,9 @@ def extract_gzipped_tar(gzipped_tar_path: Path, output_tar_path: Path) -> bool:
 
 
 def generate_part_name(now_iso: str) -> str:
-    # Use compact timestamp: YYYYMMDDThhmmssZ
-    ts = datetime.fromisoformat(now_iso.replace("Z", "+00:00")).strftime(
-        "%Y%m%dT%H%M%SZ"
+    # Use compact timestamp: YYYYMMDDThhmmss
+    ts = datetime.fromisoformat(now_iso).strftime(
+        "%Y%m%dT%H%M%S"
     )
     return f"part-{ts}"
 
