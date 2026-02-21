@@ -369,7 +369,8 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
     for f in files:
         try:
             size = Path(f).stat().st_size
-        except OSError:
+        except OSError as e:
+            print(f"Warning: Failed to get size for file {f}: {e}. Treating size as 0.")
             size = 0
         files_with_size.append((f, size))
 
@@ -406,7 +407,15 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
             parts_uploaded += 1
         finally:
             Path(temp_path).unlink(missing_ok=True)
-
+    for file_path, file_size in files_with_size:
+        # Guard against a single file being larger than the maximum allowed tar size.
+        # In this case we cannot create a valid part that respects MAX_TAR_SIZE_BYTES,
+        # so fail fast and let the caller decide how to handle it.
+        if file_size > MAX_TAR_SIZE_BYTES:
+            raise ValueError(
+                f"File {file_path} (size={format_size(file_size)}) exceeds the maximum "
+                f"tar part size of {format_size(MAX_TAR_SIZE_BYTES)}"
+            )
     for file_path, file_size in files_with_size:
         # If adding this file would exceed the limit AND we already have files,
         # flush the current part first

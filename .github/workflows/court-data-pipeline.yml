@@ -54,7 +54,7 @@ jobs:
           INPUT_START_DATE: ${{ github.event.inputs.start_date }}
           INPUT_END_DATE: ${{ github.event.inputs.end_date }}
         run: |
-          ARGS="--s3_sync --max_workers 4"
+          ARGS="--sync-s3 --max_workers 4"
           if [ -n "$INPUT_COURT_CODE" ]; then
             ARGS="$ARGS --court_code $INPUT_COURT_CODE"
           fi
