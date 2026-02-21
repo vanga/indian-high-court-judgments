@@ -17,10 +17,9 @@ import tarfile
 import tempfile
 
 INPUT_DIR = Path("/home/ubuntu/data")
-OUTPUT_DIR = Path("/home/ubuntu/data/data/tar-compressed")
+OUTPUT_DIR = Path("./data/tar-compressed")
 ERROR_LOG = OUTPUT_DIR / "error_log.txt"
-HIGH_COURTS_CSV = Path(
-    "/home/ubuntu/indian-high-court-judgments/opendata/docs/high_courts.csv")
+HIGH_COURTS_CSV = Path("./opendata/docs/high_courts.csv")
 
 
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -72,8 +71,7 @@ def compress_pdf(input_path, output_path, compression_level="screen"):
         if os.path.exists(output_path):
             input_size = get_file_size_kb(input_path)
             output_size = get_file_size_kb(output_path)
-            reduction = (1 - output_size / input_size) * \
-                100 if input_size > 0 else 0
+            reduction = (1 - output_size / input_size) * 100 if input_size > 0 else 0
             if reduction <= 0:
                 os.remove(output_path)
                 shutil.copy(input_path, output_path)
@@ -104,14 +102,16 @@ def log_error(pdf_file):
 def load_court_data():
     """Load court and bench data from high_courts.csv"""
     courts_data = []
-    with open(HIGH_COURTS_CSV, 'r') as file:
+    with open(HIGH_COURTS_CSV, "r") as file:
         reader = csv.DictReader(file)
         for row in reader:
-            courts_data.append({
-                'court_name': row['court_name'],
-                'court_code': row['court_code'],
-                'bench_name': row['bench_name']
-            })
+            courts_data.append(
+                {
+                    "court_name": row["court_name"],
+                    "court_code": row["court_code"],
+                    "bench_name": row["bench_name"],
+                }
+            )
     return courts_data
 
 
@@ -129,27 +129,35 @@ def generate_processing_combinations():
     combinations = []
     for year in years:
         for court in courts_data:
-            combinations.append({
-                'year': year,
-                'court_name': court['court_name'],
-                'court_code': court['court_code'],
-                'bench_name': court['bench_name']
-            })
+            combinations.append(
+                {
+                    "year": year,
+                    "court_name": court["court_name"],
+                    "court_code": court["court_code"],
+                    "bench_name": court["bench_name"],
+                }
+            )
 
     return combinations
 
 
 def compress_pdf_wrapper(combination):
     """Wrapper function for compress_pdf to use with concurrent.futures."""
-    year = combination['year']
-    court_name = combination['court_name']
-    court_code = combination['court_code']
-    bench_name = combination['bench_name']
+    year = combination["year"]
+    court_name = combination["court_name"]
+    court_code = combination["court_code"]
+    bench_name = combination["bench_name"]
 
     # Construct the expected directory path based on S3 partitioning structure
     # Structure: INPUT_DIR/data/tar/year=YYYY/court=XX_X/bench=name/
-    data_tar_dir = INPUT_DIR / "data" / "tar" / \
-        f"year={year}" / f"court={court_code}" / f"bench={bench_name}"
+    data_tar_dir = (
+        INPUT_DIR
+        / "data"
+        / "tar"
+        / f"year={year}"
+        / f"court={court_code}"
+        / f"bench={bench_name}"
+    )
 
     if not data_tar_dir.exists():
         return  # Skip if directory doesn't exist
@@ -159,15 +167,15 @@ def compress_pdf_wrapper(combination):
     if not tar_files:
         return  # Skip if no TAR files found
 
-    print(
-        f"Processing {len(tar_files)} TAR files for {year}/{court_code}/{bench_name}")
+    print(f"Processing {len(tar_files)} TAR files for {year}/{court_code}/{bench_name}")
 
     for tar_file in tar_files:
         try:
-            process_tar_file(tar_file, year, court_name,
-                             court_code, bench_name)
+            process_tar_file(tar_file, year, court_name, court_code, bench_name)
         except Exception as e:
-            error_message = f"Error processing TAR {tar_file}: {str(e)}\n{traceback.format_exc()}"
+            error_message = (
+                f"Error processing TAR {tar_file}: {str(e)}\n{traceback.format_exc()}"
+            )
             log_error(tar_file)
             print(f"Error processing TAR {tar_file}: {e}")
 
@@ -188,11 +196,10 @@ def process_tar_file(tar_file_path, year, court_name, court_code, bench_name):
         print(f"  Original TAR size: {original_tar_size:,} bytes")
 
         # Detect if original TAR is compressed
-        is_compressed = tar_file_path.name.endswith('.gz')
-        print(
-            f"  TAR compression: {'gzip' if is_compressed else 'uncompressed'}")
+        is_compressed = tar_file_path.name.endswith(".gz")
+        print(f"  TAR compression: {'gzip' if is_compressed else 'uncompressed'}")
 
-        with tarfile.open(tar_file_path, 'r') as tar:
+        with tarfile.open(tar_file_path, "r") as tar:
             tar.extractall(extract_dir)
             original_members = len(tar.getmembers())
             print(f"  Original TAR contains: {original_members} files")
@@ -211,8 +218,7 @@ def process_tar_file(tar_file_path, year, court_name, court_code, bench_name):
                 total_original_size += original_size
 
                 # Create temporary file for compressed version
-                compressed_file = pdf_file.parent / \
-                    f"{pdf_file.stem}_compressed.pdf"
+                compressed_file = pdf_file.parent / f"{pdf_file.stem}_compressed.pdf"
 
                 # Compress the PDF
                 success, message = compress_pdf(pdf_file, compressed_file)
@@ -229,20 +235,19 @@ def process_tar_file(tar_file_path, year, court_name, court_code, bench_name):
                         compressed_count += 1
                         total_compressed_size += compressed_size
                         print(
-                            f"    ✓ Compressed {pdf_file.name}: {original_size} → {compressed_size} bytes")
+                            f"    ✓ Compressed {pdf_file.name}: {original_size} → {compressed_size} bytes"
+                        )
                     else:
                         # Keep original, remove compressed version
                         compressed_file.unlink()
                         total_compressed_size += original_size
-                        print(
-                            f"    - Skipped {pdf_file.name}: no size reduction")
+                        print(f"    - Skipped {pdf_file.name}: no size reduction")
                 else:
                     # Compression failed, keep original
                     if compressed_file.exists():
                         compressed_file.unlink()
                     total_compressed_size += original_size
-                    print(
-                        f"    ✗ Failed to compress {pdf_file.name}: {message}")
+                    print(f"    ✗ Failed to compress {pdf_file.name}: {message}")
 
             except Exception as e:
                 print(f"    ✗ Error processing {pdf_file.name}: {e}")
@@ -250,18 +255,18 @@ def process_tar_file(tar_file_path, year, court_name, court_code, bench_name):
 
         # Recreate TAR file with updated PDFs
         if compressed_count > 0:
-            print(
-                f"  Recreating TAR with {compressed_count} compressed PDFs...")
+            print(f"  Recreating TAR with {compressed_count} compressed PDFs...")
             create_updated_tar(extract_dir, tar_file_path, is_compressed)
 
             # Calculate savings
             savings = total_original_size - total_compressed_size
-            savings_percent = (savings / total_original_size *
-                               100) if total_original_size > 0 else 0
+            savings_percent = (
+                (savings / total_original_size * 100) if total_original_size > 0 else 0
+            )
             print(
-                f"  ✓ TAR updated: {compressed_count}/{len(pdf_files)} PDFs compressed")
-            print(
-                f"  ✓ Size reduction: {savings:,} bytes ({savings_percent:.1f}%)")
+                f"  ✓ TAR updated: {compressed_count}/{len(pdf_files)} PDFs compressed"
+            )
+            print(f"  ✓ Size reduction: {savings:,} bytes ({savings_percent:.1f}%)")
         else:
             print(f"  No PDFs were compressed, keeping original TAR")
 
@@ -269,16 +274,16 @@ def process_tar_file(tar_file_path, year, court_name, court_code, bench_name):
 def create_updated_tar(extract_dir, original_tar_path, is_compressed=False):
     """Create a new TAR file with the updated PDFs."""
     # Create backup of original
-    backup_path = original_tar_path.with_suffix('.tar.backup')
+    backup_path = original_tar_path.with_suffix(".tar.backup")
     shutil.copy2(original_tar_path, backup_path)
 
     # Determine TAR mode based on original compression
-    tar_mode = 'w:gz' if is_compressed else 'w'
+    tar_mode = "w:gz" if is_compressed else "w"
 
     # Create new TAR file with same compression as original
     with tarfile.open(original_tar_path, tar_mode) as tar:
         added_files = 0
-        for file_path in extract_dir.rglob('*'):
+        for file_path in extract_dir.rglob("*"):
             if file_path.is_file():
                 # Add file to TAR with relative path
                 arcname = file_path.relative_to(extract_dir)
@@ -296,11 +301,11 @@ def create_updated_tar(extract_dir, original_tar_path, is_compressed=False):
     print(f"    ✓ TAR file updated: {backup_size} → {new_size} bytes")
 
     if new_size < backup_size:
-        print(
-            f"    ✓ TAR file size reduced by {backup_size - new_size:,} bytes")
+        print(f"    ✓ TAR file size reduced by {backup_size - new_size:,} bytes")
     elif new_size > backup_size:
         print(
-            f"    ℹ️  TAR file size increased by {new_size - backup_size:,} bytes (but PDFs inside are compressed)")
+            f"    ℹ️  TAR file size increased by {new_size - backup_size:,} bytes (but PDFs inside are compressed)"
+        )
 
 
 def batch_compress_pdfs(
@@ -327,21 +332,26 @@ def batch_compress_pdfs(
     print(f"Years: 2025-{datetime.now().year}")
     print(f"Courts and benches loaded from: {HIGH_COURTS_CSV}")
     print(
-        f"Input directory structure: {INPUT_DIR}/data/tar/year=YYYY/court=XX_X/bench=name/")
-    print(f"Processing TAR files containing PDFs - will compress PDFs and update TAR files in-place")
+        f"Input directory structure: {INPUT_DIR}/data/tar/year=YYYY/court=XX_X/bench=name/"
+    )
+    print(
+        f"Processing TAR files containing PDFs - will compress PDFs and update TAR files in-place"
+    )
     print(f"Only PDFs that compress to smaller size will be replaced")
 
     # Process files in parallel
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit all compression tasks
-        futures = [executor.submit(compress_pdf_wrapper, combination)
-                   for combination in combinations]
+        futures = [
+            executor.submit(compress_pdf_wrapper, combination)
+            for combination in combinations
+        ]
 
         # Process results as they complete
         for future in tqdm(
             concurrent.futures.as_completed(futures),
             desc="Compressing PDFs",
-            total=len(futures)
+            total=len(futures),
         ):
             try:
                 future.result()
@@ -351,8 +361,7 @@ def batch_compress_pdfs(
 
 def main():
     # Parse command line arguments
-    parser = argparse.ArgumentParser(
-        description="Compress PDF files using Ghostscript")
+    parser = argparse.ArgumentParser(description="Compress PDF files using Ghostscript")
     parser.add_argument(
         "-o",
         "--output",

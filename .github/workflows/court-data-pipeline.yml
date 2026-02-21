@@ -1,11 +1,23 @@
 name: Court Data Pipeline
 
 on:
-  # schedule:
-  #   # Run at 2:00 AM UTC every day
-  #   - cron: "0 2 * * *"
+  schedule:
+    # Run at 2:00 AM UTC every day
+    - cron: "0 2 * * *"
   workflow_dispatch:
-    # Allow manual triggering
+    inputs:
+      court_code:
+        description: "Court code to process (e.g. 33_10). Leave empty for all courts."
+        required: false
+        default: ""
+      start_date:
+        description: "Start date (YYYY-MM-DD). Leave empty to auto-detect from S3."
+        required: false
+        default: ""
+      end_date:
+        description: "End date (YYYY-MM-DD). Leave empty for today."
+        required: false
+        default: ""
 
 jobs:
   run-data-pipeline:
@@ -37,4 +49,20 @@ jobs:
           mkdir -p ./data
 
       - name: Run court data pipeline
-        run: python download.py --sync-s3 --max_workers 4
+        env:
+          INPUT_COURT_CODE: ${{ github.event.inputs.court_code }}
+          INPUT_START_DATE: ${{ github.event.inputs.start_date }}
+          INPUT_END_DATE: ${{ github.event.inputs.end_date }}
+        run: |
+          ARGS="--sync-s3 --max_workers 4"
+          if [ -n "$INPUT_COURT_CODE" ]; then
+            ARGS="$ARGS --court_code $INPUT_COURT_CODE"
+          fi
+          if [ -n "$INPUT_START_DATE" ]; then
+            ARGS="$ARGS --start_date $INPUT_START_DATE"
+          fi
+          if [ -n "$INPUT_END_DATE" ]; then
+            ARGS="$ARGS --end_date $INPUT_END_DATE"
+          fi
+          echo "Running: python download.py $ARGS"
+          python download.py $ARGS
