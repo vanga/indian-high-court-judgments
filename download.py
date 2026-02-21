@@ -275,13 +275,53 @@ def run(court_codes=None, start_date=None, end_date=None, day_step=1, max_worker
     if isinstance(court_codes, str):
         court_codes = [court_codes]
 
-    if start_date is None or end_date is None:
-        print("ERROR: Both start_date and end_date are required")
-        print("Usage: python download.py --start_date 2024-01-01 --end_date 2024-01-31")
+    # Auto-detect end_date if not provided
+    if end_date is None:
+        end_date = datetime.now().strftime("%Y-%m-%d")
+        print(f"Auto-detected end_date: {end_date} (today)")
+
+    # Auto-detect start_date from S3 index files if not provided
+    if start_date is None:
+        if not S3_ENABLED:
+            print("ERROR: start_date is required when S3 sync is disabled (no index files to read)")
+            print("Usage: python download.py --start_date 2024-01-01 --end_date 2024-01-31")
+            return
+        print("Auto-detecting start_date from S3 index files...")
+        court_dates = get_court_dates_from_index_files()
+        if court_dates:
+            # Find the earliest updated_at across all courts/benches
+            all_dates = []
+            for court, benches in court_dates.items():
+                for bench, updated_at in benches.items():
+                    try:
+                        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                        # Normalize to naive UTC for comparison
+                        if dt.tzinfo is not None:
+                            dt = dt.replace(tzinfo=None)
+                        all_dates.append(dt)
+                    except (ValueError, AttributeError):
+                        continue
+            if all_dates:
+                latest_date = max(all_dates)
+                # Start from the day after the latest indexed date
+                start_date = (latest_date + timedelta(days=1)).strftime("%Y-%m-%d")
+                print(f"Auto-detected start_date: {start_date} (day after latest S3 index: {latest_date.strftime('%Y-%m-%d')})")
+            else:
+                print("ERROR: Could not parse any dates from S3 index files")
+                print("Provide --start_date explicitly")
+                return
+        else:
+            print("ERROR: No S3 index files found. Cannot auto-detect start_date.")
+            print("Provide --start_date explicitly for first run")
+            return
+
+    # Check if date range is valid
+    if start_date > end_date:
+        print(f"INFO: start_date ({start_date}) is after end_date ({end_date}). All data is up to date.")
         return
 
     print(
-        f"Downloading for specified date range: {start_date} to {end_date or start_date}"
+        f"Downloading for date range: {start_date} to {end_date}"
     )
 
     # Determine which courts to process

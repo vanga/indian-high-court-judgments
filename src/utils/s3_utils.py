@@ -46,7 +46,10 @@ from src.utils.file_utils import group_files_by_year_and_bench, cleanup_uploaded
 from tqdm import tqdm
 
 S3_READ_BUCKET = "indian-high-court-judgments"
-S3_WRITE_BUCKET = "indian-high-court-judgments"
+S3_WRITE_BUCKET = "indian-high-court-judgments-test"
+
+# Maximum tar file size before splitting into a new part (1 GB)
+MAX_TAR_SIZE_BYTES = 1 * 1024 * 1024 * 1024
 
 
 def extract_court_bench_from_path(key):
@@ -103,38 +106,53 @@ def _load_index_v2(
 
 def get_court_dates_from_index_files(year=None):
     """
-    Get updated_at dates from data index files
+    Get updated_at dates from data index files.
 
     Args:
-        year: Year to check (defaults to current year)
+        year: Year to check. If None, checks current year first then falls
+              back to previous years until data is found.
 
     Returns:
         Dict of {court_code: {bench_name: updated_at_timestamp}}
     """
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
-    year = year or datetime.now().year
-    prefix = f"data/tar/year={year}/"
-
-    print(f"Reading dates from data index files: {S3_READ_BUCKET}/{prefix}")
+    if year is not None:
+        years_to_check = [year]
+    else:
+        # Check current year first, then fall back up to 3 years
+        current_year = datetime.now().year
+        years_to_check = [current_year, current_year - 1, current_year - 2]
 
     result = {}
-    paginator = s3.get_paginator("list_objects_v2")
-    for page in paginator.paginate(Bucket=S3_READ_BUCKET, Prefix=prefix):
-        for obj in page.get("Contents", []):
-            key = obj["Key"]
-            if not key.endswith("data.index.json"):
-                continue
+    for yr in years_to_check:
+        prefix = f"data/tar/year={yr}/"
+        print(f"Reading dates from data index files: {S3_READ_BUCKET}/{prefix}")
 
-            court_code, bench = extract_court_bench_from_path(key)
-            if not court_code or not bench:
-                continue
+        paginator = s3.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_READ_BUCKET, Prefix=prefix):
+            for obj in page.get("Contents", []):
+                key = obj["Key"]
+                if not key.endswith("data.index.json"):
+                    continue
 
-            updated_at = read_updated_at_from_index(s3, S3_READ_BUCKET, key)
-            if updated_at:
-                if court_code not in result:
-                    result[court_code] = {}
-                result[court_code][bench] = updated_at
+                court_code, bench = extract_court_bench_from_path(key)
+                if not court_code or not bench:
+                    continue
+
+                updated_at = read_updated_at_from_index(s3, S3_READ_BUCKET, key)
+                if updated_at:
+                    if court_code not in result:
+                        result[court_code] = {}
+                    # Keep the latest date per bench across years
+                    existing = result[court_code].get(bench)
+                    if existing is None or updated_at > existing:
+                        result[court_code][bench] = updated_at
+
+        if result:
+            print(f"Found dates for {len(result)} courts (from year={yr})")
+            return result
+        print(f"No index files found for year={yr}, checking previous year...")
 
     print(f"Found dates for {len(result)} courts")
     return result
@@ -335,26 +353,79 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
 
 
 def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench: str, files: List[Path]) -> bool:
+    """Create tar file(s) from files and upload to S3, splitting when size limit is exceeded.
+
+    When the cumulative size of source files exceeds MAX_TAR_SIZE_BYTES, the current
+    tar is closed/uploaded and a new part is started. Each part gets its own index entry.
+    """
     parts_prefix = get_bench_partition_key(
         data_type, 'tar', year, court_code, bench)
-    part_name = generate_part_name(utc_now_iso())
     suffix = ".tar.gz" if data_type == "metadata" else ".tar"
     tar_mode = "w:gz" if data_type == "metadata" else "w"
-    part_file_name = part_name + suffix
-    part_key = parts_prefix + part_file_name
     content_type = "application/x-tar.gz" if data_type == "metadata" else "application/x-tar"
 
-    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_tar:
-        with tarfile.open(temp_tar.name, tar_mode) as tar:
-            for file in tqdm(files, desc="Adding files to tar file"):
-                tar.add(file, arcname=Path(file).name)
+    # Sort files by size for more predictable splitting
+    files_with_size = []
+    for f in files:
+        try:
+            size = Path(f).stat().st_size
+        except OSError:
+            size = 0
+        files_with_size.append((f, size))
 
-        success = upload_large_file_to_s3(temp_tar.name,
-                                          S3_WRITE_BUCKET, part_key, content_type)
-        tar_size = Path(temp_tar.name).stat().st_size
-        update_index_file(data_type, year, court_code, bench,
-                          files, part_file_name, tar_size)
-        return True
+    # Track current part
+    current_part_files = []
+    current_cumulative_size = 0
+    parts_uploaded = 0
+
+    def _flush_part(part_files):
+        """Close, upload, and index the current tar part."""
+        nonlocal parts_uploaded
+        part_name = generate_part_name(utc_now_iso())
+        # Append a sequence suffix if we've already uploaded a part in this run
+        # to avoid timestamp collisions within the same second
+        if parts_uploaded > 0:
+            part_file_name = f"{part_name}-{parts_uploaded}{suffix}"
+        else:
+            part_file_name = f"{part_name}{suffix}"
+        part_key = parts_prefix + part_file_name
+
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_tar:
+            temp_path = temp_tar.name
+
+        try:
+            with tarfile.open(temp_path, tar_mode) as tar:
+                for pf in tqdm(part_files, desc=f"Adding files to tar part {parts_uploaded + 1}"):
+                    tar.add(pf, arcname=Path(pf).name)
+
+            tar_size = Path(temp_path).stat().st_size
+            print(f"  Uploading tar part {part_file_name} ({format_size(tar_size)}, {len(part_files)} files)")
+            upload_large_file_to_s3(temp_path, S3_WRITE_BUCKET, part_key, content_type)
+            update_index_file(data_type, year, court_code, bench,
+                              part_files, part_file_name, tar_size)
+            parts_uploaded += 1
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+
+    for file_path, file_size in files_with_size:
+        # If adding this file would exceed the limit AND we already have files,
+        # flush the current part first
+        if current_part_files and (current_cumulative_size + file_size) > MAX_TAR_SIZE_BYTES:
+            _flush_part(current_part_files)
+            current_part_files = []
+            current_cumulative_size = 0
+
+        current_part_files.append(file_path)
+        current_cumulative_size += file_size
+
+    # Flush remaining files
+    if current_part_files:
+        _flush_part(current_part_files)
+
+    if parts_uploaded > 1:
+        print(f"  Split into {parts_uploaded} tar parts due to size limit ({format_size(MAX_TAR_SIZE_BYTES)})")
+
+    return True
 
 
 def create_and_upload_parquet_files(
