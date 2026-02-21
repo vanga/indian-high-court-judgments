@@ -46,7 +46,7 @@ from src.utils.file_utils import group_files_by_year_and_bench, cleanup_uploaded
 from tqdm import tqdm
 
 S3_READ_BUCKET = "indian-high-court-judgments"
-S3_WRITE_BUCKET = "indian-high-court-judgments-test"
+S3_WRITE_BUCKET = "indian-high-court-judgments"
 
 # Maximum tar file size before splitting into a new part (1 GB)
 MAX_TAR_SIZE_BYTES = 1 * 1024 * 1024 * 1024
