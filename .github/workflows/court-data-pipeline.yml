@@ -18,30 +18,34 @@ on:
         description: "End date (YYYY-MM-DD). Leave empty for today."
         required: false
         default: ""
+env:
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
 
 jobs:
   run-data-pipeline:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      id-token: write
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v3
 
-      - name: Set up Python 3.10
+      - name: Set up Python 3.13
         uses: actions/setup-python@v4
         with:
-          python-version: "3.10"
+          python-version: "3.13"
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Configure AWS credentials
-        uses: aws-actions/configure-aws-credentials@v2
+      - name: Authenticate with AWS using OIDC
+        uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          role-to-assume: arn:aws:iam::${{ env.AWS_ACCOUNT_ID }}:role/github-actions
           aws-region: ap-south-1
 
       - name: Ensure directories exist
@@ -54,7 +58,7 @@ jobs:
           INPUT_START_DATE: ${{ github.event.inputs.start_date }}
           INPUT_END_DATE: ${{ github.event.inputs.end_date }}
         run: |
-          ARGS="--sync-s3 --max_workers 4"
+          ARGS="--s3_sync --max_workers 4"
           if [ -n "$INPUT_COURT_CODE" ]; then
             ARGS="$ARGS --court_code $INPUT_COURT_CODE"
           fi
