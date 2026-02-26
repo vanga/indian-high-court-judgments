@@ -3,7 +3,7 @@ name: Court Data Pipeline
 on:
   schedule:
     # Run at 2:00 AM UTC every day
-    - cron: "0 2 * * *"
+    # - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       court_code:
