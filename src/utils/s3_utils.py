@@ -322,12 +322,16 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
     index_data = _load_index_v2(
         S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
-    current_files = []
+    current_files = set()
     for part in index_data.parts:
-        current_files.extend(part.files)
+        current_files.update(part.files)
     new_files = [Path(p).name for p in files]
-    # assert new_files are not in current_files
-    assert set(new_files) & set(current_files) == set()
+    # Check for duplicates and filter them out instead of failing
+    duplicates = set(new_files) & current_files
+    if duplicates:
+        new_files = [f for f in new_files if f not in duplicates]
+        if not new_files:
+            return True
     size_human = format_size(tar_file_size)
     new_part = IndexPart(
         name=tar_file_name,
