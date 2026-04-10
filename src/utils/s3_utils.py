@@ -153,10 +153,10 @@ def get_court_dates_from_index_files(year=None):
 
         if result:
             print(f"Found dates for {len(result)} courts (from year={yr})")
-            return result
-        print(f"No index files found for year={yr}, checking previous year...")
+            # Don't return early — keep checking older years to pick up courts
+            # whose most recent data lives in a prior year partition.
 
-    print(f"Found dates for {len(result)} courts")
+    print(f"Found dates for {len(result)} courts (across {years_to_check})")
     return result
 
 
