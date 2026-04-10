@@ -1,8 +1,10 @@
 """S3 utility functions for uploading, downloading, and managing index files."""
 
+import os
 import shutil
 import tarfile
 import tempfile
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
@@ -45,8 +47,8 @@ except ImportError as e:
 from src.utils.file_utils import group_files_by_year_and_bench, cleanup_uploaded_files
 from tqdm import tqdm
 
-S3_READ_BUCKET = "indian-high-court-judgments"
-S3_WRITE_BUCKET = "indian-high-court-judgments"
+S3_READ_BUCKET = os.environ.get("S3_READ_BUCKET", "indian-high-court-judgments")
+S3_WRITE_BUCKET = os.environ.get("S3_WRITE_BUCKET", "indian-high-court-judgments")
 
 # Maximum tar file size before splitting into a new part (1 GB)
 MAX_TAR_SIZE_BYTES = 1 * 1024 * 1024 * 1024
@@ -233,71 +235,77 @@ def upload_large_file_to_s3(
     content_type: str = "application/octet-stream",
     multipart_threshold: int = 5 * 1024 * 1024 * 1024,  # 5GB
     multipart_chunksize: int = 100 * 1024 * 1024,  # 100MB
+    max_retries: int = 3,
 ) -> bool:
     file_path_obj = Path(file_path)
     file_size = file_path_obj.stat().st_size
     print(f"  File size: {format_size(file_size)}")
 
-    try:
-        # Configure transfer settings
-        transfer_config = TransferConfig(
-            multipart_threshold=multipart_threshold,
-            multipart_chunksize=multipart_chunksize,
-            use_threads=True,  # Enable parallel uploads for better performance
-            max_concurrency=10,  # Number of threads to use
-        )
+    transfer_config = TransferConfig(
+        multipart_threshold=multipart_threshold,
+        multipart_chunksize=multipart_chunksize,
+        use_threads=True,
+        max_concurrency=10,
+    )
 
-        # Use boto3's high-level upload_file method
-        s3_client.upload_file(
-            file_path,
-            bucket,
-            key,
-            ExtraArgs={"ContentType": content_type},
-            Config=transfer_config,
-        )
-
-        print("  Upload successful")
-        return True
-
-    except Exception as e:
-        print(f"  Upload failed: {e}")
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            s3_client.upload_file(
+                file_path,
+                bucket,
+                key,
+                ExtraArgs={"ContentType": content_type},
+                Config=transfer_config,
+            )
+            print("  Upload successful")
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                print(f"  Upload attempt {attempt}/{max_retries} failed: {e}. Retrying in {wait}s...")
+                time.sleep(wait)
+            else:
+                print(f"  Upload failed after {max_retries} attempts: {e}")
+                return False
 
 
 def upload_single_file_to_s3(
     data_type: str,
     year: int, court_code: str, bench: str, local_file_path: str | Path,
+    max_retries: int = 3,
 ) -> bool:
     """Upload a single file to S3 (without print statements for use with progress bar)"""
-    try:
-        # Convert to Path object for consistent handling
-        file_path_obj = Path(local_file_path)
-        filename = file_path_obj.name
+    file_path_obj = Path(local_file_path)
+    filename = file_path_obj.name
 
-        if data_type == "metadata":
-            s3_key = (
-                f"metadata/json/year={year}/court={court_code}/bench={bench}/{filename}"
-            )
-        else:
-            s3_key = f"data/pdf/year={year}/court={court_code}/bench={bench}/{filename}"
+    if data_type == "metadata":
+        s3_key = (
+            f"metadata/json/year={year}/court={court_code}/bench={bench}/{filename}"
+        )
+    else:
+        s3_key = f"data/pdf/year={year}/court={court_code}/bench={bench}/{filename}"
 
-        # Upload the file
-        with open(file_path_obj, "rb") as f:
-            s3_client.put_object(
-                Bucket=S3_WRITE_BUCKET,
-                Key=s3_key,
-                Body=f,
-                ContentType="application/json"
-                if filename.endswith(".json")
-                else "application/pdf",
-            )
-
-        return True
-
-    except Exception as e:
-        print(
-            f"Failed to upload {local_file_path}, remote path: {s3_key}: {e}")
-        return False
+    for attempt in range(1, max_retries + 1):
+        try:
+            with open(file_path_obj, "rb") as f:
+                s3_client.put_object(
+                    Bucket=S3_WRITE_BUCKET,
+                    Key=s3_key,
+                    Body=f,
+                    ContentType="application/json"
+                    if filename.endswith(".json")
+                    else "application/pdf",
+                )
+            return True
+        except Exception as e:
+            if attempt < max_retries:
+                wait = 2 ** attempt
+                time.sleep(wait)
+            else:
+                print(
+                    f"Failed to upload {local_file_path}, remote path: {s3_key} "
+                    f"after {max_retries} attempts: {e}")
+                return False
 
 
 def upload_files_to_s3_v2(data_type: str, year: int, court_code: str, bench: str, files: List[Path]) -> bool:
@@ -309,15 +317,32 @@ def upload_files_to_s3_v2(data_type: str, year: int, court_code: str, bench: str
         return True
 
     # upload individual files
+    failed_files = []
     for file in files:
-        upload_single_file_to_s3(data_type, year, court_code, bench, file)
+        ok = upload_single_file_to_s3(data_type, year, court_code, bench, file)
+        if not ok:
+            failed_files.append(file)
+
+    if failed_files:
+        print(
+            f"WARNING: {len(failed_files)} individual file upload(s) failed for "
+            f"{data_type}/{year}/{court_code}/{bench}. "
+            f"Tar archive will still be created for all files."
+        )
 
     create_and_upload_tar_file(data_type, year, court_code, bench, files)
 
-    return True
+    return len(failed_files) == 0
 
 
 def update_index_file(data_type: str, year: int, court_code: str, bench: str, files: List[Path], tar_file_name: str, tar_file_size: int) -> bool:
+    """Update the S3 index file with a new tar part.
+
+    WARNING: This performs a non-atomic read-modify-write on S3. If multiple
+    processes update the same index concurrently, one write can overwrite the
+    other, causing tar parts to be lost from the index. Do not run multiple
+    download.py instances for the same (court, bench, year) simultaneously.
+    """
     index_key = get_metadata_index_key(
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
     index_data = _load_index_v2(
@@ -326,8 +351,13 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
     for part in index_data.parts:
         current_files.extend(part.files)
     new_files = [Path(p).name for p in files]
-    # assert new_files are not in current_files
-    assert set(new_files) & set(current_files) == set()
+    duplicates = set(new_files) & set(current_files)
+    if duplicates:
+        raise ValueError(
+            f"Duplicate files detected in index for {data_type}/{year}/{court_code}/{bench}: "
+            f"{list(duplicates)[:10]}. This may indicate a concurrent write or a re-upload. "
+            f"Aborting to prevent index corruption."
+        )
     size_human = format_size(tar_file_size)
     new_part = IndexPart(
         name=tar_file_name,
@@ -401,7 +431,12 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
 
             tar_size = Path(temp_path).stat().st_size
             print(f"  Uploading tar part {part_file_name} ({format_size(tar_size)}, {len(part_files)} files)")
-            upload_large_file_to_s3(temp_path, S3_WRITE_BUCKET, part_key, content_type)
+            upload_ok = upload_large_file_to_s3(temp_path, S3_WRITE_BUCKET, part_key, content_type)
+            if not upload_ok:
+                raise RuntimeError(
+                    f"Failed to upload tar part {part_file_name} to S3. "
+                    f"Index will NOT be updated to avoid phantom entries."
+                )
             update_index_file(data_type, year, court_code, bench,
                               part_files, part_file_name, tar_size)
             parts_uploaded += 1

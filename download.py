@@ -155,7 +155,11 @@ OUTPUT_DIR = output_dir
 
 
 class S3FileListCacheStore:
-    # given a year, court code, bench and data type, return the list of files in S3, maintaining reusability of existing cache if needed. If the cache is not available, fetch the files from S3.
+    """Cache for S3 file listings, keyed by (year, court_code, bench, data_type).
+
+    Populated lazily on first access. Call invalidate() after uploading new files
+    so subsequent lookups reflect the new state.
+    """
     def __init__(self):
         self.cache = {}
 
@@ -168,6 +172,18 @@ class S3FileListCacheStore:
             files = get_existing_files_from_s3_v2(data_type, year, s3_court_code, bench)
             self.cache[key] = files
             return files
+
+    def invalidate(self, year: int, court_code: str, bench: str, data_type: str = None):
+        """Remove cached entries so the next get() fetches fresh data from S3.
+
+        If data_type is None, invalidates both metadata and data for the key.
+        """
+        s3_court_code = to_s3_format(court_code)
+        if data_type:
+            self.cache.pop((year, s3_court_code, bench, data_type), None)
+        else:
+            self.cache.pop((year, s3_court_code, bench, "metadata"), None)
+            self.cache.pop((year, s3_court_code, bench, "data"), None)
 
 
 cache_store = S3FileListCacheStore()
@@ -404,17 +420,28 @@ def _run_tasks(tasks, max_workers, compression_enabled=False):
 
 
 def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
-    """Group files by year"""
+    """Group files by year extracted from the decision date in the JSON metadata.
+
+    Files whose decision date cannot be parsed are logged and skipped.
+    Callers should be aware these files will NOT appear in any year bucket.
+    """
     files_by_year: Dict[int, List[Path]] = {}
+    skipped: List[Path] = []
     for file in files:
         json_file = file.with_suffix(".json")
         year = extract_decision_date_from_json(json_file)
         if year is None:
+            skipped.append(file)
             continue
-            # maybe they need to be handled instead of skipping?
         if year not in files_by_year:
             files_by_year[year] = []
         files_by_year[year].append(file)
+    if skipped:
+        logger.warning(
+            f"Skipped {len(skipped)} file(s) with unparseable decision dates "
+            f"(these will NOT be uploaded): {[str(f) for f in skipped[:10]]}"
+            + (f" ... and {len(skipped) - 10} more" if len(skipped) > 10 else "")
+        )
     return files_by_year
 
 
@@ -517,26 +544,29 @@ def _run_tasks_and_upload_to_s3(
 
             for year in json_files_by_year_partition.keys():
                 # get cached files from S3
-                existing_files = get_existing_files_from_s3_v2(
+                existing_files = set(get_existing_files_from_s3_v2(
                     "metadata", year, court_code_underscore, bench
-                )
+                ))
 
-                new_files = set(json_files_by_year_partition[year]) - set(
-                    existing_files
-                )
+                # Build a basename -> full path map so we can compare basenames
+                # (S3 index stores basenames, local files are full Paths)
+                local_json_map = {f.name: f for f in json_files_by_year_partition[year]}
+                new_basenames = set(local_json_map.keys()) - existing_files
+                new_files = {local_json_map[name] for name in new_basenames}
 
                 if year not in bench_files:
                     bench_files[year] = {"metadata": set(), "data": set()}
 
                 bench_files[year]["metadata"] = new_files
             for year in pdf_files_by_year_partition.keys():
-                existing_pdf_files = get_existing_files_from_s3_v2(
+                existing_pdf_files = set(get_existing_files_from_s3_v2(
                     "data", year, court_code_underscore, bench
-                )
+                ))
 
-                new_pdf_files = set(pdf_files_by_year_partition[year]) - set(
-                    existing_pdf_files
-                )
+                # Same basename comparison for PDFs
+                local_pdf_map = {f.name: f for f in pdf_files_by_year_partition[year]}
+                new_pdf_basenames = set(local_pdf_map.keys()) - existing_pdf_files
+                new_pdf_files = {local_pdf_map[name] for name in new_pdf_basenames}
 
                 logger.info(
                     f"New PDF files: {len(new_pdf_files)}, for year {year}, bench {bench}, court {court_code_underscore}"
@@ -556,11 +586,13 @@ def _run_tasks_and_upload_to_s3(
                         bench,
                         year_files["metadata"],
                     )
+                    cache_store.invalidate(year, court_code, bench, "metadata")
 
                 if year_files["data"]:
                     upload_files_to_s3_v2(
                         "data", year, court_code_underscore, bench, year_files["data"]
                     )
+                    cache_store.invalidate(year, court_code, bench, "data")
 
                 # upload parquet files
                 success = create_and_upload_parquet_files(
@@ -571,8 +603,26 @@ def _run_tasks_and_upload_to_s3(
                         f"Failed to upload parquet files for year {year}, bench {bench}, court {court_code_underscore}"
                     )
 
-            # clean up local files, remove the bench directory
-            shutil.rmtree(bench_path)
+            # Clean up only files that were successfully uploaded.
+            # Files with unparseable dates were never uploaded and should be preserved.
+            uploaded_files = []
+            for year_files in bench_files.values():
+                uploaded_files.extend(year_files.get("metadata", []))
+                uploaded_files.extend(year_files.get("data", []))
+            for f in uploaded_files:
+                try:
+                    Path(f).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            # Remove bench dir if no files remain (ignore empty subdirectories)
+            remaining_files = [p for p in bench_path.rglob("*") if p.is_file()] if bench_path.exists() else []
+            if bench_path.exists() and not remaining_files:
+                shutil.rmtree(bench_path)
+            elif remaining_files:
+                logger.warning(
+                    f"Preserved {len(remaining_files)} file(s) in {bench_path} "
+                    f"(unparseable dates or upload failures)"
+                )
 
     except Exception as e:
         print(f"Error during S3 upload: {e}")
@@ -683,17 +733,31 @@ class Downloader:
                 results_available = False
 
     def does_result_exist_in_s3(self, pdf_path: str | Path):
-        if isinstance(pdf_path, str):
-            pdf_path = Path(pdf_path)
-        start_year = datetime.strptime(self.task.from_date, "%Y-%m-%d").year
-        end_year = datetime.strptime(self.task.to_date, "%Y-%m-%d").year
-        # assuming the date range falls in two years at max
-        years = set([start_year, end_year])
-        bench = extract_bench_from_path(pdf_path)
+        pdf_path_obj = Path(pdf_path) if isinstance(pdf_path, str) else pdf_path
+        # get_pdf_output_path expects a string (calls .split("#"))
+        pdf_path_str = str(pdf_path) if not isinstance(pdf_path, str) else pdf_path
+
+        bench = extract_bench_from_path(pdf_path_obj)
         if not bench:
             return False
+
+        # If a local JSON already exists from a prior run, use its decision date
+        # for an exact year lookup instead of guessing from the task date range.
+        json_path = self.get_pdf_output_path(pdf_path_str).with_suffix(".json")
+        decision_year = None
+        if json_path.exists():
+            decision_year = extract_decision_date_from_json(str(json_path))
+
+        if decision_year is not None:
+            years = {decision_year}
+        else:
+            # Fallback: check both years the task date range spans
+            start_year = datetime.strptime(self.task.from_date, "%Y-%m-%d").year
+            end_year = datetime.strptime(self.task.to_date, "%Y-%m-%d").year
+            years = {start_year, end_year}
+
         for year in years:
-            if pdf_path.name in cache_store.get(year, self.court_code, bench, "data"):
+            if pdf_path_obj.name in cache_store.get(year, self.court_code, bench, "data"):
                 return True
         return False
 
@@ -944,7 +1008,8 @@ class Downloader:
         self.update_session_id(res)
         logger.debug("Refreshed token")
 
-    def request_api(self, method, url, payload, **kwargs):
+    def request_api(self, method, url, payload, _retry_count=0, **kwargs):
+        MAX_RETRIES = 3
         headers = self.get_headers()
         logger.debug(
             f"api_request {self.session_id} {payload.get('app_token') if payload else None} {url}"
@@ -977,17 +1042,23 @@ class Downloader:
             return self.solve_pdf_download_captcha(response_dict, payload)
 
         elif response_dict.get("session_expire") == "Y":
+            if _retry_count >= MAX_RETRIES:
+                logger.error(f"Giving up after {MAX_RETRIES} session_expire retries for {url}")
+                return response
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
-            return self.request_api(method, url, payload, **kwargs)
+            return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
 
         elif "errormsg" in response_dict:
+            if _retry_count >= MAX_RETRIES:
+                logger.error(f"Giving up after {MAX_RETRIES} errormsg retries for {url}: {response_dict.get('errormsg')}")
+                return response
             logger.error(f"Error {response_dict['errormsg']}")
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
-            return self.request_api(method, url, payload, **kwargs)
+            return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
 
         return response
 
