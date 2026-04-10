@@ -371,6 +371,19 @@ def run(
 
     print(f"Processing {len(target_courts)} court(s): {', '.join(target_courts)}")
 
+    # Single background uploader so scraping for court N+1 can start while
+    # court N's tar/parquet upload is still running. Queue depth is bounded
+    # to 1 (we wait on the previous future before submitting the next) so
+    # disk usage stays at "at most two courts on disk at once".
+    upload_executor = (
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="s3-upload"
+        )
+        if S3_ENABLED
+        else None
+    )
+    pending_upload: Optional[concurrent.futures.Future] = None
+
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
         # Resolve per-court start_date. Explicit --start_date on the CLI
@@ -405,16 +418,26 @@ def run(
 
         print(f"Generated {len(tasks)} tasks for court {court_code}")
 
-        # Run tasks with S3 upload if enabled
+        # Scrape this court in the foreground, then hand the upload off to
+        # the background worker so we can start the next court immediately.
+        _run_tasks(tasks, max_workers, compress_pdfs)
+
         if S3_ENABLED:
             end_date_obj = (
                 datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
             )
-            _run_tasks_and_upload_to_s3(
-                tasks, court_code, max_workers, end_date_obj, compress_pdfs
+            if pending_upload is not None:
+                # Wait for previous court's upload to finish before queueing
+                # the next one — bounds disk to ~2 courts at a time.
+                pending_upload.result()
+            pending_upload = upload_executor.submit(
+                _upload_court_to_s3, court_code, end_date_obj
             )
-        else:
-            _run_tasks(tasks, max_workers, compress_pdfs)
+
+    if pending_upload is not None:
+        pending_upload.result()
+    if upload_executor is not None:
+        upload_executor.shutdown(wait=True)
 
     logger.info("All download tasks completed")
 
@@ -461,29 +484,15 @@ def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
     return files_by_year
 
 
-def _run_tasks_and_upload_to_s3(
-    tasks, court_code, max_workers, end_date=None, compression_enabled=False
-):
+def _upload_court_to_s3(court_code, end_date):
     """
-    Run download tasks and upload results to S3
+    Scan local files for a court, diff against S3, and upload.
 
-    Args:
-        tasks: List of CourtDateTask objects
-        court_code: Court code being processed
-        max_workers: Number of parallel workers
-        end_date: End date of the download range (for index timestamp)
-        compression_enabled: Whether to compress PDFs during download
+    Designed to run on a background thread so the main loop can start
+    scraping the next court while this one uploads. If the process dies
+    mid-upload, local files are preserved (we only unlink after successful
+    upload), so the next run can resume by re-diffing.
     """
-    if not S3_ENABLED:
-        print("INFO: S3 disabled, will only download locally")
-        _run_tasks(tasks, max_workers, compression_enabled)
-        return
-
-    _run_tasks(tasks, max_workers, compression_enabled)
-
-    if end_date is None and tasks:
-        end_date = max(task.to_date for task in tasks)
-
     print(f"\nCollecting NEW files for {court_code}...")
     downloaded_files = {"metadata": [], "data": []}
 
