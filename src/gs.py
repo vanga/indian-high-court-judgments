@@ -48,24 +48,31 @@ def compress_pdf(input_path, output_path, compression_level="screen"):
                 f"Invalid compression level. Choose from: {', '.join(valid_levels)}",
             )
 
-        # Use full path to Ghostscript
-        gs_path = "/usr/bin/gs"  # Update this path if needed
-
-        # Construct Ghostscript command
-        gs_command = (
-            f"{gs_path} -sDEVICE=pdfwrite -dCompatibilityLevel=1.4 "
-            f"-dPDFSETTINGS=/{compression_level} -dNOPAUSE -dBATCH -dQUIET "
-            f"-sOutputFile='{output_path}' '{input_path}'"
-        )
-
-        # Execute command first
-        exit_code = os.system(gs_command)
-        if exit_code != 0:
-            error_msg = (
-                f"Ghostscript failed with exit code {exit_code}\nCommand: {gs_command}"
-            )
+        # Resolve Ghostscript via PATH (works on macOS/Homebrew, Linux, etc.)
+        gs_path = shutil.which("gs")
+        if not gs_path:
             log_error(input_path)
-            return False, f"Ghostscript failed with exit code {exit_code}"
+            return False, "Ghostscript not found on PATH"
+
+        # Execute via subprocess to avoid shell injection from filename characters
+        import subprocess
+        result = subprocess.run(
+            [
+                gs_path,
+                "-sDEVICE=pdfwrite",
+                "-dCompatibilityLevel=1.4",
+                f"-dPDFSETTINGS=/{compression_level}",
+                "-dNOPAUSE",
+                "-dBATCH",
+                "-dQUIET",
+                f"-sOutputFile={output_path}",
+                str(input_path),
+            ],
+            capture_output=True,
+        )
+        if result.returncode != 0:
+            log_error(input_path)
+            return False, f"Ghostscript failed with exit code {result.returncode}"
 
         # Now check file sizes after compression is done
         if os.path.exists(output_path):

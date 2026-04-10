@@ -98,6 +98,16 @@ class IndexFileV2(BaseModel):
     tar_size_human: str = Field(default="0 B", description="Human-readable total size")
     updated_at: str = Field(description="ISO datetime when index was last updated")
     parts: List[IndexPart] = Field(default_factory=list, description="List of parts")
+    scraped_through_date: Optional[str] = Field(
+        default=None,
+        description=(
+            "Highest scrape to_date (YYYY-MM-DD) that has been successfully "
+            "processed for this (bench, year). Written by the catch-up pipeline "
+            "after a bench's upload phase completes. Use this — NOT updated_at — "
+            "as the resume cursor, since updated_at only reflects when the "
+            "index was last written, not what data range it covers."
+        ),
+    )
 
 
 class JudgmentMetadata(BaseModel):

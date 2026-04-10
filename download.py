@@ -41,6 +41,7 @@ from src.utils.s3_utils import (
     get_court_dates_from_index_files,
     get_existing_files_from_s3_v2,
     upload_files_to_s3_v2,
+    write_scraped_through_date,
 )
 
 
@@ -305,7 +306,13 @@ def run(
         end_date = datetime.now().strftime("%Y-%m-%d")
         print(f"Auto-detected end_date: {end_date} (today)")
 
-    # Auto-detect start_date from S3 index files if not provided
+    # Default bootstrap date for brand-new courts with no S3 index entries
+    DEFAULT_BOOTSTRAP = "2008-01-01"
+
+    # Per-court auto-resume: each court starts from its own last-sync date.
+    # Populated only when start_date is not explicitly provided.
+    court_start_dates: Dict[str, str] = {}
+
     if start_date is None:
         if not S3_ENABLED:
             print(
@@ -315,45 +322,44 @@ def run(
                 "Usage: python download.py --start_date 2024-01-01 --end_date 2024-01-31"
             )
             return
-        print("Auto-detecting start_date from S3 index files...")
+        print("Auto-detecting per-court start_dates from S3 index files...")
         court_dates = get_court_dates_from_index_files()
-        if court_dates:
-            # Find the earliest updated_at across all courts/benches
-            all_dates = []
-            for court, benches in court_dates.items():
-                for bench, updated_at in benches.items():
-                    try:
-                        dt = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
-                        # Normalize to naive UTC for comparison
-                        if dt.tzinfo is not None:
-                            dt = dt.replace(tzinfo=None)
-                        all_dates.append(dt)
-                    except (ValueError, AttributeError):
-                        continue
-            if all_dates:
-                earliest_date = min(all_dates)
-                # Start from the day after the earliest indexed date
-                start_date = (earliest_date + timedelta(days=1)).strftime("%Y-%m-%d")
-                print(
-                    f"Auto-detected start_date: {start_date} (day after earliest S3 index: {earliest_date.strftime('%Y-%m-%d')})"
-                )
-            else:
-                print("ERROR: Could not parse any dates from S3 index files")
-                print("Provide --start_date explicitly")
-                return
-        else:
+        if not court_dates:
             print("ERROR: No S3 index files found. Cannot auto-detect start_date.")
             print("Provide --start_date explicitly for first run")
             return
 
-    # Check if date range is valid
-    if start_date > end_date:
-        print(
-            f"INFO: start_date ({start_date}) is after end_date ({end_date}). All data is up to date."
-        )
-        return
+        # For each court, take the MIN resume cursor across its benches and
+        # start from the day after. Resume cursors are YYYY-MM-DD strings
+        # returned by get_court_dates_from_index_files() — they come from the
+        # scraped_through_date field (new) or max filename date (legacy).
+        # One lagging bench still drags that court, but other courts are
+        # no longer affected.
+        for court, benches in court_dates.items():
+            bench_cursors = []
+            for _, cursor_str in benches.items():
+                try:
+                    dt = datetime.strptime(cursor_str, "%Y-%m-%d")
+                    bench_cursors.append(dt)
+                except (ValueError, TypeError):
+                    continue
+            if bench_cursors:
+                earliest = min(bench_cursors)
+                court_start_dates[court] = (earliest + timedelta(days=1)).strftime(
+                    "%Y-%m-%d"
+                )
 
-    print(f"Downloading for date range: {start_date} to {end_date}")
+        if not court_start_dates:
+            print("ERROR: Could not parse any dates from S3 index files")
+            print("Provide --start_date explicitly")
+            return
+
+        print(
+            f"Resolved per-court start_dates for {len(court_start_dates)} court(s). "
+            f"Courts not listed will fall back to {DEFAULT_BOOTSTRAP}."
+        )
+
+    print(f"Downloading through end_date: {end_date}")
 
     # Determine which courts to process
     if court_codes is None:
@@ -367,20 +373,30 @@ def run(
 
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
-        print(f"\nProcessing court {court_code}...")
+        # Resolve per-court start_date. Explicit --start_date on the CLI
+        # short-circuits the per-court logic; otherwise look up by the court's
+        # S3-format code and fall back to DEFAULT_BOOTSTRAP for brand-new courts.
+        if start_date is not None:
+            court_start = start_date
+        else:
+            court_start = court_start_dates.get(
+                to_s3_format(court_code), DEFAULT_BOOTSTRAP
+            )
 
-        # Load S3 cache for this court if S3 is enabled
-        if S3_ENABLED:
-            year_to_check = None
-            if start_date:
-                try:
-                    year_to_check = datetime.strptime(start_date, "%Y-%m-%d").year
-                except Exception:
-                    pass
+        if court_start > end_date:
+            print(
+                f"\nINFO: court {court_code} up to date "
+                f"(start {court_start} > end {end_date}). Skipping."
+            )
+            continue
+
+        print(
+            f"\nProcessing court {court_code} from {court_start} to {end_date}..."
+        )
 
         # Generate tasks for this specific court
         tasks = list[CourtDateTask](
-            generate_tasks([court_code], start_date, end_date, day_step)
+            generate_tasks([court_code], court_start, end_date, day_step)
         )
 
         if not tasks:
@@ -603,6 +619,27 @@ def _run_tasks_and_upload_to_s3(
                         f"Failed to upload parquet files for year {year}, bench {bench}, court {court_code_underscore}"
                     )
 
+            # Advance the resume cursor for every year partition we know about
+            # for this bench. We use the run's end_date (what we scraped
+            # THROUGH) rather than max decision date, because the scrape
+            # operates on decision-date ranges and end_date is the actual
+            # boundary. Write to the data index so auto-detect sees it.
+            if end_date is not None:
+                scraped_through_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)
+                # Write to all year partitions this bench has touched, plus
+                # the end_date's year (in case the bench has no files for it yet)
+                years_to_update = set(bench_files.keys()) | {end_date.year if hasattr(end_date, "year") else int(scraped_through_str[:4])}
+                for yr in years_to_update:
+                    try:
+                        write_scraped_through_date(
+                            "data", yr, court_code_underscore, bench, scraped_through_str
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to write scraped_through_date for "
+                            f"{yr}/{court_code_underscore}/{bench}: {e}"
+                        )
+
             # Clean up only files that were successfully uploaded.
             # Files with unparseable dates were never uploaded and should be preserved.
             uploaded_files = []
@@ -732,14 +769,22 @@ class Downloader:
                 traceback.print_exc()
                 results_available = False
 
-    def does_result_exist_in_s3(self, pdf_path: str | Path):
+    def check_result_in_s3(self, pdf_path: str | Path) -> tuple[bool, bool]:
+        """Return (json_in_s3, pdf_in_s3) for the given pdf fragment.
+
+        Consults both the metadata and data S3 indexes so callers can decide
+        whether to skip the row entirely (both present), skip only the PDF
+        download (PDF present, JSON missing), or run the full flow (neither
+        present). A JSON-present-only case is rare and handled by the batch
+        upload path which dedupes against the metadata index.
+        """
         pdf_path_obj = Path(pdf_path) if isinstance(pdf_path, str) else pdf_path
         # get_pdf_output_path expects a string (calls .split("#"))
         pdf_path_str = str(pdf_path) if not isinstance(pdf_path, str) else pdf_path
 
         bench = extract_bench_from_path(pdf_path_obj)
         if not bench:
-            return False
+            return False, False
 
         # If a local JSON already exists from a prior run, use its decision date
         # for an exact year lookup instead of guessing from the task date range.
@@ -756,10 +801,18 @@ class Downloader:
             end_year = datetime.strptime(self.task.to_date, "%Y-%m-%d").year
             years = {start_year, end_year}
 
+        pdf_name = pdf_path_obj.name
+        json_name = pdf_path_obj.with_suffix(".json").name
+        json_in_s3 = False
+        pdf_in_s3 = False
         for year in years:
-            if pdf_path_obj.name in cache_store.get(year, self.court_code, bench, "data"):
-                return True
-        return False
+            if pdf_name in cache_store.get(year, self.court_code, bench, "data"):
+                pdf_in_s3 = True
+            if json_name in cache_store.get(year, self.court_code, bench, "metadata"):
+                json_in_s3 = True
+            if json_in_s3 and pdf_in_s3:
+                break
+        return json_in_s3, pdf_in_s3
 
     def process_result_row(self, row, row_pos):
         html = row[1]
@@ -780,12 +833,13 @@ class Downloader:
             return False
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
-        if self.does_result_exist_in_s3(pdf_fragment):
+        json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
+        if json_in_s3 and pdf_in_s3:
             logger.debug(f"Skipping {pdf_fragment} - already exists in S3")
             return False
 
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
-        is_pdf_present = self.is_pdf_downloaded(pdf_fragment)
+        is_pdf_present = pdf_in_s3 or self.is_pdf_downloaded(pdf_fragment)
         pdf_needs_download = not is_pdf_present
         if pdf_needs_download:
             is_fresh_download = self.download_pdf(pdf_fragment, row_pos)
@@ -1284,9 +1338,10 @@ Examples:
     )
     parser.add_argument(
         "--compress-pdfs",
-        action="store_true",
-        default=False,
-        help="Enable PDF compression during download (requires Ghostscript to be installed)",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Compress PDFs during download with Ghostscript. Enabled by default; "
+             "pass --no-compress-pdfs to disable. No-op if Ghostscript is not installed.",
     )
 
     args = parser.parse_args()
@@ -1301,12 +1356,14 @@ Examples:
     # Handle PDF compression settings
     if args.compress_pdfs:
         if not COMPRESSION_AVAILABLE:
-            print("ERROR: PDF compression requested but Ghostscript not available")
-            print("Please install Ghostscript: sudo apt-get install ghostscript")
-            sys.exit(1)
-        print("INFO: PDF compression enabled")
+            print(
+                "WARNING: PDF compression enabled but Ghostscript not found on PATH. "
+                "PDFs will be uploaded uncompressed. Install Ghostscript to enable."
+            )
+        else:
+            print("INFO: PDF compression enabled")
     else:
-        print("INFO: PDF compression disabled (use --compress-pdfs to enable)")
+        print("INFO: PDF compression disabled (--no-compress-pdfs)")
 
     # Handle different modes
     if args.fetch_dates:

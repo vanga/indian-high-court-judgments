@@ -3,6 +3,7 @@ name: Court Data Pipeline
 on:
   schedule:
     # Run at 2:00 AM UTC every day
+    # Re-enable after the initial catch-up run completes for all courts.
     # - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
@@ -20,6 +21,10 @@ on:
         default: ""
 env:
   AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+
+concurrency:
+  group: court-data-pipeline
+  cancel-in-progress: false
 
 jobs:
   run-data-pipeline:

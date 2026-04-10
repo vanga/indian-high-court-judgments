@@ -1,5 +1,6 @@
 """S3 utility functions for uploading, downloading, and managing index files."""
 
+import logging
 import os
 import shutil
 import tarfile
@@ -7,7 +8,7 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import json
 
@@ -49,6 +50,7 @@ from tqdm import tqdm
 
 S3_READ_BUCKET = os.environ.get("S3_READ_BUCKET", "indian-high-court-judgments")
 S3_WRITE_BUCKET = os.environ.get("S3_WRITE_BUCKET", "indian-high-court-judgments")
+logger = logging.getLogger(__name__)
 
 # Maximum tar file size before splitting into a new part (1 GB)
 MAX_TAR_SIZE_BYTES = 1 * 1024 * 1024 * 1024
@@ -80,6 +82,85 @@ def read_updated_at_from_index(s3, bucket, key):
         return None
 
 
+# Filename date pattern: e.g. "UPHC020313492024_1_2025-10-07.pdf" -> "2025-10-07"
+import re as _re
+_FILENAME_DATE_RE = _re.compile(r"_(\d{4}-\d{2}-\d{2})\.(?:pdf|json)$", _re.IGNORECASE)
+
+
+def _extract_resume_cursor_from_index(s3, bucket: str, key: str, partition_year: int) -> Optional[str]:
+    """Return a YYYY-MM-DD resume cursor for one (bench, year) data index.
+
+    Preference order:
+    1. `scraped_through_date` field if present (new, authoritative)
+    2. Max filename date from all part files (legacy fallback, with sanity
+       bounds to reject garbage years: must be in [partition_year-1, current year])
+    3. None (caller should bootstrap from a sane default)
+    """
+    try:
+        response = s3.get_object(Bucket=bucket, Key=key)
+        data = json.loads(response["Body"].read())
+    except Exception as e:
+        print(f"Warning: Failed to read {key}: {e}")
+        return None
+
+    explicit = data.get("scraped_through_date")
+    if explicit:
+        return explicit
+
+    # Legacy fallback: scan filenames for the max embedded YYYY-MM-DD,
+    # filtering out garbage (eCourts has filenames with typo years like
+    # 2046, 2202, 2205 in the wild). Only accept dates in a plausible
+    # window: [partition_year-1, today]. Dates before that are too old
+    # to trust as a resume cursor; dates after today are clearly typos.
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    min_year = max(2000, partition_year - 1)
+
+    max_date: Optional[str] = None
+    for part in data.get("parts", []) or []:
+        for fname in part.get("files", []) or []:
+            m = _FILENAME_DATE_RE.search(fname)
+            if not m:
+                continue
+            d = m.group(1)
+            try:
+                y = int(d[:4])
+            except ValueError:
+                continue
+            if y < min_year:
+                continue
+            if d > today_str:
+                continue
+            if max_date is None or d > max_date:
+                max_date = d
+    return max_date
+
+
+def write_scraped_through_date(data_type: str, year: int, court_code: str, bench: str, scraped_through_date: str) -> bool:
+    """Set/advance the scraped_through_date field on a bench+year index.
+
+    Only moves forward — if the existing value is newer, no write occurs.
+    Creates the index if missing (with zero files/parts).
+    """
+    index_key = (
+        get_metadata_index_key(year, court_code, bench)
+        if data_type == "metadata"
+        else get_data_index_key(year, court_code, bench)
+    )
+    index_data = _load_index_v2(S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
+    existing = index_data.scraped_through_date
+    if existing and existing >= scraped_through_date:
+        return False
+    index_data.scraped_through_date = scraped_through_date
+    index_data.updated_at = utc_now_iso()
+    s3_client.put_object(
+        Bucket=S3_WRITE_BUCKET,
+        Key=index_key,
+        Body=index_data.model_dump_json(indent=2),
+        ContentType="application/json",
+    )
+    return True
+
+
 def _load_index_v2(
     read_bucket: str,
     index_key: str,
@@ -108,28 +189,36 @@ def _load_index_v2(
 
 def get_court_dates_from_index_files(year=None):
     """
-    Get updated_at dates from data index files.
+    Get resume-cursor dates from data index files.
+
+    For each (court, bench, year), returns the highest date that has been
+    successfully scraped. Preference order inside each index file:
+        1. scraped_through_date field (new, authoritative)
+        2. Max filename date across all indexed parts (legacy fallback)
+
+    Across year partitions, the MAX resume cursor per bench is kept (so the
+    bench's most-recent coverage wins even if it lives in a prior year's
+    partition).
 
     Args:
-        year: Year to check. If None, checks current year first then falls
-              back to previous years until data is found.
+        year: Year to check. If None, scans current year and up to 2 prior years.
 
     Returns:
-        Dict of {court_code: {bench_name: updated_at_timestamp}}
+        Dict of {court_code: {bench_name: "YYYY-MM-DD"}} where the date is
+        the resume cursor (the latest date the scraper has confirmed coverage of).
     """
     s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
 
     if year is not None:
         years_to_check = [year]
     else:
-        # Check current year first, then fall back up to 3 years
         current_year = datetime.now().year
         years_to_check = [current_year, current_year - 1, current_year - 2]
 
-    result = {}
+    result: Dict[str, Dict[str, str]] = {}
     for yr in years_to_check:
         prefix = f"data/tar/year={yr}/"
-        print(f"Reading dates from data index files: {S3_READ_BUCKET}/{prefix}")
+        print(f"Reading resume cursors from data index files: {S3_READ_BUCKET}/{prefix}")
 
         paginator = s3.get_paginator("list_objects_v2")
         for page in paginator.paginate(Bucket=S3_READ_BUCKET, Prefix=prefix):
@@ -142,21 +231,17 @@ def get_court_dates_from_index_files(year=None):
                 if not court_code or not bench:
                     continue
 
-                updated_at = read_updated_at_from_index(s3, S3_READ_BUCKET, key)
-                if updated_at:
-                    if court_code not in result:
-                        result[court_code] = {}
-                    # Keep the latest date per bench across years
-                    existing = result[court_code].get(bench)
-                    if existing is None or updated_at > existing:
-                        result[court_code][bench] = updated_at
+                cursor = _extract_resume_cursor_from_index(s3, S3_READ_BUCKET, key, yr)
+                if not cursor:
+                    continue
 
-        if result:
-            print(f"Found dates for {len(result)} courts (from year={yr})")
-            # Don't return early — keep checking older years to pick up courts
-            # whose most recent data lives in a prior year partition.
+                bench_map = result.setdefault(court_code, {})
+                existing = bench_map.get(bench)
+                # Keep the latest cursor (dates are ISO, lexicographic sort = chronological)
+                if existing is None or cursor > existing:
+                    bench_map[bench] = cursor
 
-    print(f"Found dates for {len(result)} courts (across {years_to_check})")
+    print(f"Found resume cursors for {len(result)} courts (across {years_to_check})")
     return result
 
 
@@ -297,6 +382,14 @@ def upload_single_file_to_s3(
                     else "application/pdf",
                 )
             return True
+        except FileNotFoundError as e:
+            logger.warning(
+                "Skipping missing local file during upload: %s, remote path: %s (%s)",
+                local_file_path,
+                s3_key,
+                e,
+            )
+            return False
         except Exception as e:
             if attempt < max_retries:
                 wait = 2 ** attempt
@@ -316,9 +409,34 @@ def upload_files_to_s3_v2(data_type: str, year: int, court_code: str, bench: str
             f"No files to upload for {data_type} in {year}/{court_code}/{bench}")
         return True
 
+    upload_candidates = []
+    missing_files = []
+    for file in files:
+        path = Path(file)
+        if path.exists():
+            upload_candidates.append(path)
+        else:
+            missing_files.append(path)
+
+    if missing_files:
+        logger.warning(
+            "Skipping %d missing local file(s) before upload for %s/%s/%s/%s",
+            len(missing_files),
+            data_type,
+            year,
+            court_code,
+            bench,
+        )
+
+    if not upload_candidates:
+        print(
+            f"No existing files to upload for {data_type} in {year}/{court_code}/{bench}"
+        )
+        return False
+
     # upload individual files
     failed_files = []
-    for file in files:
+    for file in upload_candidates:
         ok = upload_single_file_to_s3(data_type, year, court_code, bench, file)
         if not ok:
             failed_files.append(file)
@@ -330,9 +448,23 @@ def upload_files_to_s3_v2(data_type: str, year: int, court_code: str, bench: str
             f"Tar archive will still be created for all files."
         )
 
-    create_and_upload_tar_file(data_type, year, court_code, bench, files)
+    create_and_upload_tar_file(
+        data_type, year, court_code, bench, upload_candidates
+    )
 
     return len(failed_files) == 0
+
+
+def _get_indexed_filenames(data_type: str, year: int, court_code: str, bench: str) -> set:
+    """Return the set of filenames already present in the S3 index for this (bench, year)."""
+    index_key = get_metadata_index_key(
+        year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
+    index_data = _load_index_v2(
+        S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
+    indexed = set()
+    for part in index_data.parts:
+        indexed.update(part.files)
+    return indexed
 
 
 def update_index_file(data_type: str, year: int, court_code: str, bench: str, files: List[Path], tar_file_name: str, tar_file_size: int) -> bool:
@@ -342,22 +474,33 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
     processes update the same index concurrently, one write can overwrite the
     other, causing tar parts to be lost from the index. Do not run multiple
     download.py instances for the same (court, bench, year) simultaneously.
+
+    Duplicate filenames (already present in a prior indexed part) are silently
+    filtered out before appending. Callers should pre-filter when possible to
+    avoid wasting tar upload bandwidth on duplicates — see _flush_part.
     """
     index_key = get_metadata_index_key(
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
     index_data = _load_index_v2(
         S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
-    current_files = []
+    current_files = set()
     for part in index_data.parts:
-        current_files.extend(part.files)
+        current_files.update(part.files)
     new_files = [Path(p).name for p in files]
-    duplicates = set(new_files) & set(current_files)
+    duplicates = set(new_files) & current_files
     if duplicates:
-        raise ValueError(
-            f"Duplicate files detected in index for {data_type}/{year}/{court_code}/{bench}: "
-            f"{list(duplicates)[:10]}. This may indicate a concurrent write or a re-upload. "
-            f"Aborting to prevent index corruption."
+        logger.warning(
+            "Filtering %d already-indexed file(s) from new part %s for %s/%s/%s/%s",
+            len(duplicates), tar_file_name, data_type, year, court_code, bench,
         )
+        new_files = [n for n in new_files if n not in current_files]
+        if not new_files:
+            logger.warning(
+                "All files in part %s already indexed; skipping index update "
+                "(tar still uploaded to S3 and will be an orphan — clean up via audit).",
+                tar_file_name,
+            )
+            return False
     size_human = format_size(tar_file_size)
     new_part = IndexPart(
         name=tar_file_name,
@@ -410,8 +553,34 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
     parts_uploaded = 0
 
     def _flush_part(part_files):
-        """Close, upload, and index the current tar part."""
+        """Close, upload, and index the current tar part.
+
+        Pre-checks against the S3 index and filters out any filenames that are
+        already indexed. If nothing is left after filtering, the tar is never
+        built or uploaded (preventing orphan tar creation).
+        """
         nonlocal parts_uploaded
+
+        # Pre-filter against the S3 index to avoid building a tar for files
+        # that are already indexed. This prevents orphan tar creation when
+        # there's any overlap (from concurrent writers, re-uploads, etc.).
+        already_indexed = _get_indexed_filenames(data_type, year, court_code, bench)
+        new_part_files = [pf for pf in part_files if Path(pf).name not in already_indexed]
+        skipped = len(part_files) - len(new_part_files)
+        if skipped > 0:
+            logger.warning(
+                "Skipping %d already-indexed file(s) before tar build for %s/%s/%s/%s",
+                skipped, data_type, year, court_code, bench,
+            )
+        if not new_part_files:
+            logger.info(
+                "All %d files in this part are already indexed; skipping tar build entirely.",
+                len(part_files),
+            )
+            return
+
+        part_files = new_part_files
+
         part_name = generate_part_name(utc_now_iso())
         # Append a sequence suffix if we've already uploaded a part in this run
         # to avoid timestamp collisions within the same second
