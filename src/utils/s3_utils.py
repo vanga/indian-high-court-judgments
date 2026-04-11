@@ -18,13 +18,9 @@ from src.utils.shared_utils import format_size, utc_now_iso, generate_part_name,
 try:
     import boto3
     from boto3.s3.transfer import TransferConfig
-    from botocore import UNSIGNED
-    from botocore.client import Config
 
     S3_AVAILABLE = True
     s3_client = boto3.client("s3")
-    s3_client_unsigned = boto3.client(
-        "s3", config=Config(signature_version=UNSIGNED))
 except ImportError as e:
     print(f"S3 dependencies not available: {e}")
     S3_AVAILABLE = False
@@ -48,12 +44,16 @@ except ImportError as e:
 from src.utils.file_utils import group_files_by_year_and_bench, cleanup_uploaded_files
 from tqdm import tqdm
 
-S3_READ_BUCKET = os.environ.get("S3_READ_BUCKET", "indian-high-court-judgments")
-S3_WRITE_BUCKET = os.environ.get("S3_WRITE_BUCKET", "indian-high-court-judgments")
+S3_BUCKET = os.environ.get("S3_BUCKET", "indian-high-court-judgments")
 logger = logging.getLogger(__name__)
 
 # Maximum tar file size before splitting into a new part (1 GB)
 MAX_TAR_SIZE_BYTES = 1 * 1024 * 1024 * 1024
+# Parts at or below this size are eligible for in-place append on the next run.
+# Anything bigger becomes immutable — re-downloading/re-uploading a 1 GB tar just
+# to add a handful of small files wastes bandwidth. 100 MB keeps daily deltas
+# cheap while still absorbing the vast majority of fragmentation on small benches.
+APPEND_ELIGIBLE_SIZE_BYTES = 100 * 1024 * 1024
 
 
 def extract_court_bench_from_path(key):
@@ -146,14 +146,14 @@ def write_scraped_through_date(data_type: str, year: int, court_code: str, bench
         if data_type == "metadata"
         else get_data_index_key(year, court_code, bench)
     )
-    index_data = _load_index_v2(S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
+    index_data = _load_index_v2(index_key)
     existing = index_data.scraped_through_date
     if existing and existing >= scraped_through_date:
         return False
     index_data.scraped_through_date = scraped_through_date
     index_data.updated_at = utc_now_iso()
     s3_client.put_object(
-        Bucket=S3_WRITE_BUCKET,
+        Bucket=S3_BUCKET,
         Key=index_key,
         Body=index_data.model_dump_json(indent=2),
         ContentType="application/json",
@@ -161,28 +161,19 @@ def write_scraped_through_date(data_type: str, year: int, court_code: str, bench
     return True
 
 
-def _load_index_v2(
-    read_bucket: str,
-    index_key: str,
-    file_type: str,
-    court_code: str,
-    bench: str,
-    year: int,
-) -> IndexFileV2:
-    """Load index file (V2). If missing, return empty V2."""
+def _load_index_v2(index_key: str) -> IndexFileV2:
+    """Load index file (V2) from the canonical bucket. Returns empty V2 if missing."""
     try:
-        resp = s3_client_unsigned.get_object(Bucket=read_bucket, Key=index_key)
+        resp = s3_client.get_object(Bucket=S3_BUCKET, Key=index_key)
         raw = resp["Body"].read().decode("utf-8")
         data = json.loads(raw)
         return IndexFileV2.model_validate(data)
     except Exception:
-        # No existing index -> create empty V2
-        now_iso = utc_now_iso()
         return IndexFileV2(
             file_count=0,
             tar_size=0,
             tar_size_human="0 B",
-            updated_at=now_iso,
+            updated_at=utc_now_iso(),
             parts=[],
         )
 
@@ -207,8 +198,6 @@ def get_court_dates_from_index_files(year=None):
         Dict of {court_code: {bench_name: "YYYY-MM-DD"}} where the date is
         the resume cursor (the latest date the scraper has confirmed coverage of).
     """
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
-
     if year is not None:
         years_to_check = [year]
     else:
@@ -218,10 +207,10 @@ def get_court_dates_from_index_files(year=None):
     result: Dict[str, Dict[str, str]] = {}
     for yr in years_to_check:
         prefix = f"data/tar/year={yr}/"
-        print(f"Reading resume cursors from data index files: {S3_READ_BUCKET}/{prefix}")
+        print(f"Reading resume cursors from data index files: {S3_BUCKET}/{prefix}")
 
-        paginator = s3.get_paginator("list_objects_v2")
-        for page in paginator.paginate(Bucket=S3_READ_BUCKET, Prefix=prefix):
+        paginator = s3_client.get_paginator("list_objects_v2")
+        for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
             for obj in page.get("Contents", []):
                 key = obj["Key"]
                 if not key.endswith("data.index.json"):
@@ -231,7 +220,7 @@ def get_court_dates_from_index_files(year=None):
                 if not court_code or not bench:
                     continue
 
-                cursor = _extract_resume_cursor_from_index(s3, S3_READ_BUCKET, key, yr)
+                cursor = _extract_resume_cursor_from_index(s3_client, S3_BUCKET, key, yr)
                 if not cursor:
                     continue
 
@@ -258,7 +247,6 @@ def get_existing_files_from_s3(file_type, court_code, benches, year=None):
     if not S3_AVAILABLE:
         return {}
 
-    s3 = boto3.client("s3", config=Config(signature_version=UNSIGNED))
     year = year or datetime.now().year
 
     existing_files = {}
@@ -268,7 +256,7 @@ def get_existing_files_from_s3(file_type, court_code, benches, year=None):
 
         metadata_key = get_metadata_index_key(year, court_code, bench_name)
 
-        response = s3.get_object(Bucket=S3_READ_BUCKET, Key=metadata_key)
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_key)
         raw = response["Body"].read().decode("utf-8")
         data = json.loads(raw)
         for part in data.get("parts", []):
@@ -276,7 +264,7 @@ def get_existing_files_from_s3(file_type, court_code, benches, year=None):
                 part.get("files", []))
 
         data_key = get_data_index_key(year, court_code, bench_name)
-        response = s3.get_object(Bucket=S3_READ_BUCKET, Key=data_key)
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_key)
         raw = response["Body"].read().decode("utf-8")
         data = json.loads(raw)
         for part in data.get("parts", []):
@@ -302,7 +290,7 @@ def get_existing_files_from_s3_v2(data_type: str, year: int, court_code: str, be
         else get_data_index_key(year, court_code, bench)
     )
     try:
-        response = s3_client.get_object(Bucket=S3_READ_BUCKET, Key=index_key)
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=index_key)
         raw = response["Body"].read().decode("utf-8")
         data = json.loads(raw)
         for part in data.get("parts", []):
@@ -374,7 +362,7 @@ def upload_single_file_to_s3(
         try:
             with open(file_path_obj, "rb") as f:
                 s3_client.put_object(
-                    Bucket=S3_WRITE_BUCKET,
+                    Bucket=S3_BUCKET,
                     Key=s3_key,
                     Body=f,
                     ContentType="application/json"
@@ -459,15 +447,23 @@ def _get_indexed_filenames(data_type: str, year: int, court_code: str, bench: st
     """Return the set of filenames already present in the S3 index for this (bench, year)."""
     index_key = get_metadata_index_key(
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
-    index_data = _load_index_v2(
-        S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
+    index_data = _load_index_v2(index_key)
     indexed = set()
     for part in index_data.parts:
         indexed.update(part.files)
     return indexed
 
 
-def update_index_file(data_type: str, year: int, court_code: str, bench: str, files: List[Path], tar_file_name: str, tar_file_size: int) -> bool:
+def update_index_file(
+    data_type: str,
+    year: int,
+    court_code: str,
+    bench: str,
+    files: List[Path],
+    tar_file_name: str,
+    tar_file_size: int,
+    replace_part_name: Optional[str] = None,
+) -> bool:
     """Update the S3 index file with a new tar part.
 
     WARNING: This performs a non-atomic read-modify-write on S3. If multiple
@@ -478,11 +474,36 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
     Duplicate filenames (already present in a prior indexed part) are silently
     filtered out before appending. Callers should pre-filter when possible to
     avoid wasting tar upload bandwidth on duplicates — see _flush_part.
+
+    If ``replace_part_name`` is given, the part with that name is removed from
+    the index and the new part is written in its place. The new part's ``files``
+    list becomes the union of the replaced part's files and the incoming new
+    files (deduped). This is used by the hybrid append path — callers upload a
+    merged tar under a brand-new key, then swap the index entry in one PUT.
     """
     index_key = get_metadata_index_key(
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
-    index_data = _load_index_v2(
-        S3_READ_BUCKET, index_key, data_type, court_code, bench, year)
+    index_data = _load_index_v2(index_key)
+
+    old_part: Optional[IndexPart] = None
+    if replace_part_name:
+        for p in index_data.parts:
+            if p.name == replace_part_name:
+                old_part = p
+                break
+        if old_part is None:
+            logger.warning(
+                "replace_part_name=%s not found in index for %s/%s/%s/%s; "
+                "proceeding as plain append.",
+                replace_part_name, data_type, year, court_code, bench,
+            )
+        else:
+            index_data.parts = [p for p in index_data.parts if p.name != replace_part_name]
+            index_data.file_count -= old_part.file_count
+            index_data.tar_size -= old_part.size
+
+    # Dedup incoming files against everything still in the index (i.e. excluding
+    # the part we just removed, whose files will be re-added via the merged part).
     current_files = set()
     for part in index_data.parts:
         current_files.update(part.files)
@@ -494,35 +515,195 @@ def update_index_file(data_type: str, year: int, court_code: str, bench: str, fi
             len(duplicates), tar_file_name, data_type, year, court_code, bench,
         )
         new_files = [n for n in new_files if n not in current_files]
-        if not new_files:
-            logger.warning(
-                "All files in part %s already indexed; skipping index update "
-                "(tar still uploaded to S3 and will be an orphan — clean up via audit).",
-                tar_file_name,
-            )
-            return False
+
+    if old_part is not None:
+        # Merged part carries the old part's files plus the new unique ones.
+        old_files_set = set(old_part.files)
+        unique_new = [n for n in new_files if n not in old_files_set]
+        part_files_list = list(old_part.files) + unique_new
+    else:
+        part_files_list = new_files
+
+    if not part_files_list:
+        logger.warning(
+            "All files in part %s already indexed; skipping index update "
+            "(tar still uploaded to S3 and will be an orphan — clean up via audit).",
+            tar_file_name,
+        )
+        return False
+
     size_human = format_size(tar_file_size)
     new_part = IndexPart(
         name=tar_file_name,
-        files=new_files,
-        file_count=len(new_files),
+        files=part_files_list,
+        file_count=len(part_files_list),
         size=tar_file_size,
         size_human=size_human,
         created_at=utc_now_iso(),
     )
     index_data.parts.append(new_part)
-    index_data.file_count = index_data.file_count + len(new_files)
-    index_data.tar_size = index_data.tar_size + \
-        tar_file_size
+    index_data.file_count = index_data.file_count + len(part_files_list)
+    index_data.tar_size = index_data.tar_size + tar_file_size
     index_data.tar_size_human = format_size(index_data.tar_size)
     index_data.updated_at = utc_now_iso()
     s3_client.put_object(
-        Bucket=S3_WRITE_BUCKET,
+        Bucket=S3_BUCKET,
         Key=index_key,
         Body=index_data.model_dump_json(indent=2),
         ContentType="application/json",
     )
     return True
+
+
+def _find_append_target(
+    index_data: IndexFileV2, new_files_total_size: int
+) -> Optional[IndexPart]:
+    """Return the latest tar part eligible for in-place append, or None.
+
+    Eligibility (all must hold):
+      1. Part has the max ``created_at`` across all parts in the index.
+      2. ``part.size <= APPEND_ELIGIBLE_SIZE_BYTES`` (cheap to re-upload).
+      3. ``part.size + new_files_total_size <= MAX_TAR_SIZE_BYTES`` (stays
+         under the split ceiling).
+
+    Empty parts list, missing/malformed ``created_at``, or legacy oversized
+    parts all return None — the caller falls through to new-part creation.
+    """
+    if not index_data.parts:
+        return None
+    parts_with_ts = [p for p in index_data.parts if p.created_at]
+    if not parts_with_ts:
+        return None
+    try:
+        latest = max(parts_with_ts, key=lambda p: p.created_at)
+    except (TypeError, ValueError):
+        return None
+    if latest.size > APPEND_ELIGIBLE_SIZE_BYTES:
+        return None
+    if latest.size + new_files_total_size > MAX_TAR_SIZE_BYTES:
+        return None
+    return latest
+
+
+def _append_to_existing_part(
+    data_type: str,
+    year: int,
+    court_code: str,
+    bench: str,
+    part_files: List[Path],
+    target: IndexPart,
+    parts_prefix: str,
+    suffix: str,
+    tar_mode: str,
+    content_type: str,
+) -> bool:
+    """Best-effort: merge ``part_files`` into ``target`` tar and swap the index.
+
+    Returns True on full success. Returns False on any failure so the caller can
+    fall through to the normal new-part path in the same run.
+
+    Crash-safety ordering: upload merged tar under a brand-new key → swap index
+    in one PUT → delete old part. The merged tar is never uploaded under the
+    old part's key, so a crash between upload and index update leaves the old
+    part authoritative (merged tar becomes an orphan for audit cleanup).
+    """
+    old_part_key = parts_prefix + target.name
+    old_tar_temp: Optional[str] = None
+    merged_tar_temp: Optional[str] = None
+    try:
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            old_tar_temp = tmp.name
+        try:
+            s3_client.download_file(S3_BUCKET, old_part_key, old_tar_temp)
+        except Exception as e:
+            logger.warning(
+                "Append: failed to download old part s3://%s/%s (%s); falling through to new-part",
+                S3_BUCKET, old_part_key, e,
+            )
+            return False
+
+        read_mode = "r:gz" if data_type == "metadata" else "r"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+            merged_tar_temp = tmp.name
+        try:
+            with tarfile.open(old_tar_temp, read_mode) as old_tar, \
+                 tarfile.open(merged_tar_temp, tar_mode) as new_tar:
+                for member in old_tar:
+                    if member.isfile():
+                        extracted = old_tar.extractfile(member)
+                        new_tar.addfile(member, extracted)
+                    else:
+                        new_tar.addfile(member)
+                for pf in tqdm(part_files, desc=f"Appending to {target.name}"):
+                    new_tar.add(pf, arcname=Path(pf).name)
+        except Exception as e:
+            logger.warning(
+                "Append: failed to build merged tar for %s (%s); falling through",
+                old_part_key, e,
+            )
+            return False
+
+        merged_size = Path(merged_tar_temp).stat().st_size
+        if merged_size > MAX_TAR_SIZE_BYTES:
+            logger.warning(
+                "Append: merged tar size %s exceeds split ceiling %s; falling through",
+                format_size(merged_size), format_size(MAX_TAR_SIZE_BYTES),
+            )
+            return False
+
+        new_part_base = generate_part_name(utc_now_iso())
+        new_part_file_name = f"{new_part_base}{suffix}"
+        # Never reuse the old part's filename — protects against an S3 overwrite
+        # racing with the index swap on sub-second collisions.
+        if new_part_file_name == target.name:
+            new_part_file_name = f"{new_part_base}-append{suffix}"
+        new_part_key = parts_prefix + new_part_file_name
+
+        print(
+            f"  Appending to existing part {target.name} "
+            f"({format_size(target.size)} + {len(part_files)} new files "
+            f"→ {format_size(merged_size)}); uploading as {new_part_file_name}"
+        )
+        upload_ok = upload_large_file_to_s3(
+            merged_tar_temp, S3_BUCKET, new_part_key, content_type
+        )
+        if not upload_ok:
+            logger.warning(
+                "Append: upload of merged tar %s failed; falling through to new-part",
+                new_part_key,
+            )
+            return False
+
+        try:
+            update_index_file(
+                data_type, year, court_code, bench,
+                part_files, new_part_file_name, merged_size,
+                replace_part_name=target.name,
+            )
+        except Exception as e:
+            logger.error(
+                "Append: index swap failed after merged-tar upload (%s). "
+                "Merged tar s3://%s/%s is now an orphan; old part %s remains "
+                "authoritative per the index.",
+                e, S3_BUCKET, new_part_key, old_part_key,
+            )
+            return False
+
+        try:
+            s3_client.delete_object(Bucket=S3_BUCKET, Key=old_part_key)
+        except Exception as e:
+            logger.warning(
+                "Append: failed to delete old part s3://%s/%s after successful merge (%s). "
+                "Orphan; clean up via audit.",
+                S3_BUCKET, old_part_key, e,
+            )
+
+        return True
+    finally:
+        if old_tar_temp:
+            Path(old_tar_temp).unlink(missing_ok=True)
+        if merged_tar_temp:
+            Path(merged_tar_temp).unlink(missing_ok=True)
 
 
 def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench: str, files: List[Path]) -> bool:
@@ -558,13 +739,28 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
         Pre-checks against the S3 index and filters out any filenames that are
         already indexed. If nothing is left after filtering, the tar is never
         built or uploaded (preventing orphan tar creation).
+
+        After dedup, the latest tar part may be eligible for an in-place append
+        (small enough, and total merged size fits under the split ceiling). If
+        so, we download it, stream-merge the new files into a freshly named
+        tar, upload, swap the index, and delete the old part. Any failure in
+        that path falls through to the normal new-part creation below.
         """
         nonlocal parts_uploaded
 
         # Pre-filter against the S3 index to avoid building a tar for files
         # that are already indexed. This prevents orphan tar creation when
         # there's any overlap (from concurrent writers, re-uploads, etc.).
-        already_indexed = _get_indexed_filenames(data_type, year, court_code, bench)
+        index_key = (
+            get_metadata_index_key(year, court_code, bench)
+            if data_type == "metadata"
+            else get_data_index_key(year, court_code, bench)
+        )
+        index_data = _load_index_v2(index_key)
+        already_indexed = set()
+        for _p in index_data.parts:
+            already_indexed.update(_p.files)
+
         new_part_files = [pf for pf in part_files if Path(pf).name not in already_indexed]
         skipped = len(part_files) - len(new_part_files)
         if skipped > 0:
@@ -580,6 +776,28 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
             return
 
         part_files = new_part_files
+
+        # Try the hybrid append path: if the latest indexed part is small
+        # enough and the merged size stays under the split ceiling, re-upload
+        # a merged tar instead of fragmenting with yet another tiny part.
+        new_files_total_size = 0
+        for pf in part_files:
+            try:
+                new_files_total_size += Path(pf).stat().st_size
+            except OSError:
+                pass
+
+        append_target = _find_append_target(index_data, new_files_total_size)
+        if append_target is not None:
+            appended = _append_to_existing_part(
+                data_type, year, court_code, bench,
+                part_files, append_target,
+                parts_prefix, suffix, tar_mode, content_type,
+            )
+            if appended:
+                parts_uploaded += 1
+                return
+            # else fall through to new-part creation
 
         part_name = generate_part_name(utc_now_iso())
         # Append a sequence suffix if we've already uploaded a part in this run
@@ -600,7 +818,7 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
 
             tar_size = Path(temp_path).stat().st_size
             print(f"  Uploading tar part {part_file_name} ({format_size(tar_size)}, {len(part_files)} files)")
-            upload_ok = upload_large_file_to_s3(temp_path, S3_WRITE_BUCKET, part_key, content_type)
+            upload_ok = upload_large_file_to_s3(temp_path, S3_BUCKET, part_key, content_type)
             if not upload_ok:
                 raise RuntimeError(
                     f"Failed to upload tar part {part_file_name} to S3. "
@@ -673,7 +891,7 @@ def create_and_upload_parquet_files(
             try:
                 print(f"  Downloading existing parquet file...")
                 response = s3_client.get_object(
-                    Bucket=S3_READ_BUCKET, Key=parquet_key)
+                    Bucket=S3_BUCKET, Key=parquet_key)
 
                 # Save existing parquet to temp file
                 with open(existing_parquet_path, "wb") as f:
@@ -741,7 +959,7 @@ def create_and_upload_parquet_files(
             print(f"  Uploading updated parquet file...")
             with open(combined_parquet_path, "rb") as f:
                 s3_client.put_object(
-                    Bucket=S3_WRITE_BUCKET,
+                    Bucket=S3_BUCKET,
                     Key=parquet_key,
                     Body=f,
                     ContentType="application/octet-stream",
