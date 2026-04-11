@@ -46,6 +46,7 @@ from src.utils.s3_utils import (
 
 
 S3_ENABLED = False
+DAILY_UPDATE_BUFFER_DAYS = 14
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -305,6 +306,7 @@ def run(
     if end_date is None:
         end_date = datetime.now().strftime("%Y-%m-%d")
         print(f"Auto-detected end_date: {end_date} (today)")
+    end_date_dt = datetime.strptime(end_date, "%Y-%m-%d")
 
     # Default bootstrap date for brand-new courts with no S3 index entries
     DEFAULT_BOOTSTRAP = "2008-01-01"
@@ -330,11 +332,12 @@ def run(
             return
 
         # For each court, take the MIN resume cursor across its benches and
-        # start from the day after. Resume cursors are YYYY-MM-DD strings
-        # returned by get_court_dates_from_index_files() — they come from the
-        # scraped_through_date field (new) or max filename date (legacy).
-        # One lagging bench still drags that court, but other courts are
-        # no longer affected.
+        # re-scrape with a fixed overlap window. Resume cursors are YYYY-MM-DD
+        # strings returned by get_court_dates_from_index_files() — they come
+        # from the scraped_through_date field (new) or max filename date
+        # (legacy). The overlap protects against judgments that appear on the
+        # portal days after their decision date. One lagging bench still drags
+        # that court, but other courts are no longer affected.
         for court, benches in court_dates.items():
             bench_cursors = []
             for _, cursor_str in benches.items():
@@ -345,7 +348,9 @@ def run(
                     continue
             if bench_cursors:
                 earliest = min(bench_cursors)
-                court_start_dates[court] = (earliest + timedelta(days=1)).strftime(
+                overlap_floor = end_date_dt - timedelta(days=DAILY_UPDATE_BUFFER_DAYS)
+                overlap_start = min(earliest, overlap_floor)
+                court_start_dates[court] = overlap_start.strftime(
                     "%Y-%m-%d"
                 )
 
@@ -356,6 +361,7 @@ def run(
 
         print(
             f"Resolved per-court start_dates for {len(court_start_dates)} court(s). "
+            f"Using a {DAILY_UPDATE_BUFFER_DAYS}-day overlap window. "
             f"Courts not listed will fall back to {DEFAULT_BOOTSTRAP}."
         )
 
@@ -1320,7 +1326,7 @@ Examples:
         "--start_date",
         type=str,
         default=None,
-        help="Start date in YYYY-MM-DD format (omit to auto-detect from S3)",
+        help="Start date in YYYY-MM-DD format (omit to auto-detect from S3 with a 14-day overlap buffer)",
     )
     parser.add_argument(
         "--end_date",
