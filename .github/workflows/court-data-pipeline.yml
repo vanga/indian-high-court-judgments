@@ -3,8 +3,7 @@ name: Court Data Pipeline
 on:
   schedule:
     # Run at 2:00 AM UTC every day
-    # Re-enable after the initial catch-up run completes for all courts.
-    # - cron: "0 2 * * *"
+    - cron: "0 2 * * *"
   workflow_dispatch:
     inputs:
       court_code:
