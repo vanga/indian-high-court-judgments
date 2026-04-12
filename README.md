@@ -1,6 +1,8 @@
 # Indian High Court Judgments
 
-An open dataset of judgments from 25 Indian High Courts, scraped from the [eCourts judgments portal](https://judgments.ecourts.gov.in).
+[![Daily Sync](https://github.com/vanga/indian-high-court-judgments/actions/workflows/court-data-pipeline.yml/badge.svg)](https://github.com/vanga/indian-high-court-judgments/actions/workflows/court-data-pipeline.yml)
+
+An open dataset of judgments from 25 Indian High Courts, scraped from the [eCourts judgments portal](https://judgments.ecourts.gov.in). The dataset is synced daily via GitHub Actions.
 
 - **Download the dataset**: [AWS Open Data Registry](https://registry.opendata.aws/indian-high-court-judgments/)
 - **License**: [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) — free to use, share, and adapt with attribution
