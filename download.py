@@ -142,7 +142,6 @@ payload = "&sEcho=1&iColumns=2&sColumns=,&iDisplayStart=0&iDisplayLength=100&mDa
 pdf_link_payload = "val=0&lang_flg=undefined&path=cnrorders/taphc/orders/2017/HBHC010262202017_1_2047-06-29.pdf#page=&search=+&citation_year=&fcourt_type=2&file_type=undefined&nc_display=undefined&ajax_req=true&app_token=c64944b84c687f501f9692e239e2a0ab007eabab497697f359a2f62e4fcd3d10"
 
 page_size = 1000
-MATH_CAPTCHA = False
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
 
@@ -945,40 +944,6 @@ class Downloader:
             return match.group(1).split("#")[0]
         return None
 
-    def solve_math_expression(self, expression):
-        # credits to: https://github.com/NoelShallum
-        expression = expression.strip().replace(" ", "").replace(".", "")
-        if "+" in expression:
-            nums = expression.split("+")
-            return str(int(nums[0]) + int(nums[1]))
-        elif "-" in expression:
-            nums = expression.split("-")
-            return str(int(nums[0]) - int(nums[1]))
-        elif (
-            "*" in expression
-            or "X" in expression
-            or "x" in expression
-            or "×" in expression
-        ):
-            expression = (
-                expression.replace("x", "*").replace("×", "*").replace("X", "*")
-            )
-            nums = expression.split("*")
-            return str(int(nums[0]) * int(nums[1]))
-        elif "/" in expression or "÷" in expression:
-            expression = expression.replace("÷", "/")
-            nums = expression.split("/")
-            return str(int(nums[0]) // int(nums[1]))
-        else:
-            raise ValueError(f"Unsupported mathematical expression: {expression}")
-
-    def is_math_expression(self, expression):
-        separators = ["+", "-", "*", "/", "÷", "x", "×", "X"]
-        for separator in separators:
-            if separator in expression:
-                return True
-        return False
-
     def solve_captcha(self, retries=0, captcha_url=None):
         logger.debug(f"Solving captcha, retries: {retries}, task: {self.task.id}")
         if retries > 10:
@@ -1001,33 +966,12 @@ class Downloader:
 
         captcha_text = captcha_text.strip()
 
-        if MATH_CAPTCHA:
-            if self.is_math_expression(captcha_text):
-                try:
-                    answer = self.solve_math_expression(captcha_text)
-                    captcha_filename.unlink()
-                    return answer
-                except Exception as e:
-                    logger.error(
-                        f"Error solving math expression, task: {self.task.id}, retries: {retries}, captcha text: {captcha_text}, Error: {e}"
-                    )
-                    # move the captcha image to a new folder for debugging
-                    new_filename = f"{uuid.uuid4().hex[:8]}_{captcha_filename.name}"
-                    captcha_filename.rename(
-                        Path(f"{captcha_failures_dir}/{new_filename}")
-                    )
-                    return self.solve_captcha(retries + 1, captcha_url)
-            else:
-                # If not a math expression, try again
-                captcha_filename.unlink()  # Clean up the file
-                return self.solve_captcha(retries + 1, captcha_url)
-        else:
-            captcha_text = captcha_text.strip()
-            if len(captcha_text) != 6:
-                if retries > 10:
-                    raise Exception("Captcha not solved")
-                return self.solve_captcha(retries + 1)
-            return captcha_text
+        captcha_text = captcha_text.strip()
+        if len(captcha_text) != 6:
+            if retries > 10:
+                raise Exception("Captcha not solved")
+            return self.solve_captcha(retries + 1)
+        return captcha_text
 
     def solve_pdf_download_captcha(self, response, pdf_link_payload, retries=0):
         html_str = response["filename"]

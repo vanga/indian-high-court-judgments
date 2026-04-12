@@ -234,52 +234,6 @@ def get_court_dates_from_index_files(year=None):
     return result
 
 
-def get_existing_files_from_s3(file_type, court_code, benches, year=None):
-    """
-    Fetch existing filenames from S3 index files for all benches of a court.
-    Returns a dict: {bench_name: {'metadata': set(), 'data': set()}}
-
-    Args:
-        court_code: Court code (e.g., '33_10')
-        benches: Dict of bench names
-        year: Year to check (defaults to current year)
-    """
-    if not S3_AVAILABLE:
-        return {}
-
-    year = year or datetime.now().year
-
-    existing_files = {}
-
-    for bench_name in benches.keys():
-        existing_files[bench_name] = {"metadata": set(), "data": set()}
-
-        metadata_key = get_metadata_index_key(year, court_code, bench_name)
-
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=metadata_key)
-        raw = response["Body"].read().decode("utf-8")
-        data = json.loads(raw)
-        for part in data.get("parts", []):
-            existing_files[bench_name]["metadata"].update(
-                part.get("files", []))
-
-        data_key = get_data_index_key(year, court_code, bench_name)
-        response = s3_client.get_object(Bucket=S3_BUCKET, Key=data_key)
-        raw = response["Body"].read().decode("utf-8")
-        data = json.loads(raw)
-        for part in data.get("parts", []):
-            existing_files[bench_name]["data"].update(
-                part.get("files", []))
-
-    total_metadata = sum(len(bench["metadata"])
-                         for bench in existing_files.values())
-    total_data = sum(len(bench["data"]) for bench in existing_files.values())
-    print(
-        f"  Found {total_metadata} existing metadata files and {total_data} existing PDFs in S3"
-    )
-
-    return existing_files
-
 
 def get_existing_files_from_s3_v2(data_type: str, year: int, court_code: str, bench: str) -> List[str]:
     """Get existing files from S3"""
