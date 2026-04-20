@@ -707,6 +707,43 @@ class Downloader:
 
         # PDF compression settings
         self.compression_enabled = compression_enabled and COMPRESSION_AVAILABLE
+        self.task_stats = self._new_task_stats()
+
+    def _new_task_stats(self):
+        return {
+            "pages_fetched": 0,
+            "results_seen": 0,
+            "downloaded": 0,
+            "skip_s3": 0,
+            "skip_local": 0,
+            "metadata_only": 0,
+            "no_download": 0,
+            "parse_failure": 0,
+            "session_refreshes": 0,
+            "session_expire_events": 0,
+            "errormsg_events": 0,
+        }
+
+    def _log_task_summary(self):
+        logger.info(
+            "Task summary: court=%s from=%s to=%s pages=%s results=%s downloaded=%s "
+            "skip_s3=%s skip_local=%s metadata_only=%s no_download=%s parse_failures=%s "
+            "session_refreshes=%s session_expire=%s api_errors=%s",
+            self.court_code,
+            self.task.from_date,
+            self.task.to_date,
+            self.task_stats["pages_fetched"],
+            self.task_stats["results_seen"],
+            self.task_stats["downloaded"],
+            self.task_stats["skip_s3"],
+            self.task_stats["skip_local"],
+            self.task_stats["metadata_only"],
+            self.task_stats["no_download"],
+            self.task_stats["parse_failure"],
+            self.task_stats["session_refreshes"],
+            self.task_stats["session_expire_events"],
+            self.task_stats["errormsg_events"],
+        )
 
     def _results_exist_in_search_response(self, res_dict):
         results_exist = (
@@ -714,74 +751,16 @@ class Downloader:
             and "aaData" in res_dict["reportrow"]
             and len(res_dict["reportrow"]["aaData"]) > 0
         )
-        if results_exist:
-            no_of_results = len(res_dict["reportrow"]["aaData"])
-            logger.info(f"Found {no_of_results} results for task: {self.task}")
         return results_exist
 
     def _prepare_next_iteration(self, search_payload):
         search_payload["sEcho"] += 1
         search_payload["iDisplayStart"] += page_size
-        logger.info(
-            f"Next iteration: {search_payload['iDisplayStart']}, task: {self.task.id}"
-        )
         return search_payload
 
     def process_court(self):
-        """Process court data for the specific date range in the task."""
-        from_date = self.task.from_date
-        to_date = self.task.to_date
-
-        search_payload = self.default_search_payload()
-        search_payload["from_date"] = from_date
-        search_payload["to_date"] = to_date
-        self.init_user_session()
-        search_payload["state_code"] = self.court_code
-        search_payload["app_token"] = self.app_token
-        results_available = True
-        pdfs_downloaded = 0
-
-        while results_available:
-            try:
-                response = self.request_api("POST", self.search_url, search_payload)
-                res_dict = response.json()
-                if self._results_exist_in_search_response(res_dict):
-                    for idx, row in enumerate(res_dict["reportrow"]["aaData"]):
-                        try:
-                            is_pdf_downloaded = self.process_result_row(
-                                row, row_pos=idx
-                            )
-                            if is_pdf_downloaded:
-                                pdfs_downloaded += 1
-
-                            if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
-                                # after 25 downloads, need to solve captcha for every pdf link request. Starting with a fresh session would be faster so that we get another 25 downloads without captcha
-                                logger.info(
-                                    f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task.id}"
-                                )
-                                break
-
-                        except Exception as e:
-                            logger.error(
-                                f"Error processing row {row}: {e}, task: {self.task}"
-                            )
-                            traceback.print_exc()
-                    if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
-                        pdfs_downloaded = 0
-                        self.init_user_session()
-                        search_payload["app_token"] = self.app_token
-                        continue
-                        # we are skipping the rest of the loop, meaning we fetch the 1000 results again for the same page, with a new session and process. Already downloaded pdfs will be skipped. This continues until we hve downloaded the whole page.
-                    # prepare next iteration
-                    search_payload = self._prepare_next_iteration(search_payload)
-                else:
-                    logger.info(f"No more data to download for: task: {self.task}")
-                    results_available = False
-
-            except Exception as e:
-                logger.error(f"Error processing task: {self.task}, Error: {e}")
-                traceback.print_exc()
-                results_available = False
+        """Backward-compatible alias for the main task runner."""
+        return self.download()
 
     def check_result_in_s3(self, pdf_path: str | Path) -> tuple[bool, bool]:
         """Return (json_in_s3, pdf_in_s3) for the given pdf fragment.
@@ -838,22 +817,22 @@ class Downloader:
         # case_details = html_element.xpath("./strong//text()")
         # check if button with onclick is present
         if not (soup.button and "onclick" in soup.button.attrs):
-            logger.info(
+            logger.debug(
                 f"No button found, likely multi language judgment, task: {self.task}"
             )
             with open("html-parse-failures.txt", "a") as f:
                 f.write(html + "\n")
             # TODO: requires special parsing
-            return False
+            return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
         if json_in_s3 and pdf_in_s3:
-            logger.debug(f"Skipping {pdf_fragment} - already exists in S3")
-            return False
+            return "skip_s3"
 
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
-        is_pdf_present = pdf_in_s3 or self.is_pdf_downloaded(pdf_fragment)
+        is_local_pdf_present = self.is_pdf_downloaded(pdf_fragment)
+        is_pdf_present = pdf_in_s3 or is_local_pdf_present
         pdf_needs_download = not is_pdf_present
         if pdf_needs_download:
             is_fresh_download = self.download_pdf(pdf_fragment, row_pos)
@@ -873,7 +852,13 @@ class Downloader:
         metadata_output.parent.mkdir(parents=True, exist_ok=True)
         with open(metadata_output, "w") as f:
             json.dump(metadata, f)
-        return is_fresh_download
+        if is_fresh_download:
+            return "downloaded"
+        if pdf_in_s3 and not json_in_s3:
+            return "metadata_only"
+        if is_local_pdf_present and not pdf_in_s3:
+            return "skip_local"
+        return "no_download"
 
     def download_pdf(self, pdf_fragment, row_pos):
         # prepare temp pdf request
@@ -1055,6 +1040,7 @@ class Downloader:
             return self.solve_pdf_download_captcha(response_dict, payload)
 
         elif response_dict.get("session_expire") == "Y":
+            self.task_stats["session_expire_events"] += 1
             if _retry_count >= MAX_RETRIES:
                 logger.error(f"Giving up after {MAX_RETRIES} session_expire retries for {url}")
                 return response
@@ -1064,10 +1050,11 @@ class Downloader:
             return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
 
         elif "errormsg" in response_dict:
+            self.task_stats["errormsg_events"] += 1
             if _retry_count >= MAX_RETRIES:
                 logger.error(f"Giving up after {MAX_RETRIES} errormsg retries for {url}: {response_dict.get('errormsg')}")
                 return response
-            logger.error(f"Error {response_dict['errormsg']}")
+            logger.debug(f"Error {response_dict['errormsg']}")
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
@@ -1162,16 +1149,19 @@ class Downloader:
         search_payload["app_token"] = self.app_token
         results_available = True
         pdfs_downloaded = 0
+        self.task_stats = self._new_task_stats()
 
-        logger.info(f"Downloading data for: task: {self.task}")
+        logger.info(f"Starting task: {self.task}")
 
         while results_available:
             try:
                 response = self.request_api("POST", self.search_url, search_payload)
                 res_dict = response.json()
                 if self._results_exist_in_search_response(res_dict):
+                    self.task_stats["pages_fetched"] += 1
                     results = res_dict["reportrow"]["aaData"]
                     num_results = len(results)
+                    self.task_stats["results_seen"] += num_results
 
                     with tqdm(
                         total=num_results,
@@ -1181,20 +1171,17 @@ class Downloader:
                     ) as result_pbar:
                         for idx, row in enumerate(results):
                             try:
-                                is_pdf_downloaded = self.process_result_row(
+                                outcome = self.process_result_row(
                                     row, row_pos=idx
                                 )
-                                if is_pdf_downloaded:
+                                self.task_stats[outcome] += 1
+                                if outcome == "downloaded":
                                     pdfs_downloaded += 1
                                     result_pbar.set_postfix(downloaded=pdfs_downloaded)
 
                                 result_pbar.update(1)
 
                                 if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
-                                    # after 25 downloads, need to solve captcha for every pdf link request
-                                    logger.info(
-                                        f"Downloaded {NO_CAPTCHA_BATCH_SIZE} pdfs, starting with fresh session, task: {self.task}"
-                                    )
                                     break
                             except Exception as e:
                                 logger.error(
@@ -1205,9 +1192,7 @@ class Downloader:
 
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                         pdfs_downloaded = 0
-                        logger.debug(
-                            f"Resetting session after {NO_CAPTCHA_BATCH_SIZE} downloads, continuing with same search parameters"
-                        )
+                        self.task_stats["session_refreshes"] += 1
                         self.init_user_session()
                         search_payload["app_token"] = self.app_token
                         continue
@@ -1215,13 +1200,14 @@ class Downloader:
                     # prepare next iteration
                     search_payload = self._prepare_next_iteration(search_payload)
                 else:
-                    # No more results for this date range
                     results_available = False
 
             except Exception as e:
                 logger.error(f"Error processing task: {self.task}, {e}")
                 traceback.print_exc()
-                # results_available = False
+                break
+
+        self._log_task_summary()
 
 
 if __name__ == "__main__":
