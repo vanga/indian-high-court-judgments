@@ -11,6 +11,7 @@ import logging
 import re
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 import uuid
@@ -47,6 +48,7 @@ from src.utils.s3_utils import (
 
 S3_ENABLED = False
 DAILY_UPDATE_BUFFER_DAYS = 14
+TASK_DOWNLOAD_ATTEMPTS = 3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -225,14 +227,29 @@ def get_date_ranges_to_process(court_code, start_date, end_date, day_step=1):
 
 
 class CourtDateTask:
-    def __init__(self, court_code: str, from_date: str, to_date: str):
+    def __init__(
+        self,
+        court_code: str,
+        from_date: str,
+        to_date: str,
+        dist_code: Optional[str] = None,
+    ):
         self.id = str(uuid.uuid4())
         self.court_code = court_code
         self.from_date = from_date
         self.to_date = to_date
+        self.dist_code = dist_code
 
     def __str__(self):
-        return f"CourtDateTask(id={self.id}, court_code={self.court_code}, from_date={self.from_date}, to_date={self.to_date})"
+        dist_part = (
+            f", dist_code={self.dist_code}"
+            if self.dist_code is not None
+            else ""
+        )
+        return (
+            f"CourtDateTask(id={self.id}, court_code={self.court_code}, "
+            f"from_date={self.from_date}, to_date={self.to_date}{dist_part})"
+        )
 
 
 def generate_tasks(
@@ -240,6 +257,7 @@ def generate_tasks(
     start_date: Optional[str] = None,
     end_date: Optional[str] = None,
     day_step: int = 1,
+    dist_code: Optional[str] = None,
 ) -> Generator[CourtDateTask, None, None]:
     """Generate tasks for processing courts and date ranges as a generator"""
     all_court_codes = get_court_codes()
@@ -261,23 +279,30 @@ def generate_tasks(
         for from_date, to_date in get_date_ranges_to_process(
             code, start_date, end_date, day_step
         ):
-            yield CourtDateTask(code, from_date, to_date)
+            yield CourtDateTask(code, from_date, to_date, dist_code=dist_code)
 
 
 def process_task(task: CourtDateTask, compression_enabled=False):
     """Process a single court-date task"""
-    try:
-        downloader = Downloader(
-            task,
-            compression_enabled=compression_enabled,
-        )
-        downloader.download()
-    except Exception as e:
-        court_codes = get_court_codes()
-        logger.error(
-            f"Error processing court {task.court_code} {court_codes.get(task.court_code, 'Unknown')}: {e}"
-        )
-        traceback.print_exc()
+    court_codes = get_court_codes()
+    for attempt in range(1, TASK_DOWNLOAD_ATTEMPTS + 1):
+        try:
+            downloader = Downloader(
+                task,
+                compression_enabled=compression_enabled,
+            )
+            downloader.download()
+            return
+        except Exception as e:
+            logger.error(
+                f"Error processing court {task.court_code} "
+                f"{court_codes.get(task.court_code, 'Unknown')} "
+                f"(attempt {attempt}/{TASK_DOWNLOAD_ATTEMPTS}): {e}"
+            )
+            traceback.print_exc()
+            if attempt >= TASK_DOWNLOAD_ATTEMPTS:
+                raise
+            time.sleep(attempt)
 
 
 def run(
@@ -287,6 +312,7 @@ def run(
     day_step=1,
     max_workers=2,
     compress_pdfs=False,
+    dist_code: Optional[str] = None,
 ):
     """
     Run the downloader with explicit date ranges.
@@ -388,6 +414,7 @@ def run(
         else None
     )
     pending_upload: Optional[concurrent.futures.Future] = None
+    task_failures = []
 
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
@@ -414,7 +441,13 @@ def run(
 
         # Generate tasks for this specific court
         tasks = list[CourtDateTask](
-            generate_tasks([court_code], court_start, end_date, day_step)
+            generate_tasks(
+                [court_code],
+                court_start,
+                end_date,
+                day_step,
+                dist_code=dist_code,
+            )
         )
 
         if not tasks:
@@ -425,7 +458,7 @@ def run(
 
         # Scrape this court in the foreground, then hand the upload off to
         # the background worker so we can start the next court immediately.
-        _run_tasks(tasks, max_workers, compress_pdfs)
+        task_failures.extend(_run_tasks(tasks, max_workers, compress_pdfs))
 
         if S3_ENABLED:
             end_date_obj = (
@@ -444,23 +477,41 @@ def run(
     if upload_executor is not None:
         upload_executor.shutdown(wait=True)
 
+    if task_failures:
+        failed_tasks = "\n".join(
+            f"- {task}: {error}" for task, error in task_failures
+        )
+        raise RuntimeError(f"{len(task_failures)} task(s) failed:\n{failed_tasks}")
+
     logger.info("All download tasks completed")
 
 
 def _run_tasks(tasks, max_workers, compression_enabled=False):
     """Run download tasks without S3 upload"""
+    failures = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         with tqdm(total=len(tasks), desc="Processing tasks", unit="task") as pbar:
-            for i, result in enumerate(
-                executor.map(
-                    lambda task: process_task(task, compression_enabled), tasks
-                )
-            ):
-                task = tasks[i]
+            future_to_task = {
+                executor.submit(process_task, task, compression_enabled): task
+                for task in tasks
+            }
+            for future in concurrent.futures.as_completed(future_to_task):
+                task = future_to_task[future]
                 pbar.set_description(
                     f"Processing {task.court_code} ({task.from_date} to {task.to_date})"
                 )
+                try:
+                    future.result()
+                except Exception as e:
+                    failures.append((task, e))
+                    logger.error(
+                        "Task failed after retries and will be reported after "
+                        "S3 sync: %s, error: %s",
+                        task,
+                        e,
+                    )
                 pbar.update(1)
+    return failures
 
 
 def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
@@ -556,6 +607,7 @@ def _upload_court_to_s3(court_code, end_date):
 
     total_on_disk = 0
     total_new = 0
+    upload_failures = []
 
     try:
         for bench in target_benches:
@@ -585,8 +637,15 @@ def _upload_court_to_s3(court_code, end_date):
                 new_files = {local_json_map[name] for name in new_basenames}
 
                 if year not in bench_files:
-                    bench_files[year] = {"metadata": set(), "data": set()}
+                    bench_files[year] = {
+                        "parquet_metadata": set(),
+                        "metadata": set(),
+                        "data": set(),
+                    }
 
+                bench_files[year]["parquet_metadata"] = set(
+                    json_files_by_year_partition[year]
+                )
                 bench_files[year]["metadata"] = new_files
             for year in pdf_files_by_year_partition.keys():
                 existing_pdf_files = set(get_existing_files_from_s3_v2(
@@ -603,42 +662,68 @@ def _upload_court_to_s3(court_code, end_date):
                 )
 
                 if year not in bench_files:
-                    bench_files[year] = {"metadata": set(), "data": set()}
+                    bench_files[year] = {
+                        "parquet_metadata": set(),
+                        "metadata": set(),
+                        "data": set(),
+                    }
 
                 bench_files[year]["data"] = new_pdf_files
 
+            synced_years = []
+            failed_years = set()
+
             for year, year_files in bench_files.items():
-                if year_files["metadata"]:
-                    upload_files_to_s3_v2(
-                        "metadata",
+                try:
+                    # Parquet must succeed before raw S3 indexes move forward.
+                    # Otherwise later runs will skip the raw files and the
+                    # parquet gap becomes sticky.
+                    success = create_and_upload_parquet_files(
                         year,
                         court_code_underscore,
                         bench,
-                        year_files["metadata"],
+                        {
+                            "metadata": year_files["parquet_metadata"],
+                            "data": year_files["data"],
+                        },
                     )
-                    cache_store.invalidate(year, court_code, bench, "metadata")
+                    if not success:
+                        raise RuntimeError(
+                            "parquet update failed before raw upload"
+                        )
 
-                if year_files["data"]:
-                    upload_files_to_s3_v2(
-                        "data", year, court_code_underscore, bench, year_files["data"]
-                    )
-                    cache_store.invalidate(year, court_code, bench, "data")
+                    if year_files["metadata"]:
+                        upload_files_to_s3_v2(
+                            "metadata",
+                            year,
+                            court_code_underscore,
+                            bench,
+                            year_files["metadata"],
+                        )
+                        cache_store.invalidate(year, court_code, bench, "metadata")
 
-                # upload parquet files
-                success = create_and_upload_parquet_files(
-                    year, court_code_underscore, bench, year_files
-                )
-                if not success:
-                    logger.error(
-                        f"Failed to upload parquet files for year {year}, bench {bench}, court {court_code_underscore}"
+                    if year_files["data"]:
+                        upload_files_to_s3_v2(
+                            "data", year, court_code_underscore, bench, year_files["data"]
+                        )
+                        cache_store.invalidate(year, court_code, bench, "data")
+
+                    synced_years.append(year)
+                except Exception as e:
+                    failed_years.add(year)
+                    message = (
+                        f"Failed to sync year {year} for bench {bench}, "
+                        f"court {court_code_underscore}: {e}"
                     )
+                    upload_failures.append(message)
+                    logger.error(message)
 
             # Advance the resume cursor for every year partition we know about
             # for this bench. We use the run's end_date (what we scraped
             # THROUGH) rather than max decision date, because the scrape
             # operates on decision-date ranges and end_date is the actual
             # boundary. Write to the data index so auto-detect sees it.
-            if end_date is not None:
+            if end_date is not None and not failed_years:
                 scraped_through_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)
                 # Write to all year partitions this bench has touched, plus
                 # the end_date's year (in case the bench has no files for it yet)
@@ -657,8 +742,9 @@ def _upload_court_to_s3(court_code, end_date):
             # Clean up only files that were successfully uploaded.
             # Files with unparseable dates were never uploaded and should be preserved.
             uploaded_files = []
-            for year_files in bench_files.values():
-                uploaded_files.extend(year_files.get("metadata", []))
+            for year in synced_years:
+                year_files = bench_files[year]
+                uploaded_files.extend(year_files.get("parquet_metadata", []))
                 uploaded_files.extend(year_files.get("data", []))
             for f in uploaded_files:
                 try:
@@ -675,9 +761,15 @@ def _upload_court_to_s3(court_code, end_date):
                     f"(unparseable dates or upload failures)"
                 )
 
+        if upload_failures:
+            raise RuntimeError(
+                "S3 sync completed with failures:\n- " + "\n- ".join(upload_failures)
+            )
+
     except Exception as e:
         print(f"Error during S3 upload: {e}")
         traceback.print_exc()
+        raise
 
 
 class Downloader:
@@ -753,9 +845,27 @@ class Downloader:
         )
         return results_exist
 
+    def _raise_for_terminal_search_error(self, res_dict):
+        """Surface exhausted API retries as task failures, not empty pages."""
+        if res_dict.get("session_expire") == "Y":
+            raise RuntimeError(
+                f"Search API session expired after retries for task {self.task}"
+            )
+        if "errormsg" in res_dict and "reportrow" not in res_dict:
+            raise RuntimeError(
+                f"Search API error after retries for task {self.task}: "
+                f"{res_dict.get('errormsg')}"
+            )
+
     def _prepare_next_iteration(self, search_payload):
         search_payload["sEcho"] += 1
         search_payload["iDisplayStart"] += page_size
+        return search_payload
+
+    def _restart_search_pagination(self, search_payload):
+        """Restart search pagination after creating a new portal session."""
+        search_payload["sEcho"] = 1
+        search_payload["iDisplayStart"] = 0
         return search_payload
 
     def process_court(self):
@@ -827,9 +937,6 @@ class Downloader:
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
-        if json_in_s3 and pdf_in_s3:
-            return "skip_s3"
-
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_local_pdf_present = self.is_pdf_downloaded(pdf_fragment)
         is_pdf_present = pdf_in_s3 or is_local_pdf_present
@@ -854,6 +961,8 @@ class Downloader:
             json.dump(metadata, f)
         if is_fresh_download:
             return "downloaded"
+        if json_in_s3 and pdf_in_s3:
+            return "skip_s3"
         if pdf_in_s3 and not json_in_s3:
             return "metadata_only"
         if is_local_pdf_present and not pdf_in_s3:
@@ -1044,6 +1153,7 @@ class Downloader:
             if _retry_count >= MAX_RETRIES:
                 logger.error(f"Giving up after {MAX_RETRIES} session_expire retries for {url}")
                 return response
+            self.init_user_session()
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
@@ -1144,6 +1254,8 @@ class Downloader:
         search_payload = self.default_search_payload()
         search_payload["from_date"] = self.task.from_date
         search_payload["to_date"] = self.task.to_date
+        if self.task.dist_code is not None:
+            search_payload["dist_code"] = self.task.dist_code
         self.init_user_session()
         search_payload["state_code"] = self.court_code
         search_payload["app_token"] = self.app_token
@@ -1157,6 +1269,7 @@ class Downloader:
             try:
                 response = self.request_api("POST", self.search_url, search_payload)
                 res_dict = response.json()
+                self._raise_for_terminal_search_error(res_dict)
                 if self._results_exist_in_search_response(res_dict):
                     self.task_stats["pages_fetched"] += 1
                     results = res_dict["reportrow"]["aaData"]
@@ -1190,10 +1303,15 @@ class Downloader:
                                 traceback.print_exc()
                                 result_pbar.update(1)
 
+                    # Re-fetch the same search page after a session refresh.
+                    # For backfills, most rows on the page are usually already
+                    # present and cheap to skip; avoiding smaller search pages
+                    # keeps the old-data path faster.
                     if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                         pdfs_downloaded = 0
                         self.task_stats["session_refreshes"] += 1
                         self.init_user_session()
+                        search_payload = self._restart_search_pagination(search_payload)
                         search_payload["app_token"] = self.app_token
                         continue
 
@@ -1205,7 +1323,7 @@ class Downloader:
             except Exception as e:
                 logger.error(f"Error processing task: {self.task}, {e}")
                 traceback.print_exc()
-                break
+                raise
 
         self._log_task_summary()
 
@@ -1266,6 +1384,15 @@ Examples:
     )
     parser.add_argument(
         "--day_step", type=int, default=1, help="Number of days per chunk"
+    )
+    parser.add_argument(
+        "--dist-code",
+        type=str,
+        default=None,
+        help=(
+            "Optional eCourts dist_code filter. For courts where the portal "
+            "uses Select Bench, this can scope a run to one bench."
+        ),
     )
     parser.add_argument(
         "--max_workers", type=int, default=2, help="Number of parallel workers"
@@ -1335,6 +1462,7 @@ Examples:
             args.day_step,
             args.max_workers,
             compress_pdfs=args.compress_pdfs,
+            dist_code=args.dist_code,
         )
 
 """

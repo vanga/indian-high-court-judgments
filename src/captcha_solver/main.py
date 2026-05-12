@@ -1,59 +1,66 @@
 # from https://huggingface.co/spaces/Acetde/captchabreaker/tree/main
-import torch
+import numpy as np
 import onnx
 import onnxruntime as rt
-from torchvision import transforms as T
-from src.captcha_solver.tokenizer_base import Tokenizer
 from PIL import Image
 
 model_file = "src/captcha_solver/captcha.onnx"
 img_size = (32, 128)
 charset = r"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"
-tokenizer_base = Tokenizer(charset)
+itos = (["[E]"] + list(charset) + ["[UNK]", "[B]", "[P]"])
+eos_id = 0
 
 
-def get_transform(img_size):
-    transforms = []
-    transforms.extend(
-        [
-            T.Resize(img_size, T.InterpolationMode.BICUBIC),
-            T.ToTensor(),
-            T.Normalize(0.5, 0.5),
-        ]
-    )
-    return T.Compose(transforms)
+def preprocess_image(img_obj):
+    # Match the old torchvision pipeline:
+    # Resize -> ToTensor -> Normalize(0.5, 0.5)
+    img = img_obj.convert("RGB").resize((img_size[1], img_size[0]), Image.BICUBIC)
+    arr = np.asarray(img, dtype=np.float32) / 255.0
+    arr = np.transpose(arr, (2, 0, 1))
+    arr = (arr - 0.5) / 0.5
+    return np.expand_dims(arr, axis=0)
 
 
-def to_numpy(tensor):
-    return (
-        tensor.detach().cpu().numpy() if tensor.requires_grad else tensor.cpu().numpy()
-    )
+def softmax(logits):
+    shifted = logits - np.max(logits, axis=-1, keepdims=True)
+    exp = np.exp(shifted)
+    return exp / np.sum(exp, axis=-1, keepdims=True)
+
+
+def decode_probs(probs):
+    ids = probs.argmax(axis=-1).tolist()
+    chars = []
+    for token_id in ids:
+        if token_id == eos_id:
+            break
+        if 0 <= token_id < len(itos):
+            token = itos[token_id]
+            if not token.startswith("["):
+                chars.append(token)
+    return "".join(chars)
 
 
 def initialize_model(model_file):
-    transform = get_transform(img_size)
     # Onnx model loading
     onnx_model = onnx.load(model_file)
     onnx.checker.check_model(onnx_model)
     ort_session = rt.InferenceSession(model_file)
-    return transform, ort_session
+    return ort_session
 
 
 def get_text(img_path):
     img_obj = Image.open(img_path)
     # Preprocess. Model expects a batch of images with shape: (B, C, H, W)
-    x = transform(img_obj.convert("RGB")).unsqueeze(0)
+    x = preprocess_image(img_obj)
 
     # compute ONNX Runtime output prediction
-    ort_inputs = {ort_session.get_inputs()[0].name: to_numpy(x)}
+    ort_inputs = {ort_session.get_inputs()[0].name: x}
     logits = ort_session.run(None, ort_inputs)[0]
-    probs = torch.tensor(logits).softmax(-1)
-    preds, probs = tokenizer_base.decode(probs)
-    preds = preds[0]
-    return preds
+    probs = softmax(logits)
+    return decode_probs(probs[0])
 
 
-transform, ort_session = initialize_model(model_file=model_file)
+ort_session = initialize_model(model_file=model_file)
 
 
 # if __name__ == "__main__":

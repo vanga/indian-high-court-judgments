@@ -9,5 +9,3 @@ pyexiftool
 pydantic
 onnx
 onnxruntime
-torch==2.9.0
-torchvision==0.24.0
