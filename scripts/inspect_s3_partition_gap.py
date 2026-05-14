@@ -8,11 +8,16 @@ import io
 import json
 import os
 import re
+import sys
 from collections import Counter
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 import boto3
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils.court_utils import to_s3_format  # noqa: E402
 
 
 BUCKET = "indian-high-court-judgments"
@@ -73,7 +78,7 @@ def main() -> None:
     parser.add_argument("--sample", type=int, default=10)
     args = parser.parse_args()
 
-    court = args.court.replace("~", "_")
+    court = to_s3_format(args.court)
     year = args.year
     s3 = boto3.client("s3")
 

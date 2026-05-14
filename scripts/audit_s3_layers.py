@@ -6,10 +6,16 @@ from __future__ import annotations
 import argparse
 import io
 import json
+import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 import boto3
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils.court_utils import to_s3_format  # noqa: E402
 
 
 BUCKET = "indian-high-court-judgments"
@@ -90,7 +96,7 @@ def parquet_stats(s3, prefix: str) -> ParquetStats:
 
 
 def audit_partition(s3, court: str, year: int) -> dict:
-    court = court.replace("~", "_")
+    court = to_s3_format(court)
     return {
         "court": court,
         "year": year,

@@ -13,6 +13,7 @@ import csv
 import gzip
 import io
 import json
+import sys
 import tempfile
 import tarfile
 from dataclasses import dataclass, field
@@ -21,6 +22,10 @@ from typing import Iterable
 
 import boto3
 import pandas as pd
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+
+from src.utils.court_utils import to_s3_format  # noqa: E402
 
 
 BUCKET = "indian-high-court-judgments"
@@ -386,7 +391,7 @@ def main() -> None:
     args = parser.parse_args()
 
     years = parse_years(args.years)
-    courts = {c.strip().replace("~", "_") for c in args.courts.split(",")} if args.courts else None
+    courts = {to_s3_format(c.strip()) for c in args.courts.split(",")} if args.courts else None
 
     s3 = boto3.client("s3")
     partitions = discover_partitions(s3, args.data_type)

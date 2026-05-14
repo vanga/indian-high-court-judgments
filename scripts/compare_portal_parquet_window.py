@@ -16,7 +16,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from download import CourtDateTask, Downloader, page_size  # noqa: E402
-from src.utils.court_utils import from_s3_format  # noqa: E402
+from src.utils.court_utils import from_s3_format, to_s3_format  # noqa: E402
 from src.utils.html_utils import parse_case_details_from_html  # noqa: E402
 
 
@@ -89,7 +89,7 @@ def iter_objects(s3, prefix: str):
 
 
 def parquet_records(court: str, start: date, end: date):
-    court = court.replace("~", "_")
+    court = to_s3_format(court)
     s3 = boto3.client("s3")
     records = []
     for year in range(start.year, end.year + 1):

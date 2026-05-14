@@ -8,6 +8,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import random
 import re
 import sys
 import threading
@@ -302,7 +303,7 @@ def process_task(task: CourtDateTask, compression_enabled=False):
             traceback.print_exc()
             if attempt >= TASK_DOWNLOAD_ATTEMPTS:
                 raise
-            time.sleep(attempt)
+            time.sleep(attempt + random.uniform(0, 1))
 
 
 def run(
@@ -862,10 +863,9 @@ class Downloader:
         search_payload["iDisplayStart"] += page_size
         return search_payload
 
-    def _restart_search_pagination(self, search_payload):
-        """Restart search pagination after creating a new portal session."""
+    def _refresh_search_pagination(self, search_payload):
+        """Refresh search pagination state without rewinding the current page."""
         search_payload["sEcho"] = 1
-        search_payload["iDisplayStart"] = 0
         return search_payload
 
     def process_court(self):
@@ -979,12 +979,20 @@ class Downloader:
         pdf_link_response = self.request_api(
             "POST", self.pdf_link_url, pdf_link_payload
         )
-        if "outputfile" not in pdf_link_response.json():
+        try:
+            pdf_link_data = pdf_link_response.json()
+        except Exception as e:
             logger.error(
-                f"Error downloading pdf, task: {self.task}, Error: {pdf_link_response.json()}"
+                f"Error downloading pdf, task: {self.task}, "
+                f"non-json PDF link response: {e}"
             )
             return False
-        pdf_download_link = pdf_link_response.json()["outputfile"]
+        if "outputfile" not in pdf_link_data:
+            logger.error(
+                f"Error downloading pdf, task: {self.task}, Error: {pdf_link_data}"
+            )
+            return False
+        pdf_download_link = pdf_link_data["outputfile"]
 
         # download pdf and save
         pdf_response = requests.request(
@@ -995,7 +1003,7 @@ class Downloader:
             timeout=30,
         )
         pdf_output_path.parent.mkdir(parents=True, exist_ok=True)
-        # number of response butes
+        # number of response bytes
         no_of_bytes = len(pdf_response.content)
         if no_of_bytes == 0:
             logger.error(
@@ -1005,6 +1013,19 @@ class Downloader:
         if no_of_bytes == 315:
             logger.error(
                 f"404 pdf response, task: {self.task}, output path: {pdf_output_path}"
+            )
+            return False
+        if pdf_response.status_code != 200:
+            logger.error(
+                f"Unexpected pdf status {pdf_response.status_code}, "
+                f"task: {self.task}, output path: {pdf_output_path}"
+            )
+            return False
+        if not pdf_response.content.startswith(b"%PDF"):
+            logger.error(
+                f"Non-PDF response while downloading pdf, task: {self.task}, "
+                f"output path: {pdf_output_path}, first bytes: "
+                f"{pdf_response.content[:32]!r}"
             )
             return False
         with open(pdf_output_path, "wb") as f:
@@ -1311,7 +1332,7 @@ class Downloader:
                         pdfs_downloaded = 0
                         self.task_stats["session_refreshes"] += 1
                         self.init_user_session()
-                        search_payload = self._restart_search_pagination(search_payload)
+                        search_payload = self._refresh_search_pagination(search_payload)
                         search_payload["app_token"] = self.app_token
                         continue
 

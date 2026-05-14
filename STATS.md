@@ -1,72 +1,77 @@
 # Dataset Size
 
-> **Snapshot as of October 2025.** These numbers are a point-in-time view. Daily scraping adds new judgments continuously, so the totals below will drift. To regenerate, run `python stats.py` against a local copy of the index files (`../output/data/tar`).
+> **Snapshot as of May 12, 2026.** These numbers are a point-in-time view generated from S3 `metadata.index.json` and `data.index.json` records, with raw S3 object bytes from the same audit. Daily scraping adds new judgments continuously, so the totals below will drift.
 
 ## Totals
 
 | | |
-|---|---|
-| Total size | **1,136.70 GB** (1.11 TB) |
-| Courts | 25 |
-| Year with highest volume | 2025 (189.20 GB) |
-| Court with highest volume | High Court of Punjab and Haryana (`3~22`, 137.17 GB) |
+|---|---:|
+| Judgments/PDFs | **17,529,700** |
+| Metadata records | **17,562,397** |
+| Total raw size | **1,380.54 GiB** (1.35 TiB) |
+| Courts | **25** |
+| Benches | **45** |
+| Years covered | **1950-2026** |
+| Year with highest volume | **2025** (272.47 GiB, 1,410,994 PDFs) |
+| Court with highest volume | **High Court of Punjab and Haryana** (`3~22`, 157.39 GiB, 1,816,440 PDFs) |
 
-## By court
+## By Court
 
-| Code   | Court                             | Size (GB) |
-| ------ | --------------------------------- | --------: |
-| 3~22   | High Court of Punjab and Haryana  |    137.17 |
-| 33~10  | Madras High Court                 |    114.88 |
-| 36~29  | High Court for State of Telangana |     92.80 |
-| 28~2   | High Court of Andhra Pradesh      |     87.84 |
-| 10~8   | Patna High Court                  |     74.23 |
-| 32~4   | High Court of Kerala              |     72.25 |
-| 8~9    | High Court of Rajasthan           |     65.38 |
-| 21~11  | High Court of Orissa              |     65.03 |
-| 9~13   | Allahabad High Court              |     63.64 |
-| 22~18  | High Court of Chhattisgarh        |     56.08 |
-| 27~1   | Bombay High Court                 |     53.13 |
-| 29~3   | High Court of Karnataka           |     47.76 |
-| 23~23  | High Court of Madhya Pradesh      |     37.87 |
-| 7~26   | High Court of Delhi               |     34.19 |
-| 20~7   | High Court of Jharkhand           |     29.28 |
-| 19~16  | Calcutta High Court               |     21.67 |
-| 24~17  | High Court of Gujarat             |     19.68 |
-| 2~5    | High Court of Himachal Pradesh    |     19.51 |
-| 18~6   | Gauhati High Court                |     16.01 |
-| 1~12   | High Court of Jammu and Kashmir   |     14.29 |
-| 5~15   | High Court of Uttarakhand         |      6.41 |
-| 16~20  | High Court of Tripura             |      3.61 |
-| 14~25  | High Court of Manipur             |      2.10 |
-| 17~21  | High Court of Meghalaya           |      1.28 |
-| 11~24  | High Court of Sikkim              |      0.62 |
+| Code | Court | PDFs | Metadata | Size (GiB) |
+|---|---|---:|---:|---:|
+| 3~22 | High Court of Punjab and Haryana | 1,816,440 | 1,817,630 | 157.39 |
+| 33~10 | Madras High Court | 1,655,809 | 1,655,848 | 147.18 |
+| 36~29 | High Court for State of Telangana | 1,041,098 | 1,042,230 | 131.76 |
+| 28~2 | High Court of Andhra Pradesh | 299,949 | 300,285 | 114.41 |
+| 10~8 | Patna High Court | 1,686,448 | 1,686,480 | 90.51 |
+| 32~4 | High Court of Kerala | 1,035,971 | 1,035,979 | 79.17 |
+| 21~11 | High Court of Orissa | 776,613 | 776,887 | 78.77 |
+| 8~9 | High Court of Rajasthan | 1,088,365 | 1,088,702 | 74.69 |
+| 9~13 | Allahabad High Court | 1,605,105 | 1,635,167 | 71.45 |
+| 22~18 | High Court of Chhattisgarh | 550,944 | 550,902 | 63.19 |
+| 27~1 | Bombay High Court | 1,772,444 | 1,772,868 | 61.60 |
+| 29~3 | High Court of Karnataka | 880,557 | 880,400 | 60.03 |
+| 7~26 | High Court of Delhi | 397,886 | 397,228 | 43.75 |
+| 23~23 | High Court of Madhya Pradesh | 650,641 | 650,646 | 42.58 |
+| 20~7 | High Court of Jharkhand | 448,985 | 448,976 | 34.93 |
+| 19~16 | Calcutta High Court | 400,906 | 400,908 | 27.91 |
+| 2~5 | High Court of Himachal Pradesh | 276,288 | 276,136 | 23.03 |
+| 24~17 | High Court of Gujarat | 420,023 | 420,010 | 22.58 |
+| 18~6 | Gauhati High Court | 315,684 | 315,686 | 19.18 |
+| 1~12 | High Court of Jammu and Kashmir | 111,153 | 111,051 | 18.20 |
+| 5~15 | High Court of Uttarakhand | 231,869 | 231,870 | 8.96 |
+| 16~20 | High Court of Tripura | 33,730 | 33,726 | 4.32 |
+| 14~25 | High Court of Manipur | 18,159 | 18,149 | 2.72 |
+| 17~21 | High Court of Meghalaya | 12,230 | 12,230 | 1.54 |
+| 11~24 | High Court of Sikkim | 2,403 | 2,403 | 0.70 |
 
-## By year
+## By Year
 
-Pre-2003 years each contribute less than 1 GB and are omitted for brevity. Full year-by-year data is in `stats_by_year.csv` after running `stats.py`.
+Pre-2003 years each contribute less than 1 GiB and are omitted for brevity.
 
-| Year | Size (GB) |
-| :--- | --------: |
-| 2003 |      0.87 |
-| 2004 |      1.56 |
-| 2005 |      2.71 |
-| 2006 |      4.62 |
-| 2007 |      9.42 |
-| 2008 |     11.27 |
-| 2009 |     15.32 |
-| 2010 |     20.85 |
-| 2011 |     27.25 |
-| 2012 |     27.56 |
-| 2013 |     27.46 |
-| 2014 |     31.05 |
-| 2015 |     35.31 |
-| 2016 |     37.03 |
-| 2017 |     41.30 |
-| 2018 |     62.14 |
-| 2019 |     72.37 |
-| 2020 |     53.07 |
-| 2021 |     81.23 |
-| 2022 |    124.62 |
-| 2023 |    134.76 |
-| 2024 |    124.78 |
-| 2025 |    189.20 |
+| Year | PDFs | Metadata | Size (GiB) |
+|---:|---:|---:|---:|
+| 2003 | 15,410 | 15,429 | 0.98 |
+| 2004 | 50,480 | 50,484 | 2.06 |
+| 2005 | 102,052 | 102,057 | 3.33 |
+| 2006 | 128,547 | 128,569 | 5.35 |
+| 2007 | 195,367 | 195,461 | 10.54 |
+| 2008 | 270,564 | 270,673 | 12.94 |
+| 2009 | 337,115 | 337,441 | 17.32 |
+| 2010 | 404,443 | 404,643 | 23.38 |
+| 2011 | 469,313 | 469,588 | 30.30 |
+| 2012 | 553,042 | 553,496 | 30.99 |
+| 2013 | 594,315 | 594,469 | 31.05 |
+| 2014 | 667,272 | 667,306 | 35.09 |
+| 2015 | 795,050 | 795,095 | 40.18 |
+| 2016 | 861,831 | 862,027 | 42.21 |
+| 2017 | 875,330 | 875,357 | 46.81 |
+| 2018 | 1,215,450 | 1,245,565 | 69.07 |
+| 2019 | 1,328,416 | 1,328,460 | 79.44 |
+| 2020 | 833,177 | 833,275 | 58.14 |
+| 2021 | 1,200,860 | 1,201,472 | 89.15 |
+| 2022 | 1,695,756 | 1,696,079 | 137.10 |
+| 2023 | 1,764,888 | 1,765,074 | 148.37 |
+| 2024 | 1,359,385 | 1,359,388 | 148.57 |
+| 2025 | 1,410,994 | 1,409,692 | 272.47 |
+| 2026 | 343,789 | 344,253 | 44.49 |
