@@ -1,6 +1,7 @@
 """S3 utility functions for uploading, downloading, and managing index files."""
 
 import logging
+import io
 import os
 import shutil
 import tarfile
@@ -80,6 +81,116 @@ def read_updated_at_from_index(s3, bucket, key):
     except Exception as e:
         print(f"Warning: Failed to read {key}: {e}")
         return None
+
+
+def _build_parquet_dedupe_key_frame(df):
+    """Build a stable dedupe key for parquet rows.
+
+    Prefer `cnr + decision_date` when present. CNR identifies the case, while
+    decision_date keeps distinct dated judgment/order records for the same case.
+    Fall back to `pdf_link` only when the logical key is incomplete.
+    """
+    if "cnr" in df.columns:
+        cnr = df["cnr"].astype("string").fillna("").str.strip()
+    else:
+        cnr = None
+
+    if "decision_date" in df.columns:
+        decision_date = df["decision_date"].astype("string").fillna("").str.strip()
+    else:
+        decision_date = None
+
+    if "pdf_link" in df.columns:
+        pdf_link = df["pdf_link"].astype("string").fillna("").str.strip()
+    else:
+        pdf_link = None
+
+    if cnr is None and pdf_link is None:
+        return pd.Series([""] * len(df), index=df.index, dtype="string")
+
+    if cnr is None or decision_date is None:
+        return "pdf:" + pdf_link
+
+    logical_key = "cnr:" + cnr + "|decision_date:" + decision_date
+    has_logical_key = (cnr != "") & (decision_date != "")
+
+    if pdf_link is None:
+        return logical_key.where(has_logical_key, "")
+
+    return logical_key.where(has_logical_key, "pdf:" + pdf_link)
+
+
+def dedupe_parquet_records(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Drop duplicate logical rows from a parquet frame.
+
+    The parquet writer historically deduped on `pdf_link`, which misses the
+    repeated-CNR/same-decision-date cases we observed. This helper prefers
+    `cnr + decision_date` and only falls back to `pdf_link` when needed.
+    """
+    if df.empty:
+        return df
+
+    key = _build_parquet_dedupe_key_frame(df)
+    if "_dedupe_key" in df.columns:
+        df = df.drop(columns=["_dedupe_key"])
+    df = df.copy()
+    df["_dedupe_key"] = key
+    before = len(df)
+    df = df.drop_duplicates(subset=["_dedupe_key"], keep="last").drop(
+        columns=["_dedupe_key"]
+    )
+    after = len(df)
+    if after != before:
+        print(f"  Removed {before - after} duplicate parquet records")
+    return df
+
+
+def filter_parquet_records_against_keys(
+    df: "pd.DataFrame", existing_keys: set[str]
+) -> "pd.DataFrame":
+    """Remove records whose logical key already exists elsewhere in S3.
+
+    This is used for court-year parquet regeneration so a repeated logical row
+    survives in one bench parquet file, not in every bench partition.
+    """
+    if df.empty or not existing_keys:
+        return df
+
+    key = _build_parquet_dedupe_key_frame(df)
+    mask = ~key.isin(existing_keys)
+    removed = int((~mask).sum())
+    if removed:
+        print(f"  Removed {removed} parquet records already present in sibling benches")
+    return df.loc[mask].copy()
+
+
+def _load_existing_parquet_keys_for_court_year(
+    year: int, court_code: str, exclude_bench: str
+) -> set[str]:
+    """Load logical keys from sibling bench parquet files for a court-year."""
+    if not PANDAS_AVAILABLE:
+        return set()
+
+    existing_keys: set[str] = set()
+    prefix = f"metadata/parquet/year={year}/court={court_code}/"
+    paginator = s3_client.get_paginator("list_objects_v2")
+    for page in paginator.paginate(Bucket=S3_BUCKET, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            if not key.endswith("/metadata.parquet"):
+                continue
+            if f"/bench={exclude_bench}/" in key:
+                continue
+            try:
+                body = s3_client.get_object(Bucket=S3_BUCKET, Key=key)["Body"].read()
+                sibling = pd.read_parquet(
+                    io.BytesIO(body), columns=["cnr", "decision_date", "pdf_link"]
+                )
+            except Exception as e:
+                print(f"  Warning: Could not read sibling parquet {key}: {e}")
+                continue
+            existing_keys.update(_build_parquet_dedupe_key_frame(sibling).dropna().tolist())
+    return existing_keys
 
 
 # Filename date pattern: e.g. "UPHC020313492024_1_2025-10-07.pdf" -> "2025-10-07"
@@ -881,29 +992,28 @@ def create_and_upload_parquet_files(
 
             # Combine existing and new data
             if existing_data is not None:
-                # Concatenate and remove duplicates based on a unique column (e.g., pdf_link)
                 combined_data = pd.concat(
-                    [existing_data, new_data], ignore_index=True)
-
-                # Remove duplicates if pdf_link column exists
-                if "pdf_link" in combined_data.columns:
-                    before_dedup = len(combined_data)
-                    combined_data = combined_data.drop_duplicates(
-                        subset=["pdf_link"], keep="last"
-                    )
-                    after_dedup = len(combined_data)
-                    duplicates_removed = before_dedup - after_dedup
-                    if duplicates_removed > 0:
-                        print(
-                            f"Removed {duplicates_removed} duplicate records")
-                else:
-                    print(f"No pdf_link column found, keeping all records")
+                    [existing_data, new_data], ignore_index=True
+                )
+                combined_data = dedupe_parquet_records(combined_data)
+                sibling_keys = _load_existing_parquet_keys_for_court_year(
+                    year, court_code, bench
+                )
+                combined_data = filter_parquet_records_against_keys(
+                    combined_data, sibling_keys
+                )
 
                 print(
                     f"Combined parquet: {len(existing_data)} existing + {len(new_data)} new = {len(combined_data)} total records"
                 )
             else:
-                combined_data = new_data
+                combined_data = dedupe_parquet_records(new_data)
+                sibling_keys = _load_existing_parquet_keys_for_court_year(
+                    year, court_code, bench
+                )
+                combined_data = filter_parquet_records_against_keys(
+                    combined_data, sibling_keys
+                )
                 print(f"New parquet file with {len(combined_data)} records")
 
             # Save combined data to final parquet file
