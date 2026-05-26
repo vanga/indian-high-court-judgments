@@ -148,6 +148,12 @@ page_size = 1000
 NO_CAPTCHA_BATCH_SIZE = 25
 lock = threading.Lock()
 
+# Portal bench filters confirmed from browser network captures. These split
+# dense courts into smaller search payloads and avoid repeated session expiry.
+DEFAULT_DIST_CODES_BY_COURT = {
+    "33~10": ("1", "2"),  # Madras: hc_cis_mas, mdubench
+}
+
 captcha_failures_dir = Path("./captcha-failures")
 captcha_tmp_dir = Path("./captcha-tmp")
 captcha_failures_dir.mkdir(parents=True, exist_ok=True)
@@ -259,6 +265,7 @@ def generate_tasks(
     end_date: Optional[str] = None,
     day_step: int = 1,
     dist_code: Optional[str] = None,
+    use_default_dist_codes: bool = True,
 ) -> Generator[CourtDateTask, None, None]:
     """Generate tasks for processing courts and date ranges as a generator"""
     all_court_codes = get_court_codes()
@@ -277,10 +284,20 @@ def generate_tasks(
         court_codes = normalized_codes
 
     for code in court_codes:
+        if dist_code is not None:
+            dist_codes = (dist_code,)
+        elif use_default_dist_codes:
+            dist_codes = DEFAULT_DIST_CODES_BY_COURT.get(code, (None,))
+        else:
+            dist_codes = (None,)
+
         for from_date, to_date in get_date_ranges_to_process(
             code, start_date, end_date, day_step
         ):
-            yield CourtDateTask(code, from_date, to_date, dist_code=dist_code)
+            for task_dist_code in dist_codes:
+                yield CourtDateTask(
+                    code, from_date, to_date, dist_code=task_dist_code
+                )
 
 
 def process_task(task: CourtDateTask, compression_enabled=False):
@@ -314,6 +331,7 @@ def run(
     max_workers=2,
     compress_pdfs=False,
     dist_code: Optional[str] = None,
+    use_default_dist_codes: bool = True,
 ):
     """
     Run the downloader with explicit date ranges.
@@ -402,6 +420,20 @@ def run(
         target_courts = court_codes
 
     print(f"Processing {len(target_courts)} court(s): {', '.join(target_courts)}")
+    if dist_code is not None:
+        print(f"Using explicit dist_code={dist_code} for all generated tasks")
+    elif use_default_dist_codes:
+        active_defaults = {
+            court: DEFAULT_DIST_CODES_BY_COURT[court]
+            for court in target_courts
+            if court in DEFAULT_DIST_CODES_BY_COURT
+        }
+        if active_defaults:
+            formatted = ", ".join(
+                f"{court}={','.join(codes)}"
+                for court, codes in active_defaults.items()
+            )
+            print(f"Using default dist_code splits for: {formatted}")
 
     # Single background uploader so scraping for court N+1 can start while
     # court N's tar/parquet upload is still running. Queue depth is bounded
@@ -448,6 +480,7 @@ def run(
                 end_date,
                 day_step,
                 dist_code=dist_code,
+                use_default_dist_codes=use_default_dist_codes,
             )
         )
 
@@ -1412,7 +1445,18 @@ Examples:
         default=None,
         help=(
             "Optional eCourts dist_code filter. For courts where the portal "
-            "uses Select Bench, this can scope a run to one bench."
+            "uses Select Bench, this scopes a run to one bench and overrides "
+            "the built-in default splits."
+        ),
+    )
+    parser.add_argument(
+        "--default-dist-codes",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Use built-in eCourts dist_code splits for known high-volume courts. "
+            "Enabled by default; pass --no-default-dist-codes to force an "
+            "unfiltered court-level search."
         ),
     )
     parser.add_argument(
@@ -1484,6 +1528,7 @@ Examples:
             args.max_workers,
             compress_pdfs=args.compress_pdfs,
             dist_code=args.dist_code,
+            use_default_dist_codes=args.default_dist_codes,
         )
 
 """
