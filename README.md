@@ -7,10 +7,44 @@ An open dataset of judgments from 25 Indian High Courts, scraped from the [eCour
 - **Download the dataset**: [AWS Open Data Registry](https://registry.opendata.aws/indian-high-court-judgments/)
 - **License**: [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) — free to use, share, and adapt with attribution
 - **Storage & transfer**: sponsored by AWS
-- **Size**: 17.5M judgments, ~1.35 TiB across all years. See [STATS.md](STATS.md) for a breakdown by court and year.
+- **Size**: 17.8M judgments, ~1.25 TiB of S3 tar archives across all years. See [STATS.md](STATS.md) for a breakdown by court and year.
 - **Collaborate / ask questions**: [Discord](https://discord.gg/mQhghxCRJU)
 
 > **Please scrape responsibly.** The eCourts portal is a public service — avoid high-concurrency scraping and be considerate of the maintainers. If you just want the data, use the AWS Open Data link above instead of running the scraper.
+>
+> **Please prefer tar archives over individual files.** The bucket contains millions of PDFs and JSON files. Downloading each object individually is slow and creates a very large number of S3 requests. For bulk use, sync the `data/tar/`, `metadata/tar/`, or `metadata/parquet/` prefixes and re-run the same `aws s3 sync` command periodically to fetch only changed objects.
+
+## Downloading from S3
+
+The public bucket can be read without AWS credentials by passing `--no-sign-request` to the AWS CLI.
+
+Prefer these paths:
+
+- `data/tar/` for judgment PDFs packaged as tar archives.
+- `metadata/tar/` for raw metadata JSON packaged as tar archives.
+- `metadata/parquet/` for structured metadata that can be queried with Athena, DuckDB, Spark, or pandas.
+
+Examples:
+
+```bash
+# Download all PDF tar archives for one court
+aws s3 sync s3://indian-high-court-judgments/data/tar/ ./data/tar/ \
+  --exclude "*" \
+  --include "*/court=27_1/*" \
+  --no-sign-request
+
+# Download all structured metadata parquet files
+aws s3 sync s3://indian-high-court-judgments/metadata/parquet/ ./metadata/parquet/ \
+  --no-sign-request
+
+# Refresh a local mirror later; sync only transfers new or changed objects
+aws s3 sync s3://indian-high-court-judgments/data/tar/ ./data/tar/ \
+  --exclude "*" \
+  --include "*/court=27_1/*" \
+  --no-sign-request
+```
+
+Avoid syncing `data/pdf/` or `metadata/json/` for bulk use unless you specifically need individual objects. The tar and parquet layouts are the intended bulk-download interfaces.
 
 ## Court codes
 

@@ -4,6 +4,15 @@ Refer to the [athena doc](../ATHENA.md) for more information on how to query the
 
 This script processes tar archives containing PDF files of Indian High Court judgments stored in an AWS S3 bucket. It extracts text from these PDFs, converts them into a structured text format (JSON-like), compresses them into a `tar.gz` archive, and uploads the results to a specified output S3 bucket.
 
+For bulk downloads, prefer the dataset's tar archives instead of syncing individual PDF objects. Use `aws s3 sync` on `data/tar/` and re-run the same command periodically to fetch only new or changed archives:
+
+```bash
+aws s3 sync s3://indian-high-court-judgments/data/tar/ ./data/tar/ \
+  --exclude "*" \
+  --include "*/court=27_1/*" \
+  --no-sign-request
+```
+
 ---
 
 ## 📦 Features
@@ -19,15 +28,15 @@ This script processes tar archives containing PDF files of Indian High Court jud
 
 ## 📁 Input S3 Structure
 
-The script expects tar files (`pdfs.tar`) stored in the following path structure within the source bucket:
+The script expects PDF tar files stored in the following path structure within the source bucket:
 
 ```
-data/tar/year=<YEAR>/court=<COURT>/bench=<BENCH>/pdfs.tar
+data/tar/year=<YEAR>/court=<COURT>/bench=<BENCH>/<part_name>.tar
 ```
 
 Example:
 ```
-data/tar/year=2023/court=11_24/bench=sikkimhc_pg/pdfs.tar
+data/tar/year=2023/court=11_24/bench=sikkimhc_pg/part-2025-10-23T071214.tar
 ```
 
 ---
@@ -94,7 +103,7 @@ OUTPUT_BUCKET_NAME/data/text-tars/year=2025/court=1_12/bench=kashmirhc/texts.tar
 ## 🧪 Processing Steps
 
 1. **Find Tar Files**  
-   Searches S3 for files ending in `pdfs.tar` matching the optional filters.
+   Searches S3 for `.tar` files matching the optional filters.
 
 2. **Download + Extract**  
    Downloads and extracts tar files to a temporary local directory.

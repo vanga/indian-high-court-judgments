@@ -64,7 +64,7 @@ class PDFProcessor:
             ):
                 if "Contents" in page:
                     for obj in page["Contents"]:
-                        if obj["Key"].endswith("pdfs.tar"):
+                        if obj["Key"].endswith(".tar"):
                             tar_files.append(obj["Key"])
 
             logger.info(f"Found {len(tar_files)} tar files matching criteria")
@@ -105,7 +105,7 @@ class PDFProcessor:
     def _build_output_prefix_for_tar(self, tar_key: str) -> str:
         """Build S3 prefix for output files based on the tar file's parent path."""
         # Extract parent directory from tar file path
-        # e.g., "data/tar/year=2023/court=SC/bench=1/pdfs.tar" -> "data/tar/year=2023/court=SC/bench=1/"
+        # e.g., "data/tar/year=2023/court=SC/bench=1/part-1.tar" -> "data/tar/year=2023/court=SC/bench=1/"
         parent_path = "/".join(tar_key.split("/")[:-1])
 
         # Replace "data/tar" with "data/text-tars"
@@ -196,7 +196,7 @@ class PDFProcessor:
             output_prefix = self._build_output_prefix_for_tar(tar_key)
 
             with tempfile.TemporaryDirectory() as temp_dir:
-                tar_path = os.path.join(temp_dir, "pdfs.tar")
+                tar_path = os.path.join(temp_dir, os.path.basename(tar_key))
                 if not self.download_tar_file(tar_key, tar_path):
                     logger.error(f"Skipping {tar_key} due to download failure")
                     continue
