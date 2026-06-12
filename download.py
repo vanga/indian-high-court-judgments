@@ -50,6 +50,12 @@ from src.utils.s3_utils import (
 S3_ENABLED = False
 DAILY_UPDATE_BUFFER_DAYS = 14
 TASK_DOWNLOAD_ATTEMPTS = 3
+# Tolerance for transient task failures before failing the whole run. Failed
+# ranges auto-resume next run (their court's last-downloaded date never
+# advances), so a few transient failures shouldn't paint CI red. Fail hard only
+# when failures are widespread (ratio) or large in absolute terms (count).
+FAILURE_RATIO_THRESHOLD = 0.2
+FAILURE_COUNT_THRESHOLD = 10
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -448,6 +454,7 @@ def run(
     )
     pending_upload: Optional[concurrent.futures.Future] = None
     task_failures = []
+    total_tasks = 0
 
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
@@ -492,6 +499,7 @@ def run(
 
         # Scrape this court in the foreground, then hand the upload off to
         # the background worker so we can start the next court immediately.
+        total_tasks += len(tasks)
         task_failures.extend(_run_tasks(tasks, max_workers, compress_pdfs))
 
         if S3_ENABLED:
@@ -515,7 +523,27 @@ def run(
         failed_tasks = "\n".join(
             f"- {task}: {error}" for task, error in task_failures
         )
-        raise RuntimeError(f"{len(task_failures)} task(s) failed:\n{failed_tasks}")
+        # Failed ranges never advance their court's last-downloaded date, so the
+        # exact same ranges are retried automatically on the next run. A handful
+        # of transient failures (e.g. eCourts session expiry) therefore don't
+        # warrant a red CI run — only fail hard when failures are widespread.
+        n_failed = len(task_failures)
+        failure_ratio = n_failed / total_tasks if total_tasks else 1.0
+        fatal = failure_ratio > FAILURE_RATIO_THRESHOLD or n_failed > FAILURE_COUNT_THRESHOLD
+        if fatal:
+            raise RuntimeError(
+                f"{n_failed}/{total_tasks} task(s) failed "
+                f"({failure_ratio:.0%} > {FAILURE_RATIO_THRESHOLD:.0%} or "
+                f"count > {FAILURE_COUNT_THRESHOLD}):\n{failed_tasks}"
+            )
+        logger.warning(
+            "%d/%d task(s) failed transiently (%.0f%%); within tolerance, "
+            "will resume on next run:\n%s",
+            n_failed,
+            total_tasks,
+            failure_ratio * 100,
+            failed_tasks,
+        )
 
     logger.info("All download tasks completed")
 
@@ -1170,7 +1198,7 @@ class Downloader:
         logger.debug("Refreshed token")
 
     def request_api(self, method, url, payload, _retry_count=0, **kwargs):
-        MAX_RETRIES = 3
+        MAX_RETRIES = 5
         headers = self.get_headers()
         logger.debug(
             f"api_request {self.session_id} {payload.get('app_token') if payload else None} {url}"
@@ -1207,6 +1235,7 @@ class Downloader:
             if _retry_count >= MAX_RETRIES:
                 logger.error(f"Giving up after {MAX_RETRIES} session_expire retries for {url}")
                 return response
+            self._sleep_backoff(_retry_count)
             self.init_user_session()
             self.refresh_token()
             if payload:
@@ -1219,12 +1248,26 @@ class Downloader:
                 logger.error(f"Giving up after {MAX_RETRIES} errormsg retries for {url}: {response_dict.get('errormsg')}")
                 return response
             logger.debug(f"Error {response_dict['errormsg']}")
+            self._sleep_backoff(_retry_count)
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
             return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
 
         return response
+
+    @staticmethod
+    def _sleep_backoff(retry_count, base=1.0, cap=30.0):
+        """Exponential backoff with full jitter between API retries.
+
+        Instant retries hit the same transient bad window (server overload /
+        rate-limiting) and exhaust the retry budget without recovering. Waiting
+        a (jittered, exponentially growing) interval lets the window pass.
+        """
+        delay = min(cap, base * (2**retry_count))
+        delay = random.uniform(0, delay)
+        logger.debug(f"Backing off {delay:.1f}s before retry {retry_count + 1}")
+        time.sleep(delay)
 
     def get_pdf_output_path(self, pdf_fragment):
         return output_dir / pdf_fragment.split("#")[0]
