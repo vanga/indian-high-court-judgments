@@ -49,7 +49,8 @@ class CourtJudgmentStats:
             'metadata_files': 0,
             'data_files': 0,
             'metadata_size': 0,
-            'data_size': 0
+            'data_size': 0,
+            'source_counts': defaultdict(int)
         })
 
         self.stats_by_court: Dict[str, Dict] = defaultdict(lambda: {
@@ -60,7 +61,8 @@ class CourtJudgmentStats:
             'metadata_files': 0,
             'data_files': 0,
             'metadata_size': 0,
-            'data_size': 0
+            'data_size': 0,
+            'source_counts': defaultdict(int)
         })
 
         self.stats_by_bench: Dict[str, Dict] = defaultdict(lambda: {
@@ -71,7 +73,8 @@ class CourtJudgmentStats:
             'metadata_files': 0,
             'data_files': 0,
             'metadata_size': 0,
-            'data_size': 0
+            'data_size': 0,
+            'source_counts': defaultdict(int)
         })
 
     def load_index_file(self, year: int, court_code: str, bench: str, file_type: str) -> Optional[Dict]:
@@ -97,6 +100,7 @@ class CourtJudgmentStats:
         # Extract statistics from index file
         file_count = index_data.get('file_count', 0)
         tar_size = index_data.get('tar_size', 0)
+        source_counts = self.extract_source_counts(index_data, file_count)
 
         # Update year statistics
         self.stats_by_year[year]['total_files'] += file_count
@@ -110,6 +114,8 @@ class CourtJudgmentStats:
         else:
             self.stats_by_year[year]['data_files'] += file_count
             self.stats_by_year[year]['data_size'] += tar_size
+        for source, count in source_counts.items():
+            self.stats_by_year[year]['source_counts'][source] += count
 
         # Update court statistics
         self.stats_by_court[court_code]['total_files'] += file_count
@@ -123,6 +129,8 @@ class CourtJudgmentStats:
         else:
             self.stats_by_court[court_code]['data_files'] += file_count
             self.stats_by_court[court_code]['data_size'] += tar_size
+        for source, count in source_counts.items():
+            self.stats_by_court[court_code]['source_counts'][source] += count
 
         # Update bench statistics
         self.stats_by_bench[bench]['total_files'] += file_count
@@ -136,6 +144,24 @@ class CourtJudgmentStats:
         else:
             self.stats_by_bench[bench]['data_files'] += file_count
             self.stats_by_bench[bench]['data_size'] += tar_size
+        for source, count in source_counts.items():
+            self.stats_by_bench[bench]['source_counts'][source] += count
+
+    def extract_source_counts(self, index_data: Dict, fallback_count: int) -> Dict[str, int]:
+        """Return file counts by source from V2 index parts.
+
+        Older web indexes do not carry source metadata. Count those as unknown so
+        mixed-source reports still reconcile with total file counts.
+        """
+        source_counts = defaultdict(int)
+        parts = index_data.get('parts') or []
+        if parts:
+            for part in parts:
+                source = part.get('source') or 'unknown'
+                source_counts[source] += part.get('file_count', len(part.get('files', [])))
+        else:
+            source_counts[index_data.get('source') or 'unknown'] += fallback_count
+        return source_counts
 
     def discover_available_data(self) -> Tuple[Set[int], Set[str], Dict[str, Set[str]]]:
         """Discover available years, courts, and benches from the local directory structure."""
@@ -241,7 +267,8 @@ class CourtJudgmentStats:
                 'metadata_size': year_data['metadata_size'],
                 'metadata_size_human': self.format_size(year_data['metadata_size']),
                 'data_size': year_data['data_size'],
-                'data_size_human': self.format_size(year_data['data_size'])
+                'data_size_human': self.format_size(year_data['data_size']),
+                'source_counts': dict(year_data['source_counts'])
             })
         return stats
 
@@ -265,7 +292,8 @@ class CourtJudgmentStats:
                 'metadata_size': court_data['metadata_size'],
                 'metadata_size_human': self.format_size(court_data['metadata_size']),
                 'data_size': court_data['data_size'],
-                'data_size_human': self.format_size(court_data['data_size'])
+                'data_size_human': self.format_size(court_data['data_size']),
+                'source_counts': dict(court_data['source_counts'])
             })
         return stats
 
@@ -291,7 +319,8 @@ class CourtJudgmentStats:
                 'metadata_size': bench_data['metadata_size'],
                 'metadata_size_human': self.format_size(bench_data['metadata_size']),
                 'data_size': bench_data['data_size'],
-                'data_size_human': self.format_size(bench_data['data_size'])
+                'data_size_human': self.format_size(bench_data['data_size']),
+                'source_counts': dict(bench_data['source_counts'])
             })
         return stats
 
@@ -332,6 +361,14 @@ class CourtJudgmentStats:
         print(f"  Courts: {total_courts}")
         print(f"  Benches: {total_benches}")
         print(f"  Years Covered: {years_covered}")
+        source_counts = defaultdict(int)
+        for stats in self.stats_by_year.values():
+            for source, count in stats['source_counts'].items():
+                source_counts[source] += count
+        if source_counts:
+            print("  Source Counts:")
+            for source, count in sorted(source_counts.items()):
+                print(f"    {source}: {count:,}")
 
         # Top courts by file count
         court_stats = self.generate_court_statistics()

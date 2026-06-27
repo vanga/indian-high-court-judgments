@@ -2,10 +2,25 @@ import unittest
 
 import pandas as pd
 
-from src.utils.s3_utils import dedupe_parquet_records, filter_parquet_records_against_keys
+from src.utils.s3_utils import (
+    dedupe_parquet_records,
+    filter_parquet_records_against_keys,
+    judgment_identity_from_record,
+)
 
 
 class ParquetDedupeTests(unittest.TestCase):
+    def test_builds_cross_source_identity_from_cnr_date_and_filename_order(self):
+        identity = judgment_identity_from_record(
+            {
+                "cnr": "ABC123",
+                "decision_date": "2025-01-01 00:00:00",
+                "pdf_link": "court/cnrorders/bench/orders/2025/ABC123_2_2025-01-01.pdf",
+            }
+        )
+
+        self.assertEqual(identity, ("ABC123", "2025-01-01", "2"))
+
     def test_dedupes_by_cnr_and_decision_date_even_when_pdf_links_differ(self):
         df = pd.DataFrame(
             [

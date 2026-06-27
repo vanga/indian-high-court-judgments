@@ -1,7 +1,7 @@
 # Indian High Court Judgements
 
 ### Summary
-This dataset contains judgements from the Indian High Courts, downloaded from [ecourts website](https://judgments.ecourts.gov.in/). It contains judgments of 25 high courts, along with raw metadata (in json format) and structured metadata (in parquet format). Judgments from the website are further compressed to optimize for size (care has been taken to not have any loss of data either in content or in visual appearance).
+This dataset contains judgements from the Indian High Courts. Most records are downloaded from the [eCourts judgments website](https://judgments.ecourts.gov.in/), and some courts are backfilled from the eCourts mobile API where the web portal is incomplete. It contains judgments of 25 high courts, along with raw metadata (in json format) and structured metadata (in parquet format). Judgments from the website are further compressed to optimize for size (care has been taken to not have any loss of data either in content or in visual appearance).
 
 For bulk access, use the tar archives and parquet files. The bucket also exposes individual PDF and JSON objects, but downloading millions of individual files is slow and creates a very large number of S3 requests. Prefer `aws s3 sync` on `data/tar/`, `metadata/tar/`, or `metadata/parquet/`; running the same sync command later will fetch only new or changed objects.
 
@@ -22,6 +22,22 @@ For bulk access, use the tar archives and parquet files. The bucket also exposes
     * metadata/tar/year=2025/court=xyz/bench=xyz/<part_name>.tar.gz
     * data/tar/year=2025/court=xyz/bench=xyz/<part_name>.tar
     * data/tar/year=2025/court=xyz/bench=xyz/data.index.json
+
+### Mixed web and mobile API data
+
+The public layout is the same for both sources, but filenames can differ between
+the website and mobile API for the same judgment/order. Use structured metadata
+for dedupe and joins: prefer `(cnr, decision_date, order_number)` when available,
+or `(cnr, decision_date)` for older web-only rows that do not expose an order
+number. `pdf_link` is a storage pointer, not a stable cross-source identifier.
+
+Mobile-sourced parquet rows are tagged with `source = "mobile"` and may have
+`pdf_exists = null` because PDF presence is not asserted during mobile metadata
+generation. Mobile ingestion may also publish
+`metadata/parquet_case_details/court=.../bench=.../case_details-mobile.parquet`,
+a per-bench dimension table keyed by `cnr` with richer case-level fields. The
+mobile scraper is not yet part of this repository; the web scraper here remains
+the supported runnable scraper.
 
 
 #### Index file structure

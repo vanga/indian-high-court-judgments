@@ -30,6 +30,7 @@ class UploadCourtToS3Tests(unittest.TestCase):
             patch.object(download, "get_bench_codes", return_value={}),
             patch.object(download, "extract_decision_date_from_json", return_value=2025),
             patch.object(download, "get_existing_files_from_s3_v2", return_value=[]),
+            patch.object(download, "get_existing_judgment_identities_from_parquet", return_value=set()),
             patch.object(download.cache_store, "invalidate"),
             patch.object(
                 download,
@@ -43,9 +44,9 @@ class UploadCourtToS3Tests(unittest.TestCase):
     def test_parquet_failure_blocks_raw_upload_and_resume_cursor(self):
         with ExitStack() as stack:
             mocks = [stack.enter_context(p) for p in self._common_patches(parquet_success=False)]
-            parquet_mock = mocks[5]
-            upload_mock = mocks[6]
-            cursor_mock = mocks[7]
+            parquet_mock = mocks[6]
+            upload_mock = mocks[7]
+            cursor_mock = mocks[8]
 
             with self.assertRaises(RuntimeError):
                 download._upload_court_to_s3("9~13", date(2026, 4, 28))
@@ -59,9 +60,9 @@ class UploadCourtToS3Tests(unittest.TestCase):
     def test_successful_sync_uploads_and_cleans_up_files(self):
         with ExitStack() as stack:
             mocks = [stack.enter_context(p) for p in self._common_patches()]
-            parquet_mock = mocks[5]
-            upload_mock = mocks[6]
-            cursor_mock = mocks[7]
+            parquet_mock = mocks[6]
+            upload_mock = mocks[7]
+            cursor_mock = mocks[8]
 
             download._upload_court_to_s3("9~13", date(2026, 4, 28))
 
@@ -109,6 +110,9 @@ class UploadCourtToS3Tests(unittest.TestCase):
             )
             stack.enter_context(
                 patch.object(download, "get_existing_files_from_s3_v2", return_value=[])
+            )
+            stack.enter_context(
+                patch.object(download, "get_existing_judgment_identities_from_parquet", return_value=set())
             )
             stack.enter_context(patch.object(download.cache_store, "invalidate"))
             parquet_mock = stack.enter_context(

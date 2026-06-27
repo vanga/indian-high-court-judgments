@@ -42,6 +42,8 @@ from src.utils.s3_utils import (
     create_and_upload_parquet_files,
     get_court_dates_from_index_files,
     get_existing_files_from_s3_v2,
+    get_existing_judgment_identities_from_parquet,
+    get_metadata_identity_from_file,
     upload_files_to_s3_v2,
     write_scraped_through_date,
 )
@@ -602,6 +604,37 @@ def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
     return files_by_year
 
 
+def filter_new_files_by_name(local_files: List[Path], existing_names: List[str]) -> set[Path]:
+    """Return local files whose filename is not already present in an S3 index."""
+    existing_name_set = {Path(name).name for name in existing_names}
+    return {file for file in local_files if file.name not in existing_name_set}
+
+
+def filter_metadata_files_by_existing_identity(
+    local_files: set[Path],
+    existing_identities: set[tuple[str, str, str]],
+) -> set[Path]:
+    """Drop web metadata already represented by mobile/web parquet identity."""
+    if not existing_identities:
+        return local_files
+
+    new_files = set()
+    skipped = 0
+    for file in local_files:
+        identity = get_metadata_identity_from_file(file)
+        if identity and identity in existing_identities:
+            skipped += 1
+            continue
+        new_files.add(file)
+
+    if skipped:
+        logger.info(
+            "Skipped %s metadata files already present by CNR/date/order identity",
+            skipped,
+        )
+    return new_files
+
+
 def _upload_court_to_s3(court_code, end_date):
     """
     Scan local files for a court, diff against S3, and upload.
@@ -691,12 +724,15 @@ def _upload_court_to_s3(court_code, end_date):
                 existing_files = set(get_existing_files_from_s3_v2(
                     "metadata", year, court_code_underscore, bench
                 ))
-
-                # Build a basename -> full path map so we can compare basenames
-                # (S3 index stores basenames, local files are full Paths)
-                local_json_map = {f.name: f for f in json_files_by_year_partition[year]}
-                new_basenames = set(local_json_map.keys()) - existing_files
-                new_files = {local_json_map[name] for name in new_basenames}
+                existing_identities = get_existing_judgment_identities_from_parquet(
+                    year, court_code_underscore, bench
+                )
+                new_files = filter_new_files_by_name(
+                    json_files_by_year_partition[year], existing_files
+                )
+                new_files = filter_metadata_files_by_existing_identity(
+                    new_files, existing_identities
+                )
 
                 if year not in bench_files:
                     bench_files[year] = {
@@ -713,11 +749,9 @@ def _upload_court_to_s3(court_code, end_date):
                 existing_pdf_files = set(get_existing_files_from_s3_v2(
                     "data", year, court_code_underscore, bench
                 ))
-
-                # Same basename comparison for PDFs
-                local_pdf_map = {f.name: f for f in pdf_files_by_year_partition[year]}
-                new_pdf_basenames = set(local_pdf_map.keys()) - existing_pdf_files
-                new_pdf_files = {local_pdf_map[name] for name in new_pdf_basenames}
+                new_pdf_files = filter_new_files_by_name(
+                    pdf_files_by_year_partition[year], existing_pdf_files
+                )
 
                 logger.info(
                     f"New PDF files: {len(new_pdf_files)}, for year {year}, bench {bench}, court {court_code_underscore}"

@@ -9,9 +9,10 @@ import tempfile
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import json
+import re
 
 from src.models import IndexFileV2, IndexPart
 from src.utils.shared_utils import format_size, utc_now_iso, generate_part_name, get_metadata_index_key, get_data_index_key, get_bench_partition_key
@@ -360,10 +361,98 @@ def get_existing_files_from_s3_v2(data_type: str, year: int, court_code: str, be
         data = json.loads(raw)
         for part in data.get("parts", []):
             all_files.extend(part.get("files", []))
+        all_files.extend(data.get("files", []))
     except s3_client.exceptions.NoSuchKey:
         # Index file doesn't exist yet, return empty list
         return []
     return all_files
+
+
+def normalize_decision_date(value) -> Optional[str]:
+    """Normalize decision_date values from web/mobile parquet rows to YYYY-MM-DD."""
+    if value is None:
+        return None
+    if hasattr(value, "date") and not isinstance(value, str):
+        return value.date().isoformat()
+    text = str(value).strip()
+    if not text or text.lower() in {"nat", "none", "nan"}:
+        return None
+    if len(text) >= 10 and re.match(r"\d{4}-\d{2}-\d{2}", text):
+        return text[:10]
+    try:
+        if PANDAS_AVAILABLE:
+            parsed = pd.to_datetime(text, format="mixed", dayfirst=True, errors="coerce")
+            if not pd.isna(parsed):
+                return parsed.date().isoformat()
+    except Exception:
+        return None
+    return None
+
+
+def extract_order_number_from_pdf_link(pdf_link) -> Optional[str]:
+    """Extract the order number from common web/mobile HC filenames."""
+    if pdf_link is None:
+        return None
+    stem = Path(str(pdf_link)).stem
+    parts = stem.split("_")
+    if len(parts) >= 3 and parts[-2]:
+        return parts[-2]
+    return None
+
+
+def judgment_identity_from_record(record: Dict) -> Optional[Tuple[str, str, str]]:
+    """
+    Return the cross-source identity for a judgment/order.
+
+    Web and mobile pipelines can store the same order under different filenames.
+    The stable identity is CNR + decision date + order number when available.
+    """
+    cnr = str(record.get("cnr") or "").strip()
+    decision_date = normalize_decision_date(record.get("decision_date"))
+    if not cnr or not decision_date:
+        return None
+    order_number = record.get("order_number")
+    if order_number is None or str(order_number).strip() == "":
+        order_number = extract_order_number_from_pdf_link(record.get("pdf_link"))
+    return (cnr, decision_date, str(order_number or ""))
+
+
+def get_existing_judgment_identities_from_parquet(
+    year: int, court_code: str, bench: str
+) -> set[Tuple[str, str, str]]:
+    """Read existing web/mobile parquet rows and return cross-source identities."""
+    if not PANDAS_AVAILABLE:
+        return set()
+
+    parquet_key = (
+        f"metadata/parquet/year={year}/court={court_code}/bench={bench}/metadata.parquet"
+    )
+    try:
+        response = s3_client.get_object(Bucket=S3_BUCKET, Key=parquet_key)
+        data = response["Body"].read()
+        df = pd.read_parquet(io.BytesIO(data))
+    except Exception:
+        return set()
+
+    identities = set()
+    for record in df.to_dict(orient="records"):
+        identity = judgment_identity_from_record(record)
+        if identity:
+            identities.add(identity)
+    return identities
+
+
+def get_metadata_identity_from_file(json_file: Path) -> Optional[Tuple[str, str, str]]:
+    """Parse a local web metadata JSON file into the same identity used for parquet."""
+    try:
+        mp = MetadataProcessor(json_file.parent, output_path=Path(tempfile.gettempdir()) / "unused.parquet")
+        metadata = mp.load_metadata(json_file)
+        processed = mp.process_metadata(metadata)
+        if not processed:
+            return None
+        return judgment_identity_from_record(processed)
+    except Exception:
+        return None
 
 
 def upload_large_file_to_s3(

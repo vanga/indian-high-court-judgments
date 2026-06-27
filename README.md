@@ -114,6 +114,40 @@ Features:
 - Compresses PDFs with Ghostscript (~50% average reduction) when `gs` is available.
 - Parallelises across court × date chunks via a thread pool.
 
+## Data sources: web vs mobile API
+
+Most of the corpus is scraped from the eCourts **website** using the scraper in
+this repository. A growing portion is backfilled from the eCourts **mobile API**
+to fill gaps where the web portal did not publish or return all judgments. The
+mobile scraper is currently maintained in the
+`indian-district-court-judgments` repository while we stabilize the High Court
+mobile workflow; it has not yet been ported into this repo.
+
+Mobile-sourced rows are tagged `source = "mobile"` in the parquet (older web rows
+usually have `source` null) and follow the same public partition layout
+(`year=<decision_year>/court/bench`). Because the website and mobile API expose
+different PDF identifiers, the same judgment/order may have different filenames
+across sources. Treat `(cnr, decision_date, order_number)` as the cross-source
+identity when those fields are available; use `pdf_link`/filename only as a
+fallback identifier.
+
+Two things to know about mobile-sourced data:
+- **`pdf_exists` is null** for mobile rows (web rows are `true`/`false`). The mobile
+  pipeline doesn't reconcile per-PDF presence at metadata-generation time, so it
+  leaves the flag unknown rather than asserting it. Treat null as "unknown — check
+  the data tar/index if you need certainty."
+- **`metadata/parquet_case_details/court/bench/`** is a mobile-only **dimension
+  table** (one row per CNR, *not* year-partitioned) carrying richer fields the
+  website never exposed — acts/sections, full hearing history, linked cases,
+  documents, advocates, etc. Join it to the per-order `judgments` parquet on `cnr`.
+  It also includes cases with **no order/judgment** (e.g. disposed-without-an-order),
+  which never appear in the per-order tables — filter its `date_of_decision` column
+  for time-based queries.
+
+The web scraper in this repository still works as before. When S3 sync is enabled,
+it now checks existing parquet identities as well as index filenames so mobile
+backfill rows are considered during dedupe and stats generation.
+
 ## Processing metadata
 
 After downloading, `process_metadata.py` parses the raw HTML embedded in each JSON metadata file and writes a consolidated Parquet file (snappy-compressed):
