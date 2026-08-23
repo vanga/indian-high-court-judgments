@@ -26,8 +26,44 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  run-data-pipeline:
+  # Emits the matrix of court codes. One court per job, so no single slow court
+  # can consume the whole run's wall-clock budget and starve the rest.
+  select-courts:
     runs-on: ubuntu-latest
+    outputs:
+      courts: ${{ steps.select.outputs.courts }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Select courts
+        id: select
+        env:
+          INPUT_COURT_CODE: ${{ github.event.inputs.court_code }}
+        run: |
+          if [ -n "$INPUT_COURT_CODE" ]; then
+            COURTS=$(jq -cn --arg c "$INPUT_COURT_CODE" '[$c]')
+          else
+            COURTS=$(jq -c 'keys' court-codes.json)
+          fi
+          echo "Courts to process: $COURTS"
+          echo "courts=$COURTS" >> "$GITHUB_OUTPUT"
+
+  run-data-pipeline:
+    needs: select-courts
+    runs-on: ubuntu-latest
+    # Below GitHub's 6h hard ceiling on job execution. A job killed by the
+    # platform ceiling is reported as "cancelled", which does not turn the badge
+    # red — an explicit timeout is reported as "failure", which does.
+    timeout-minutes: 330
+    strategy:
+      fail-fast: false
+      # Total concurrent requests against the eCourts portal is unchanged:
+      # previously one job with --max_workers 4, now four jobs with
+      # --max_workers 1. Sharding buys wall-clock, not portal pressure.
+      max-parallel: 4
+      matrix:
+        court: ${{ fromJSON(needs.select-courts.outputs.courts) }}
     permissions:
       contents: write
       id-token: write
@@ -61,14 +97,11 @@ jobs:
 
       - name: Run court data pipeline
         env:
-          INPUT_COURT_CODE: ${{ github.event.inputs.court_code }}
+          MATRIX_COURT_CODE: ${{ matrix.court }}
           INPUT_START_DATE: ${{ github.event.inputs.start_date }}
           INPUT_END_DATE: ${{ github.event.inputs.end_date }}
         run: |
-          ARGS="--sync-s3 --max_workers 4 --day_step 5"
-          if [ -n "$INPUT_COURT_CODE" ]; then
-            ARGS="$ARGS --court_code $INPUT_COURT_CODE"
-          fi
+          ARGS="--sync-s3 --max_workers 1 --day_step 5 --court_code $MATRIX_COURT_CODE"
           if [ -n "$INPUT_START_DATE" ]; then
             ARGS="$ARGS --start_date $INPUT_START_DATE"
           fi
