@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 from contextlib import ExitStack
 from datetime import date
@@ -218,12 +219,13 @@ class ScrapeFailureTests(unittest.TestCase):
             "process_task",
             side_effect=[RuntimeError("bad day"), None],
         ) as process_mock:
-            failures = download._run_tasks(tasks, max_workers=1)
+            failures, unrun = download._run_tasks(tasks, max_workers=1)
 
         self.assertEqual(process_mock.call_count, 2)
         self.assertEqual(len(failures), 1)
         self.assertIs(failures[0][0], tasks[0])
         self.assertRegex(str(failures[0][1]), "bad day")
+        self.assertEqual(unrun, [])
 
     def test_download_propagates_terminal_search_errors(self):
         task = download.CourtDateTask("9~13", "2025-01-01", "2025-01-07")
@@ -312,6 +314,144 @@ class ScrapeFailureTests(unittest.TestCase):
 
         self.assertTrue(result)
         self.assertEqual(pdf_path.read_bytes(), PdfResponse.content)
+
+
+class ResumeCursorTests(unittest.TestCase):
+    """Cursors must advance for every bench of a court, not just busy ones.
+
+    run() resolves a court's start date as the MIN across its benches, so a
+    bench that is never given a cursor pins its whole court to an ever-growing
+    re-scrape window (issue #30).
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmpdir.cleanup)
+        self.prev_cwd = os.getcwd()
+        os.chdir(self.tmpdir.name)
+        self.addCleanup(os.chdir, self.prev_cwd)
+
+        # Only "busybench" has files on disk; "quietbench" produced nothing.
+        bench_dir = Path("data/court/cnrorders/busybench/orders/2025")
+        bench_dir.mkdir(parents=True, exist_ok=True)
+        (bench_dir / "case.json").write_text('{"raw_html":"<div></div>"}')
+        (bench_dir / "case.pdf").write_bytes(b"%PDF-1.4")
+
+    def _patches(self):
+        return [
+            patch.object(
+                download,
+                "load_court_bench_mapping",
+                return_value={"busybench": "27_1", "quietbench": "27_1"},
+            ),
+            patch.object(download, "get_bench_codes", return_value={}),
+            patch.object(download, "extract_decision_date_from_json", return_value=2025),
+            patch.object(download, "get_existing_files_from_s3_v2", return_value=[]),
+            patch.object(
+                download, "get_existing_judgment_identities_from_parquet", return_value=set()
+            ),
+            patch.object(download.cache_store, "invalidate"),
+            patch.object(download, "create_and_upload_parquet_files", return_value=True),
+            patch.object(download, "upload_files_to_s3_v2"),
+            patch.object(download, "write_scraped_through_date"),
+        ]
+
+    def test_bench_with_no_new_files_still_advances_its_cursor(self):
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in self._patches()]
+            cursor_mock = mocks[8]
+
+            download._upload_court_to_s3("27~1", date(2026, 8, 24))
+
+        benches_written = {c.args[3] for c in cursor_mock.call_args_list}
+        self.assertEqual(benches_written, {"busybench", "quietbench"})
+        self.assertIn(
+            call("data", 2026, "27_1", "quietbench", "2026-08-24"),
+            cursor_mock.call_args_list,
+        )
+
+    def test_explicit_scraped_through_overrides_end_date(self):
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in self._patches()]
+            cursor_mock = mocks[8]
+
+            download._upload_court_to_s3("27~1", date(2026, 8, 24), "2026-08-10")
+
+        written_dates = {c.args[4] for c in cursor_mock.call_args_list}
+        self.assertEqual(written_dates, {"2026-08-10"})
+
+
+class ContiguousCursorTests(unittest.TestCase):
+    def test_full_coverage_uses_end_date(self):
+        self.assertEqual(
+            download._contiguous_scraped_through("2026-08-24", []), "2026-08-24"
+        )
+
+    def test_stops_the_day_before_the_earliest_incomplete_range(self):
+        incomplete = [
+            download.CourtDateTask("27~1", "2026-08-16", "2026-08-20"),
+            download.CourtDateTask("27~1", "2026-08-06", "2026-08-10"),
+        ]
+        self.assertEqual(
+            download._contiguous_scraped_through("2026-08-24", incomplete),
+            "2026-08-05",
+        )
+
+
+class RunBudgetTests(unittest.TestCase):
+    """The run must stop itself and say so, rather than be killed by CI."""
+
+    def test_run_tasks_cancels_pending_ranges_past_the_deadline(self):
+        tasks = [
+            download.CourtDateTask("27~1", f"2026-08-{day:02d}", f"2026-08-{day:02d}")
+            for day in range(1, 6)
+        ]
+
+        # Deadline already elapsed: ranges still queued behind the single
+        # worker are cancelled and reported, not silently dropped.
+        def slow_task(_task, _compression=False):
+            time.sleep(0.1)
+
+        with patch.object(download, "process_task", side_effect=slow_task) as process_mock:
+            failures, unrun = download._run_tasks(
+                tasks, max_workers=1, deadline=time.monotonic() - 1
+            )
+
+        self.assertEqual(failures, [])
+        self.assertTrue(unrun, "expected queued ranges to be cancelled")
+        self.assertEqual(process_mock.call_count, len(tasks) - len(unrun))
+        # Cancelled ranges are the tail of the queue, never a gap in the middle.
+        self.assertEqual(
+            [t.from_date for t in unrun],
+            [t.from_date for t in tasks[len(tasks) - len(unrun):]],
+        )
+
+    def test_unattempted_court_fails_the_run(self):
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "get_court_codes",
+                    return_value={"9~13": "Allahabad", "27~1": "Bombay"},
+                )
+            )
+            stack.enter_context(
+                patch.object(download, "_run_deadline", return_value=time.monotonic() - 1)
+            )
+            run_mock = stack.enter_context(
+                patch.object(download, "_run_tasks", return_value=([], []))
+            )
+
+            with self.assertRaisesRegex(RuntimeError, "not attempted"):
+                download.run(
+                    start_date="2026-08-20",
+                    end_date="2026-08-24",
+                    day_step=5,
+                    max_runtime_minutes=60,
+                )
+
+        # Budget was already gone, so no court was even started.
+        run_mock.assert_not_called()
 
 
 if __name__ == "__main__":

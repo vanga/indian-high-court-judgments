@@ -58,6 +58,12 @@ TASK_DOWNLOAD_ATTEMPTS = 3
 # when failures are widespread (ratio) or large in absolute terms (count).
 FAILURE_RATIO_THRESHOLD = 0.2
 FAILURE_COUNT_THRESHOLD = 10
+# Wall-clock budget for a whole run. Must stay below the CI job timeout so the
+# run stops itself - draining in-flight uploads and advancing resume cursors -
+# instead of being killed mid-write. A run that cannot reach every court is
+# reported as a failure: an unattempted court is a silent data gap, not a
+# transient error.
+DEFAULT_MAX_RUNTIME_MINUTES = 300
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -340,6 +346,7 @@ def run(
     compress_pdfs=False,
     dist_code: Optional[str] = None,
     use_default_dist_codes: bool = True,
+    max_runtime_minutes: Optional[int] = DEFAULT_MAX_RUNTIME_MINUTES,
 ):
     """
     Run the downloader with explicit date ranges.
@@ -349,6 +356,8 @@ def run(
     - Downloads for specified range, skipping already-downloaded files
     - Always checks S3 for existing files to avoid re-downloading
     - Appends to existing tar files in S3 after download
+    - Stops starting new work after max_runtime_minutes and fails the run if
+      any court was left unattempted (pass None to disable the budget)
     """
 
     if isinstance(court_codes, str):
@@ -457,9 +466,22 @@ def run(
     pending_upload: Optional[concurrent.futures.Future] = None
     task_failures = []
     total_tasks = 0
+    unrun_tasks: List[CourtDateTask] = []
+    unattempted_courts: List[str] = []
+    deadline = _run_deadline(max_runtime_minutes)
+    if deadline is not None:
+        print(f"Run budget: {max_runtime_minutes} minute(s)")
 
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
+        if deadline is not None and time.monotonic() >= deadline:
+            unattempted_courts.append(court_code)
+            print(
+                f"\nWARNING: run budget exhausted; court {court_code} was not "
+                f"attempted."
+            )
+            continue
+
         # Resolve per-court start_date. Explicit --start_date on the CLI
         # short-circuits the per-court logic; otherwise look up by the court's
         # S3-format code and fall back to DEFAULT_BOOTSTRAP for brand-new courts.
@@ -502,24 +524,50 @@ def run(
         # Scrape this court in the foreground, then hand the upload off to
         # the background worker so we can start the next court immediately.
         total_tasks += len(tasks)
-        task_failures.extend(_run_tasks(tasks, max_workers, compress_pdfs))
+        court_failures, court_unrun = _run_tasks(
+            tasks, max_workers, compress_pdfs, deadline
+        )
+        task_failures.extend(court_failures)
+        unrun_tasks.extend(court_unrun)
 
         if S3_ENABLED:
             end_date_obj = (
                 datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+            )
+            # Only advance this court's resume cursor as far as it is
+            # contiguously covered, so a failed or unrun range is retried next
+            # run instead of being stepped over.
+            scraped_through = _contiguous_scraped_through(
+                end_date,
+                [task for task, _ in court_failures] + court_unrun,
             )
             if pending_upload is not None:
                 # Wait for previous court's upload to finish before queueing
                 # the next one — bounds disk to ~2 courts at a time.
                 pending_upload.result()
             pending_upload = upload_executor.submit(
-                _upload_court_to_s3, court_code, end_date_obj
+                _upload_court_to_s3, court_code, end_date_obj, scraped_through
             )
 
     if pending_upload is not None:
         pending_upload.result()
     if upload_executor is not None:
         upload_executor.shutdown(wait=True)
+
+    # A court that was never attempted (or a range that never ran) is a silent
+    # data gap, not a transient error, so it is always fatal — unlike the
+    # tolerated task failures below. Raised after the uploads above so whatever
+    # progress the run did make is still persisted.
+    if unattempted_courts or unrun_tasks:
+        raise RuntimeError(
+            f"Run budget of {max_runtime_minutes} minute(s) exhausted before the "
+            f"work was finished: {len(unattempted_courts)} court(s) not attempted "
+            f"({', '.join(unattempted_courts) or 'none'}) and "
+            f"{len(unrun_tasks)} date range(s) not run. Those courts are not "
+            f"being refreshed — raise --max-runtime-minutes, narrow the date "
+            f"window, or backfill the lagging courts with an explicit "
+            f"--court_code run."
+        )
 
     if task_failures:
         failed_tasks = "\n".join(
@@ -550,20 +598,52 @@ def run(
     logger.info("All download tasks completed")
 
 
-def _run_tasks(tasks, max_workers, compression_enabled=False):
-    """Run download tasks without S3 upload"""
+def _run_deadline(max_runtime_minutes):
+    """Monotonic timestamp after which no new work is started."""
+    if not max_runtime_minutes:
+        return None
+    return time.monotonic() + max_runtime_minutes * 60
+
+
+def _contiguous_scraped_through(end_date, incomplete_tasks):
+    """Date a court is contiguously covered through.
+
+    The resume cursor must never step over a range that failed or never ran,
+    so it stops the day before the earliest such range. With no incomplete
+    ranges the court is covered through end_date.
+    """
+    if not incomplete_tasks:
+        return end_date
+    earliest = min(task.from_date for task in incomplete_tasks)
+    cutoff = datetime.strptime(earliest, "%Y-%m-%d") - timedelta(days=1)
+    return min(cutoff.strftime("%Y-%m-%d"), end_date)
+
+
+def _run_tasks(tasks, max_workers, compression_enabled=False, deadline=None):
+    """Run download tasks without S3 upload.
+
+    Returns (failures, unrun_tasks). Once `deadline` (a time.monotonic()
+    value) passes, tasks that have not started yet are cancelled so the run can
+    finish cleanly — draining uploads and advancing cursors — rather than being
+    killed mid-write when the CI job hits its timeout.
+    """
     failures = []
+    unrun = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
         with tqdm(total=len(tasks), desc="Processing tasks", unit="task") as pbar:
             future_to_task = {
                 executor.submit(process_task, task, compression_enabled): task
                 for task in tasks
             }
+            budget_exhausted = False
             for future in concurrent.futures.as_completed(future_to_task):
                 task = future_to_task[future]
                 pbar.set_description(
                     f"Processing {task.court_code} ({task.from_date} to {task.to_date})"
                 )
+                if future.cancelled():
+                    pbar.update(1)
+                    continue
                 try:
                     future.result()
                 except Exception as e:
@@ -575,7 +655,22 @@ def _run_tasks(tasks, max_workers, compression_enabled=False):
                         e,
                     )
                 pbar.update(1)
-    return failures
+                if (
+                    not budget_exhausted
+                    and deadline is not None
+                    and time.monotonic() >= deadline
+                ):
+                    budget_exhausted = True
+                    for pending_future, pending_task in future_to_task.items():
+                        if pending_future.cancel():
+                            unrun.append(pending_task)
+                    logger.error(
+                        "Run budget exhausted; cancelled %d not-yet-started "
+                        "range(s) for court %s",
+                        len(unrun),
+                        task.court_code,
+                    )
+    return failures, unrun
 
 
 def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
@@ -635,7 +730,7 @@ def filter_metadata_files_by_existing_identity(
     return new_files
 
 
-def _upload_court_to_s3(court_code, end_date):
+def _upload_court_to_s3(court_code, end_date, scraped_through=None):
     """
     Scan local files for a court, diff against S3, and upload.
 
@@ -643,6 +738,11 @@ def _upload_court_to_s3(court_code, end_date):
     scraping the next court while this one uploads. If the process dies
     mid-upload, local files are preserved (we only unlink after successful
     upload), so the next run can resume by re-diffing.
+
+    scraped_through is the date this court is contiguously covered through
+    (YYYY-MM-DD). Defaults to end_date. Callers that only got part way through
+    a court's ranges should pass the earlier date so the resume cursor never
+    steps over a range that was not actually scraped.
     """
     print(f"\nCollecting NEW files for {court_code}...")
     downloaded_files = {"metadata": [], "data": []}
@@ -703,6 +803,11 @@ def _upload_court_to_s3(court_code, end_date):
     total_on_disk = 0
     total_new = 0
     upload_failures = []
+    # Year partitions each bench touched, and benches whose upload failed.
+    # Collected here so resume cursors can be advanced below for EVERY bench of
+    # this court, including benches that produced no new files this run.
+    bench_year_partitions: Dict[str, set] = {}
+    benches_blocked: set = set()
 
     try:
         for bench in target_benches:
@@ -768,6 +873,7 @@ def _upload_court_to_s3(court_code, end_date):
 
             synced_years = []
             failed_years = set()
+            bench_year_partitions[bench] = set(bench_files.keys())
 
             for year, year_files in bench_files.items():
                 try:
@@ -814,26 +920,8 @@ def _upload_court_to_s3(court_code, end_date):
                     upload_failures.append(message)
                     logger.error(message)
 
-            # Advance the resume cursor for every year partition we know about
-            # for this bench. We use the run's end_date (what we scraped
-            # THROUGH) rather than max decision date, because the scrape
-            # operates on decision-date ranges and end_date is the actual
-            # boundary. Write to the data index so auto-detect sees it.
-            if end_date is not None and not failed_years:
-                scraped_through_str = end_date.strftime("%Y-%m-%d") if hasattr(end_date, "strftime") else str(end_date)
-                # Write to all year partitions this bench has touched, plus
-                # the end_date's year (in case the bench has no files for it yet)
-                years_to_update = set(bench_files.keys()) | {end_date.year if hasattr(end_date, "year") else int(scraped_through_str[:4])}
-                for yr in years_to_update:
-                    try:
-                        write_scraped_through_date(
-                            "data", yr, court_code_underscore, bench, scraped_through_str
-                        )
-                    except Exception as e:
-                        logger.warning(
-                            f"Failed to write scraped_through_date for "
-                            f"{yr}/{court_code_underscore}/{bench}: {e}"
-                        )
+            if failed_years:
+                benches_blocked.add(bench)
 
             # Clean up only files that were successfully uploaded.
             # Files with unparseable dates were never uploaded and should be preserved.
@@ -857,6 +945,14 @@ def _upload_court_to_s3(court_code, end_date):
                     f"(unparseable dates or upload failures)"
                 )
 
+        _advance_court_resume_cursors(
+            court_code_underscore,
+            target_benches,
+            scraped_through if scraped_through is not None else end_date,
+            bench_year_partitions,
+            benches_blocked,
+        )
+
         if upload_failures:
             raise RuntimeError(
                 "S3 sync completed with failures:\n- " + "\n- ".join(upload_failures)
@@ -866,6 +962,52 @@ def _upload_court_to_s3(court_code, end_date):
         print(f"Error during S3 upload: {e}")
         traceback.print_exc()
         raise
+
+
+def _advance_court_resume_cursors(
+    court_code_underscore,
+    target_benches,
+    scraped_through,
+    bench_year_partitions,
+    benches_blocked,
+):
+    """Advance scraped_through_date for every bench of this court.
+
+    We use the date scraped THROUGH rather than max decision date, because the
+    scrape operates on decision-date ranges and that is the actual boundary.
+    Write to the data index so auto-detect sees it.
+
+    Benches that produced no new files are included on purpose. The search is
+    issued per court, so a bench with no rows in the range has genuinely been
+    covered - "no judgments" is not "not looked at". Skipping those benches
+    left them with no cursor at all, and run() resolves a court's start date as
+    the MIN across its benches, so a single quiet bench pinned its whole court
+    to an ever-growing re-scrape window (see issue #30).
+    """
+    if scraped_through is None:
+        return
+    scraped_through_str = (
+        scraped_through.strftime("%Y-%m-%d")
+        if hasattr(scraped_through, "strftime")
+        else str(scraped_through)
+    )
+    default_year = int(scraped_through_str[:4])
+    for bench in target_benches:
+        if bench in benches_blocked:
+            continue
+        # All year partitions this bench has touched, plus the cursor's own
+        # year (in case the bench has no files for it yet).
+        years_to_update = set(bench_year_partitions.get(bench, ())) | {default_year}
+        for yr in sorted(years_to_update):
+            try:
+                write_scraped_through_date(
+                    "data", yr, court_code_underscore, bench, scraped_through_str
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Failed to write scraped_through_date for "
+                    f"{yr}/{court_code_underscore}/{bench}: {e}"
+                )
 
 
 class Downloader:
@@ -1540,6 +1682,16 @@ Examples:
         "--max_workers", type=int, default=2, help="Number of parallel workers"
     )
     parser.add_argument(
+        "--max-runtime-minutes",
+        type=int,
+        default=DEFAULT_MAX_RUNTIME_MINUTES,
+        help=(
+            "Wall-clock budget for the run. Stops starting new work once "
+            "exceeded and exits non-zero if any court was left unattempted. "
+            "Keep it below the CI job timeout. Pass 0 to disable."
+        ),
+    )
+    parser.add_argument(
         "--fetch_dates",
         action="store_true",
         help="Just display latest dates from S3 index files without downloading",
@@ -1606,6 +1758,7 @@ Examples:
             compress_pdfs=args.compress_pdfs,
             dist_code=args.dist_code,
             use_default_dist_codes=args.default_dist_codes,
+            max_runtime_minutes=args.max_runtime_minutes or None,
         )
 
 """
