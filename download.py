@@ -72,6 +72,13 @@ DEFAULT_MAX_RUNTIME_MINUTES = 300
 # last partial batch. A normal daily run generates fewer tasks than this, so it
 # still uploads once per court - this only engages when draining a backlog.
 DEFAULT_CHECKPOINT_TASKS = 10
+# Consecutive connectivity failures before the run gives up entirely. A portal
+# that refuses to connect will not start working because we asked 3,000 more
+# times: retrying past this point is just load on a service that is already
+# struggling, and it burns the run's budget producing nothing. Counts only
+# connection-level errors (timeouts, refused, DNS) - an HTTP response, even an
+# error one, means the portal is alive and is handled by the per-task retries.
+CONNECTIVITY_FAILURE_LIMIT = 10
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -322,18 +329,99 @@ def generate_tasks(
                 )
 
 
+class PortalUnreachable(RuntimeError):
+    """The portal stopped accepting connections; the run gave up on purpose."""
+
+
+def _is_connectivity_error(exc):
+    """True if the portal could not be reached at all.
+
+    Deliberately narrow: a connection-level failure means nothing answered.
+    An HTTP response - even 5xx, even a CAPTCHA or session error - proves the
+    portal is alive and is the per-task retries' problem, not the breaker's.
+    """
+    seen = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(
+            exc,
+            (
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ConnectTimeout,
+                requests.exceptions.ReadTimeout,
+                urllib3.exceptions.NewConnectionError,
+                urllib3.exceptions.ConnectTimeoutError,
+            ),
+        ):
+            return True
+        exc = exc.__cause__ or exc.__context__
+    return False
+
+
+class _ConnectivityBreaker:
+    """Trips after CONNECTIVITY_FAILURE_LIMIT consecutive unreachable errors.
+
+    Consecutive, not cumulative: a portal that answers intermittently keeps
+    resetting the count, so only a sustained outage trips it.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._consecutive = 0
+        self._tripped = False
+
+    def reset(self):
+        with self._lock:
+            self._consecutive = 0
+            self._tripped = False
+
+    def record_success(self):
+        with self._lock:
+            self._consecutive = 0
+
+    def record_failure(self):
+        """Returns True if this failure tripped the breaker."""
+        with self._lock:
+            self._consecutive += 1
+            if self._consecutive >= CONNECTIVITY_FAILURE_LIMIT:
+                self._tripped = True
+            return self._tripped
+
+    @property
+    def tripped(self):
+        with self._lock:
+            return self._tripped
+
+
+connectivity_breaker = _ConnectivityBreaker()
+
+
 def process_task(task: CourtDateTask, compression_enabled=False):
     """Process a single court-date task"""
     court_codes = get_court_codes()
     for attempt in range(1, TASK_DOWNLOAD_ATTEMPTS + 1):
+        # Once the portal is judged unreachable, stop issuing requests at all -
+        # including retries of tasks already in flight.
+        if connectivity_breaker.tripped:
+            raise PortalUnreachable(
+                f"Portal unreachable; skipped {task} without contacting it"
+            )
         try:
             downloader = Downloader(
                 task,
                 compression_enabled=compression_enabled,
             )
             downloader.download()
+            connectivity_breaker.record_success()
             return
         except Exception as e:
+            connectivity = _is_connectivity_error(e)
+            if connectivity and connectivity_breaker.record_failure():
+                raise PortalUnreachable(
+                    f"Portal unreachable after {CONNECTIVITY_FAILURE_LIMIT} "
+                    f"consecutive connection failures; stopping so we stop "
+                    f"hammering it: {e}"
+                ) from e
             logger.error(
                 f"Error processing court {task.court_code} "
                 f"{court_codes.get(task.court_code, 'Unknown')} "
@@ -476,6 +564,9 @@ def run(
         else None
     )
     pending_upload: Optional[concurrent.futures.Future] = None
+    # Module-level state, so clear it per run rather than inheriting a trip
+    # from an earlier call in the same process.
+    connectivity_breaker.reset()
     task_failures = []
     total_tasks = 0
     unrun_tasks: List[CourtDateTask] = []
@@ -486,6 +577,12 @@ def run(
 
     # Process each court individually for proper S3 handling
     for court_code in target_courts:
+        # Nothing is reachable, so starting another court would only generate
+        # more failed connections against a portal that is already down.
+        if connectivity_breaker.tripped:
+            unattempted_courts.append(court_code)
+            continue
+
         if deadline is not None and time.monotonic() >= deadline:
             unattempted_courts.append(court_code)
             print(
@@ -638,6 +735,18 @@ def run(
             f"--court_code run."
         )
 
+    if connectivity_breaker.tripped:
+        problems.insert(
+            0,
+            f"Portal unreachable: stopped after "
+            f"{CONNECTIVITY_FAILURE_LIMIT} consecutive connection failures "
+            f"rather than continuing to send requests. Nothing is wrong with "
+            f"the resume cursors - no range was marked covered - so a later "
+            f"run picks up exactly where this one stopped. Check whether "
+            f"judgments.ecourts.gov.in is reachable from this network before "
+            f"re-running.",
+        )
+
     if problems:
         raise RuntimeError("\n\n".join(problems))
 
@@ -682,6 +791,7 @@ def _run_tasks(tasks, max_workers, compression_enabled=False, deadline=None):
                 for task in tasks
             }
             budget_exhausted = False
+            aborted = False
             for future in concurrent.futures.as_completed(future_to_task):
                 task = future_to_task[future]
                 pbar.set_description(
@@ -701,6 +811,21 @@ def _run_tasks(tasks, max_workers, compression_enabled=False, deadline=None):
                         e,
                     )
                 pbar.update(1)
+                # The portal is unreachable: drop everything still queued
+                # rather than working through it one 30s timeout at a time.
+                # Cancelled ranges are reported as unrun, so no cursor advances
+                # over them and the next run retries them.
+                if not aborted and connectivity_breaker.tripped:
+                    aborted = True
+                    for pending_future, pending_task in future_to_task.items():
+                        if pending_future.cancel():
+                            unrun.append(pending_task)
+                    logger.error(
+                        "Portal unreachable; abandoned %d queued range(s) for "
+                        "court %s instead of retrying against a dead endpoint",
+                        len(unrun),
+                        task.court_code,
+                    )
                 if (
                     not budget_exhausted
                     and deadline is not None

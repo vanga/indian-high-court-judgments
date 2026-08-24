@@ -8,6 +8,9 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import call, patch
 
+import requests
+import urllib3
+
 import download
 
 
@@ -521,6 +524,98 @@ class RunBudgetTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("boom", message)
         self.assertIn("not run", message)
+
+
+class ConnectivityBreakerTests(unittest.TestCase):
+    """A portal that will not connect must not be hammered.
+
+    The 2026-08-24 run sent 3,607 connection attempts to an endpoint that
+    never answered, burning two hours to scrape nothing.
+    """
+
+    def setUp(self):
+        download.connectivity_breaker.reset()
+        self.addCleanup(download.connectivity_breaker.reset)
+
+    def _timeout(self):
+        return requests.exceptions.ConnectTimeout("timed out")
+
+    def test_connection_errors_are_recognised_through_the_cause_chain(self):
+        try:
+            try:
+                raise urllib3.exceptions.NewConnectionError(None, "no route")
+            except Exception as inner:
+                raise RuntimeError("wrapped") from inner
+        except RuntimeError as e:
+            self.assertTrue(download._is_connectivity_error(e))
+
+    def test_http_errors_do_not_trip_the_breaker(self):
+        """A response - any response - means the portal is alive."""
+        self.assertFalse(
+            download._is_connectivity_error(RuntimeError("session expired"))
+        )
+        self.assertFalse(
+            download._is_connectivity_error(requests.exceptions.HTTPError("500"))
+        )
+
+    def test_breaker_needs_consecutive_failures(self):
+        for _ in range(download.CONNECTIVITY_FAILURE_LIMIT - 1):
+            download.connectivity_breaker.record_failure()
+        # A single success clears the streak, so an intermittent portal that
+        # still answers sometimes keeps working.
+        download.connectivity_breaker.record_success()
+        self.assertFalse(download.connectivity_breaker.tripped)
+
+        for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
+            download.connectivity_breaker.record_failure()
+        self.assertTrue(download.connectivity_breaker.tripped)
+
+    def test_process_task_stops_contacting_the_portal_once_tripped(self):
+        task = download.CourtDateTask("9~13", "2026-01-01", "2026-01-05")
+        download.connectivity_breaker._tripped = True
+
+        with (
+            patch.object(
+                download, "get_court_codes", return_value={"9~13": "Allahabad"}
+            ),
+            patch.object(download.Downloader, "download") as dl,
+        ):
+            with self.assertRaises(download.PortalUnreachable):
+                download.process_task(task)
+
+        dl.assert_not_called()
+
+    def test_sustained_timeouts_abort_instead_of_retrying_every_task(self):
+        tasks = [
+            download.CourtDateTask("9~13", f"2026-01-{d:02d}", f"2026-01-{d:02d}")
+            for d in range(1, 26)
+        ]
+        attempts = {"n": 0}
+
+        def always_timeout(*_a, **_k):
+            attempts["n"] += 1
+            raise requests.exceptions.ConnectTimeout("timed out")
+
+        with (
+            patch.object(
+                download, "get_court_codes", return_value={"9~13": "Allahabad"}
+            ),
+            patch.object(download.time, "sleep"),
+            patch.object(download.Downloader, "download", side_effect=always_timeout),
+        ):
+            failures, unrun = download._run_tasks(tasks, max_workers=1)
+
+        self.assertTrue(download.connectivity_breaker.tripped)
+        # The whole point: without the breaker this is 25 tasks x 3 retries =
+        # 75 connection attempts against a dead endpoint. The breaker caps it
+        # at the limit and every later task is skipped without being contacted.
+        self.assertLessEqual(attempts["n"], download.CONNECTIVITY_FAILURE_LIMIT)
+        self.assertLess(attempts["n"], len(tasks) * download.TASK_DOWNLOAD_ATTEMPTS)
+        # Nothing is silently counted as done: every range is either a failure
+        # or unrun, and both block the resume cursor.
+        self.assertEqual(len(failures) + len(unrun), len(tasks))
+        skipped = [e for _, e in failures if isinstance(e, download.PortalUnreachable)]
+        self.assertTrue(skipped, "later ranges should short-circuit, not retry")
 
 
 class CheckpointTests(unittest.TestCase):
