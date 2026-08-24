@@ -554,20 +554,12 @@ def run(
     if upload_executor is not None:
         upload_executor.shutdown(wait=True)
 
-    # A court that was never attempted (or a range that never ran) is a silent
-    # data gap, not a transient error, so it is always fatal — unlike the
-    # tolerated task failures below. Raised after the uploads above so whatever
-    # progress the run did make is still persisted.
-    if unattempted_courts or unrun_tasks:
-        raise RuntimeError(
-            f"Run budget of {max_runtime_minutes} minute(s) exhausted before the "
-            f"work was finished: {len(unattempted_courts)} court(s) not attempted "
-            f"({', '.join(unattempted_courts) or 'none'}) and "
-            f"{len(unrun_tasks)} date range(s) not run. Those courts are not "
-            f"being refreshed — raise --max-runtime-minutes, narrow the date "
-            f"window, or backfill the lagging courts with an explicit "
-            f"--court_code run."
-        )
+    # Both conditions below can hold in the same run (a run can exhaust its
+    # budget *and* accumulate genuine task failures). They are collected and
+    # raised together: raising on the first one found would hide the other, and
+    # the per-task detail is exactly what is needed to tell a transient portal
+    # wobble apart from a budget that is simply too small.
+    problems = []
 
     if task_failures:
         failed_tasks = "\n".join(
@@ -581,19 +573,38 @@ def run(
         failure_ratio = n_failed / total_tasks if total_tasks else 1.0
         fatal = failure_ratio > FAILURE_RATIO_THRESHOLD or n_failed > FAILURE_COUNT_THRESHOLD
         if fatal:
-            raise RuntimeError(
+            problems.append(
                 f"{n_failed}/{total_tasks} task(s) failed "
                 f"({failure_ratio:.0%} > {FAILURE_RATIO_THRESHOLD:.0%} or "
                 f"count > {FAILURE_COUNT_THRESHOLD}):\n{failed_tasks}"
             )
-        logger.warning(
-            "%d/%d task(s) failed transiently (%.0f%%); within tolerance, "
-            "will resume on next run:\n%s",
-            n_failed,
-            total_tasks,
-            failure_ratio * 100,
-            failed_tasks,
+        else:
+            logger.warning(
+                "%d/%d task(s) failed transiently (%.0f%%); within tolerance, "
+                "will resume on next run:\n%s",
+                n_failed,
+                total_tasks,
+                failure_ratio * 100,
+                failed_tasks,
+            )
+
+    # A court that was never attempted (or a range that never ran) is a silent
+    # data gap, not a transient error, so it is always fatal — unlike the
+    # tolerated task failures above. Raised after the uploads above so whatever
+    # progress the run did make is still persisted.
+    if unattempted_courts or unrun_tasks:
+        problems.append(
+            f"Run budget of {max_runtime_minutes} minute(s) exhausted before the "
+            f"work was finished: {len(unattempted_courts)} court(s) not attempted "
+            f"({', '.join(unattempted_courts) or 'none'}) and "
+            f"{len(unrun_tasks)} date range(s) not run. Those courts are not "
+            f"being refreshed — raise --max-runtime-minutes, narrow the date "
+            f"window, or backfill the lagging courts with an explicit "
+            f"--court_code run."
         )
+
+    if problems:
+        raise RuntimeError("\n\n".join(problems))
 
     logger.info("All download tasks completed")
 
@@ -808,6 +819,11 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
     # this court, including benches that produced no new files this run.
     bench_year_partitions: Dict[str, set] = {}
     benches_blocked: set = set()
+    # Benches that finished their iteration without raising. Used to persist
+    # partial progress if a later bench blows up mid-loop — see the except below.
+    benches_completed: set = set()
+    cursors_advanced = False
+    cursor_target = scraped_through if scraped_through is not None else end_date
 
     try:
         for bench in target_benches:
@@ -945,13 +961,16 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
                     f"(unparseable dates or upload failures)"
                 )
 
+            benches_completed.add(bench)
+
         _advance_court_resume_cursors(
             court_code_underscore,
             target_benches,
-            scraped_through if scraped_through is not None else end_date,
+            cursor_target,
             bench_year_partitions,
             benches_blocked,
         )
+        cursors_advanced = True
 
         if upload_failures:
             raise RuntimeError(
@@ -959,6 +978,25 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
             )
 
     except Exception as e:
+        # An exception anywhere in the bench loop (e.g. a transient S3 read
+        # before the per-year guard) would otherwise skip the advance entirely
+        # and discard cursors for benches that already synced cleanly. Persist
+        # those, and only those: benches at or after the failure point have not
+        # been shown to be covered, so they keep their old cursor and retry.
+        if not cursors_advanced:
+            try:
+                _advance_court_resume_cursors(
+                    court_code_underscore,
+                    sorted(benches_completed),
+                    cursor_target,
+                    bench_year_partitions,
+                    benches_blocked,
+                )
+            except Exception:
+                logger.exception(
+                    "Failed to persist partial resume cursors for "
+                    f"{court_code_underscore}"
+                )
         print(f"Error during S3 upload: {e}")
         traceback.print_exc()
         raise

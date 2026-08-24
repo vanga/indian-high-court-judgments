@@ -380,6 +380,37 @@ class ResumeCursorTests(unittest.TestCase):
         written_dates = {c.args[4] for c in cursor_mock.call_args_list}
         self.assertEqual(written_dates, {"2026-08-10"})
 
+    def test_midloop_failure_still_persists_cursors_for_completed_benches(self):
+        """A transient error on a later bench must not discard earlier progress.
+
+        The cursor advance runs once after the bench loop, so an exception
+        raised before it (e.g. an S3 read outside the per-year guard) used to
+        skip cursor writes for benches that had already synced cleanly.
+        """
+        with ExitStack() as stack:
+            mocks = [stack.enter_context(p) for p in self._patches()]
+            cursor_mock = mocks[8]
+            # busybench is on disk and syncs; quietbench has no directory, so
+            # give the *second* bench directory a file and blow up reading it.
+            other = Path("data/court/cnrorders/quietbench/orders/2025")
+            other.mkdir(parents=True, exist_ok=True)
+            (other / "case.json").write_text('{"raw_html":"<div></div>"}')
+
+            def flaky(data_type, year, court_code, bench, *args, **kwargs):
+                if bench == "quietbench":
+                    raise RuntimeError("transient S3 read failure")
+                return []
+
+            mocks[3].side_effect = flaky
+
+            with self.assertRaises(RuntimeError):
+                download._upload_court_to_s3("27~1", date(2026, 8, 24))
+
+        benches_written = {c.args[3] for c in cursor_mock.call_args_list}
+        # The bench that completed keeps its cursor; the one that failed does not.
+        self.assertIn("busybench", benches_written)
+        self.assertNotIn("quietbench", benches_written)
+
 
 class ContiguousCursorTests(unittest.TestCase):
     def test_full_coverage_uses_end_date(self):
@@ -452,6 +483,43 @@ class RunBudgetTests(unittest.TestCase):
 
         # Budget was already gone, so no court was even started.
         run_mock.assert_not_called()
+
+    def test_budget_error_does_not_hide_task_failure_detail(self):
+        """A run can exhaust its budget *and* hit real failures.
+
+        Raising on the budget alone used to make the per-task failure block
+        unreachable, dropping exactly the detail needed to tell a transient
+        portal wobble apart from a budget that is simply too small.
+        """
+        task = download.CourtDateTask("9~13", "2026-08-20", "2026-08-24")
+        unrun = download.CourtDateTask("9~13", "2026-08-25", "2026-08-29")
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download, "get_court_codes", return_value={"9~13": "Allahabad"}
+                )
+            )
+            stack.enter_context(patch.object(download, "S3_ENABLED", False))
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "_run_tasks",
+                    return_value=([(task, RuntimeError("boom"))], [unrun]),
+                )
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                download.run(
+                    start_date="2026-08-20",
+                    end_date="2026-08-24",
+                    day_step=5,
+                    max_runtime_minutes=60,
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("boom", message)
+        self.assertIn("not run", message)
 
 
 if __name__ == "__main__":
