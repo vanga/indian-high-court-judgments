@@ -527,18 +527,26 @@ class RunBudgetTests(unittest.TestCase):
 
 
 class ConnectivityBreakerTests(unittest.TestCase):
-    """A portal that will not connect must not be hammered.
+    """Reachability is judged from request outcomes, not task outcomes.
 
-    The 2026-08-24 run sent 3,607 connection attempts to an endpoint that
-    never answered, burning two hours to scrape nothing.
+    The 2026-08-24 runs are the reference cases. From GitHub: every request
+    timed out, 213/213 ranges failed, and the run should stop fast. From a
+    working network: ~33% of connections dropped, which fails most whole tasks
+    while two thirds of requests succeed - and the run should keep going.
+    Earlier designs counted consecutive task failures and could not tell those
+    apart, stopping a catch-up against a portal that was plainly serving.
     """
 
     def setUp(self):
         download.connectivity_breaker.reset()
         self.addCleanup(download.connectivity_breaker.reset)
 
-    def _timeout(self):
-        return requests.exceptions.ConnectTimeout("timed out")
+    def _feed(self, oks):
+        for ok in oks:
+            if ok:
+                download.connectivity_breaker.record_success()
+            else:
+                download.connectivity_breaker.record_failure()
 
     def test_connection_errors_are_recognised_through_the_cause_chain(self):
         try:
@@ -549,8 +557,8 @@ class ConnectivityBreakerTests(unittest.TestCase):
         except RuntimeError as e:
             self.assertTrue(download._is_connectivity_error(e))
 
-    def test_http_errors_do_not_trip_the_breaker(self):
-        """A response - any response - means the portal is alive."""
+    def test_http_errors_are_not_connectivity_failures(self):
+        """A response - any response - proves the portal is alive."""
         self.assertFalse(
             download._is_connectivity_error(RuntimeError("session expired"))
         )
@@ -558,138 +566,91 @@ class ConnectivityBreakerTests(unittest.TestCase):
             download._is_connectivity_error(requests.exceptions.HTTPError("500"))
         )
 
-    def test_breaker_needs_consecutive_failures(self):
-        for _ in range(download.CONNECTIVITY_FAILURE_LIMIT - 1):
-            download.connectivity_breaker.record_failure()
-        # A single success clears the streak, so an intermittent portal that
-        # still answers sometimes keeps working.
-        download.connectivity_breaker.record_success()
-        self.assertFalse(download.connectivity_breaker.tripped)
+    def test_partial_drop_rate_is_not_unreachable(self):
+        """The regression that motivated this design.
 
-        for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
-            download.connectivity_breaker.record_failure()
-        self.assertTrue(download.connectivity_breaker.tripped)
-
-    def test_breaker_reopens_after_cooldown(self):
-        """A stress burst must not kill a run against a working portal.
-
-        A busy portal drops some connections while serving most; with several
-        workers in flight that can hit the limit in seconds. Tripping forever
-        on that abandons a catch-up the portal would happily have served.
+        A third of connections dropping is a working portal having a bad day.
+        Stopping on it abandons a catch-up the portal would have served.
         """
-        b = download.connectivity_breaker
-        for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
-            b.record_failure()
-        self.assertTrue(b.tripped)
-        self.assertFalse(b.exhausted, "one burst must not be terminal")
+        pattern = [True, True, False] * 20  # ~33% failures, well past the window
+        self._feed(pattern)
+        self.assertFalse(download.connectivity_breaker.unreachable)
+        self.assertFalse(download.connectivity_breaker.exhausted)
 
-        # Still open during the cooldown...
-        with patch.object(download.time, "monotonic", return_value=b._tripped_at + 1):
-            self.assertTrue(b.tripped)
-        # ...and half-open once it elapses.
+    def test_near_total_failure_is_unreachable(self):
+        self._feed([False] * download.CONNECTIVITY_WINDOW)
+        self.assertTrue(download.connectivity_breaker.unreachable)
+
+    def test_needs_a_minimum_sample_before_judging(self):
+        """A few workers hitting one blip must not condemn the portal."""
+        self._feed([False] * (download.CONNECTIVITY_MIN_SAMPLES - 1))
+        self.assertFalse(download.connectivity_breaker.unreachable)
+
+    def test_traffic_is_let_back_in_after_the_pause(self):
+        b = download.connectivity_breaker
+        self._feed([False] * download.CONNECTIVITY_WINDOW)
+        self.assertTrue(b.unreachable)
+
         with patch.object(
             download.time,
             "monotonic",
-            return_value=b._tripped_at + download.CONNECTIVITY_COOLDOWN_SECONDS + 1,
+            return_value=time.monotonic() + download.CONNECTIVITY_PAUSE_SECONDS + 1,
         ):
-            self.assertFalse(b.tripped)
+            # Stale evidence is discarded so live traffic decides again.
+            self.assertFalse(b.unreachable)
+        self.assertFalse(b.unreachable)
 
-        # A probe that succeeds restores the trip budget too.
+    def test_a_trickle_of_success_prevents_exhaustion(self):
+        """Slow is not gone. Only total silence ends a run."""
+        b = download.connectivity_breaker
+        self._feed([False] * 200)
         b.record_success()
-        self.assertFalse(b.tripped)
-        self.assertFalse(b.exhausted)
+        with patch.object(
+            download.time,
+            "monotonic",
+            return_value=time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS - 1,
+        ):
+            self.assertFalse(b.exhausted)
 
-    def test_success_clears_the_trip_budget_after_a_reopen(self):
-        """Trips must not accumulate across a run that is plainly working.
-
-        The cooldown clears the tripped flag on its way to half-open, so a
-        success arriving afterwards has to reset the budget too - otherwise a
-        long run latches after N scattered bursts despite thousands of
-        successful downloads between them.
-        """
+    def test_total_silence_exhausts_the_run(self):
         b = download.connectivity_breaker
-        for burst in range(download.CONNECTIVITY_MAX_TRIPS + 2):
-            for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
-                b.record_failure()
-            # Cooldown elapses -> half-open (this clears _tripped internally).
-            b._tripped_at -= download.CONNECTIVITY_COOLDOWN_SECONDS + 1
-            self.assertFalse(b.tripped)
-            # The portal then serves a range, as it did ~9,800 times today.
-            b.record_success()
-            self.assertFalse(
-                b.exhausted,
-                f"burst {burst}: a working portal must never exhaust the budget",
-            )
+        self._feed([False] * download.CONNECTIVITY_WINDOW)
+        with patch.object(
+            download.time,
+            "monotonic",
+            return_value=time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS + 1,
+        ):
+            self.assertTrue(b.exhausted)
 
-    def test_breaker_gives_up_after_repeated_trips(self):
-        """A portal that is genuinely gone must still be abandoned."""
+    def test_tracked_request_records_both_outcomes(self):
         b = download.connectivity_breaker
-        for trip in range(download.CONNECTIVITY_MAX_TRIPS):
-            for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
-                b.record_failure()
-            if trip < download.CONNECTIVITY_MAX_TRIPS - 1:
-                self.assertFalse(b.exhausted)
-                # Cooldown elapses, breaker reopens, portal still dead.
-                b._tripped_at = b._tripped_at - (
-                    download.CONNECTIVITY_COOLDOWN_SECONDS + 1
-                )
-                self.assertFalse(b.tripped)
 
-        self.assertTrue(b.exhausted)
-        # Exhausted means exhausted: no further cooldown reopens it.
-        b._tripped_at = b._tripped_at - 10_000
-        self.assertTrue(b.tripped)
+        with patch.object(download.requests, "request", return_value="resp"):
+            self.assertEqual(download._tracked_request("GET", "http://x"), "resp")
+        self.assertEqual(list(b._window), [True])
 
-    def test_portal_failure_is_not_reported_as_a_timeout(self):
-        """Blaming the clock would point at the wrong fix.
+        with patch.object(
+            download.requests,
+            "request",
+            side_effect=requests.exceptions.ConnectTimeout("nope"),
+        ):
+            with self.assertRaises(requests.exceptions.ConnectTimeout):
+                download._tracked_request("GET", "http://x")
+        self.assertEqual(list(b._window), [True, False])
 
-        The breaker skips courts, which used to land them in the budget
-        message telling the reader to raise --max-runtime-minutes - advice
-        that cannot help when nothing is answering.
-        """
-        task = download.CourtDateTask("9~13", "2026-08-20", "2026-08-24")
+        # An HTTP-level error still counts as the portal being alive.
+        with patch.object(
+            download.requests, "request", side_effect=requests.exceptions.HTTPError("500")
+        ):
+            with self.assertRaises(requests.exceptions.HTTPError):
+                download._tracked_request("GET", "http://x")
+        self.assertEqual(list(b._window), [True, False])
 
-        def trip_and_fail(*_a, **_k):
-            # Exhaust the breaker outright: a single trip is recoverable now,
-            # and this test is about how a *terminal* outage is reported.
-            b = download.connectivity_breaker
-            b._tripped = True
-            b._trips = download.CONNECTIVITY_MAX_TRIPS
-            return ([(task, download.PortalUnreachable("down"))], [])
-
-        with ExitStack() as stack:
-            stack.enter_context(
-                patch.object(
-                    download,
-                    "get_court_codes",
-                    return_value={"9~13": "Allahabad", "27~1": "Bombay"},
-                )
-            )
-            stack.enter_context(patch.object(download, "S3_ENABLED", False))
-            stack.enter_context(
-                patch.object(download, "_run_tasks", side_effect=trip_and_fail)
-            )
-
-            with self.assertRaises(RuntimeError) as ctx:
-                download.run(
-                    start_date="2026-08-20",
-                    end_date="2026-08-24",
-                    day_step=5,
-                    max_runtime_minutes=300,
-                )
-
-        message = str(ctx.exception)
-        self.assertIn("Portal unreachable", message)
-        self.assertIn("27~1", message)  # named as skipped, not silently dropped
-        self.assertNotIn("Run budget", message)
-        self.assertNotIn("raise --max-runtime-minutes", message)
-
-    def test_process_task_stops_contacting_the_portal_once_exhausted(self):
+    def test_process_task_skips_only_once_exhausted(self):
         task = download.CourtDateTask("9~13", "2026-01-01", "2026-01-05")
-        # Exhausted, not merely tripped: a tripped breaker now waits out its
-        # cooldown rather than abandoning the range.
-        download.connectivity_breaker._tripped = True
-        download.connectivity_breaker._trips = download.CONNECTIVITY_MAX_TRIPS
+        download.connectivity_breaker._last_success = (
+            time.monotonic() - download.CONNECTIVITY_OUTAGE_SECONDS - 1
+        )
 
         with (
             patch.object(
@@ -702,7 +663,7 @@ class ConnectivityBreakerTests(unittest.TestCase):
 
         dl.assert_not_called()
 
-    def test_sustained_timeouts_abort_instead_of_retrying_every_task(self):
+    def test_dead_portal_stops_well_short_of_one_attempt_per_task(self):
         tasks = [
             download.CourtDateTask("9~13", f"2026-01-{d:02d}", f"2026-01-{d:02d}")
             for d in range(1, 26)
@@ -711,6 +672,7 @@ class ConnectivityBreakerTests(unittest.TestCase):
 
         def always_timeout(*_a, **_k):
             attempts["n"] += 1
+            download.connectivity_breaker.record_failure()
             raise requests.exceptions.ConnectTimeout("timed out")
 
         with (
@@ -718,27 +680,55 @@ class ConnectivityBreakerTests(unittest.TestCase):
                 download, "get_court_codes", return_value={"9~13": "Allahabad"}
             ),
             patch.object(download.time, "sleep"),
-            # No cooldown: exercise trip -> reopen -> re-trip without waiting
-            # out real seconds.
-            patch.object(download, "CONNECTIVITY_COOLDOWN_SECONDS", 0),
+            # Nothing has answered since the run began.
+            patch.object(download, "CONNECTIVITY_OUTAGE_SECONDS", 0),
             patch.object(download.Downloader, "download", side_effect=always_timeout),
         ):
             failures, unrun = download._run_tasks(tasks, max_workers=1)
 
-        self.assertTrue(download.connectivity_breaker.exhausted)
-        # Without the breaker this is 25 tasks x 3 retries = 75 attempts. With
-        # it, a dead portal costs at most limit x max_trips before the run
-        # gives up and skips the rest without contacting them.
-        self.assertLessEqual(
-            attempts["n"],
-            download.CONNECTIVITY_FAILURE_LIMIT * download.CONNECTIVITY_MAX_TRIPS,
+        self.assertLess(
+            attempts["n"], len(tasks) * download.TASK_DOWNLOAD_ATTEMPTS
         )
-        self.assertLess(attempts["n"], len(tasks) * download.TASK_DOWNLOAD_ATTEMPTS)
-        # Nothing is silently counted as done: every range is either a failure
-        # or unrun, and both block the resume cursor.
+        # Nothing is silently counted as done: every range is a failure or
+        # unrun, and both block the resume cursor.
         self.assertEqual(len(failures) + len(unrun), len(tasks))
-        skipped = [e for _, e in failures if isinstance(e, download.PortalUnreachable)]
-        self.assertTrue(skipped, "later ranges should short-circuit, not retry")
+
+    def test_portal_failure_is_not_reported_as_a_timeout(self):
+        """Blaming the clock would point at the wrong fix."""
+        task = download.CourtDateTask("9~13", "2026-08-20", "2026-08-24")
+
+        def fail_and_starve(*_a, **_k):
+            download.connectivity_breaker._last_success = (
+                time.monotonic() - download.CONNECTIVITY_OUTAGE_SECONDS - 1
+            )
+            return ([(task, download.PortalUnreachable("down"))], [])
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "get_court_codes",
+                    return_value={"9~13": "Allahabad", "27~1": "Bombay"},
+                )
+            )
+            stack.enter_context(patch.object(download, "S3_ENABLED", False))
+            stack.enter_context(
+                patch.object(download, "_run_tasks", side_effect=fail_and_starve)
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                download.run(
+                    start_date="2026-08-20",
+                    end_date="2026-08-24",
+                    day_step=5,
+                    max_runtime_minutes=300,
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("Portal unreachable", message)
+        self.assertIn("27~1", message)
+        self.assertNotIn("Run budget", message)
+        self.assertNotIn("raise --max-runtime-minutes", message)
 
 
 class CheckpointTests(unittest.TestCase):

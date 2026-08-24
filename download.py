@@ -17,6 +17,7 @@ import traceback
 import urllib.parse
 import uuid
 import warnings
+from collections import deque
 from datetime import datetime, timedelta
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -78,17 +79,23 @@ DEFAULT_CHECKPOINT_TASKS = 10
 # struggling, and it burns the run's budget producing nothing. Counts only
 # connection-level errors (timeouts, refused, DNS) - an HTTP response, even an
 # error one, means the portal is alive and is handled by the per-task retries.
-CONNECTIVITY_FAILURE_LIMIT = 10
-# A stressed portal drops a fraction of connections rather than all of them,
-# and with several workers in flight a bad patch can produce the limit above in
-# seconds while the portal is still serving most requests. So a trip is not
-# final: after a cooldown the breaker goes half-open and lets one attempt
-# through. If it succeeds the run carries on; if the portal really is gone the
-# breaker re-trips, and after CONNECTIVITY_MAX_TRIPS it stays down for good.
-# Bounds a true outage to roughly limit x max_trips requests while still
-# surviving the transient bursts that a busy portal produces.
-CONNECTIVITY_COOLDOWN_SECONDS = 60
-CONNECTIVITY_MAX_TRIPS = 3
+# Reachability is judged from a sliding window of individual request outcomes.
+# Earlier versions counted consecutive *task* failures, which conflates two
+# different things: a portal that is gone, and one merely slow enough that
+# whole tasks fail. At a 33% connection-drop rate almost every task fails while
+# two thirds of requests still succeed - a portal well worth continuing
+# against, which the old design stopped the run on anyway.
+CONNECTIVITY_WINDOW = 40
+# Never judge on a handful of requests; several workers can each hit a blip.
+CONNECTIVITY_MIN_SAMPLES = 20
+# Only near-total failure means "nothing is answering". A partial drop rate,
+# however painful, is a working portal.
+CONNECTIVITY_FAILURE_RATIO = 0.9
+# How long to hold off before letting traffic re-prove reachability.
+CONNECTIVITY_PAUSE_SECONDS = 60
+# No successful request at all for this long means the portal is genuinely
+# gone, and the run stops rather than waiting out its whole budget.
+CONNECTIVITY_OUTAGE_SECONDS = 300
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -369,74 +376,89 @@ def _is_connectivity_error(exc):
 
 
 class _ConnectivityBreaker:
-    """Trips after CONNECTIVITY_FAILURE_LIMIT consecutive unreachable errors.
+    """Judges reachability from recent request outcomes.
 
-    Consecutive, not cumulative: a portal that answers intermittently keeps
-    resetting the count, so only a sustained outage trips it.
+    Two separate questions, deliberately kept apart:
+
+    `unreachable` - is almost nothing getting through *right now*? Measured as
+    the failure ratio over the last CONNECTIVITY_WINDOW requests. Workers hold
+    while this is true, then traffic is let back in to re-prove it.
+
+    `exhausted` - has *nothing at all* succeeded for CONNECTIVITY_OUTAGE_SECONDS?
+    That is the only condition that ends a run, and a portal serving even a
+    trickle can never satisfy it.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
-        self._consecutive = 0
-        self._tripped = False
-        self._tripped_at = 0.0
-        self._trips = 0
+        self._window = deque(maxlen=CONNECTIVITY_WINDOW)
+        self._last_success = time.monotonic()
+        self._paused_until = None
 
     def reset(self):
         with self._lock:
-            self._consecutive = 0
-            self._tripped = False
-            self._tripped_at = 0.0
-            self._trips = 0
+            self._window.clear()
+            # Start the outage clock at the run, not at process import.
+            self._last_success = time.monotonic()
+            self._paused_until = None
 
     def record_success(self):
-        """The portal answered, so whatever we saw before was a blip.
-
-        Always clears the trip budget, not just when still flagged tripped:
-        the cooldown in `tripped` clears that flag on its way to half-open, so
-        keying off it here let trips accumulate across a whole run despite
-        thousands of successful downloads in between - eventually latching a
-        run against a portal that was plainly working.
-        """
         with self._lock:
-            self._consecutive = 0
-            self._tripped = False
-            self._trips = 0
+            self._window.append(True)
+            self._last_success = time.monotonic()
 
     def record_failure(self):
-        """Returns True if the run should stop contacting the portal now."""
         with self._lock:
-            self._consecutive += 1
-            if self._consecutive >= CONNECTIVITY_FAILURE_LIMIT:
-                if not self._tripped:
-                    self._trips += 1
-                self._tripped = True
-                self._tripped_at = time.monotonic()
-                self._consecutive = 0
-            return self._tripped
+            self._window.append(False)
 
     @property
     def exhausted(self):
-        """Tripped too many times: the portal is genuinely gone."""
+        """Nothing has answered for a long time: give up on this run."""
         with self._lock:
-            return self._tripped and self._trips >= CONNECTIVITY_MAX_TRIPS
+            return (
+                time.monotonic() - self._last_success >= CONNECTIVITY_OUTAGE_SECONDS
+            )
 
     @property
-    def tripped(self):
+    def unreachable(self):
+        """Near-total failure over the recent window: hold off for now."""
         with self._lock:
-            if not self._tripped:
+            if self._paused_until is not None:
+                if time.monotonic() < self._paused_until:
+                    return True
+                # Pause elapsed: discard stale evidence so live traffic decides.
+                self._paused_until = None
+                self._window.clear()
                 return False
-            if self._trips >= CONNECTIVITY_MAX_TRIPS:
+
+            if len(self._window) < CONNECTIVITY_MIN_SAMPLES:
+                return False
+            failures = sum(1 for ok in self._window if not ok)
+            if failures / len(self._window) >= CONNECTIVITY_FAILURE_RATIO:
+                self._paused_until = time.monotonic() + CONNECTIVITY_PAUSE_SECONDS
                 return True
-            if time.monotonic() - self._tripped_at >= CONNECTIVITY_COOLDOWN_SECONDS:
-                # Half-open: let attempts through again. A success clears the
-                # breaker; another run of failures re-trips it.
-                self._tripped = False
-                return False
-            return True
+            return False
 
 
 connectivity_breaker = _ConnectivityBreaker()
+
+
+def _tracked_request(method, url, **kwargs):
+    """requests.request, with the outcome fed to the connectivity breaker.
+
+    Every HTTP attempt the scraper makes goes through here, so reachability is
+    judged from what actually happened on the wire rather than inferred from
+    whole tasks failing. Only connection-level errors count against the portal:
+    an HTTP response, whatever its status, proves it is alive.
+    """
+    try:
+        response = requests.request(method, url, **kwargs)
+    except Exception as exc:
+        if _is_connectivity_error(exc):
+            connectivity_breaker.record_failure()
+        raise
+    connectivity_breaker.record_success()
+    return response
 
 
 def process_task(task: CourtDateTask, compression_enabled=False):
@@ -447,7 +469,7 @@ def process_task(task: CourtDateTask, compression_enabled=False):
         # range: a stressed portal usually recovers within the cooldown, and
         # failing here would throw away a range we could still scrape. Only a
         # breaker that has used up its trips is treated as final.
-        while connectivity_breaker.tripped and not connectivity_breaker.exhausted:
+        while connectivity_breaker.unreachable and not connectivity_breaker.exhausted:
             time.sleep(5)
         if connectivity_breaker.exhausted:
             raise PortalUnreachable(
@@ -797,11 +819,9 @@ def run(
         )
         problems.insert(
             0,
-            f"Portal unreachable: the breaker tripped "
-            f"{CONNECTIVITY_MAX_TRIPS} times ("
-            f"{CONNECTIVITY_FAILURE_LIMIT} consecutive connection failures "
-            f"each, with a {CONNECTIVITY_COOLDOWN_SECONDS}s retry between), so "
-            f"the run stopped contacting it.{skipped} Nothing is "
+            f"Portal unreachable: no request succeeded for "
+            f"{CONNECTIVITY_OUTAGE_SECONDS}s, so the run stopped contacting "
+            f"it.{skipped} Nothing is "
             f"wrong with the resume cursors - no range was marked covered - so "
             f"a later run picks up exactly where this one stopped. This is a "
             f"reachability problem, not a timeout: check whether "
@@ -1492,7 +1512,7 @@ class Downloader:
         pdf_download_link = pdf_link_data["outputfile"]
 
         # download pdf and save
-        pdf_response = requests.request(
+        pdf_response = _tracked_request(
             "GET",
             root_url + pdf_download_link,
             verify=False,
@@ -1563,7 +1583,8 @@ class Downloader:
         if captcha_url is None:
             captcha_url = self.captcha_url
         # download captcha image and save
-        captcha_response = requests.get(
+        captcha_response = _tracked_request(
+            "GET",
             captcha_url, headers={"Cookie": self.get_cookie()}, verify=False, timeout=30
         )
         # Generate a unique filename using UUID
@@ -1620,7 +1641,7 @@ class Downloader:
         }
         if with_app_token:
             captcha_check_payload["app_token"] = self.app_token
-        res = requests.request(
+        res = _tracked_request(
             "POST",
             self.captcha_token_url,
             headers=self.get_headers(),
@@ -1639,7 +1660,7 @@ class Downloader:
         logger.debug(
             f"api_request {self.session_id} {payload.get('app_token') if payload else None} {url}"
         )
-        response = requests.request(
+        response = _tracked_request(
             method,
             url,
             headers=headers,
@@ -1732,7 +1753,7 @@ class Downloader:
         return pdf_link_payload_o
 
     def init_user_session(self):
-        res = requests.request(
+        res = _tracked_request(
             "GET",
             f"{self.root_url}/pdfsearch/",
             verify=False,
