@@ -79,6 +79,16 @@ DEFAULT_CHECKPOINT_TASKS = 10
 # connection-level errors (timeouts, refused, DNS) - an HTTP response, even an
 # error one, means the portal is alive and is handled by the per-task retries.
 CONNECTIVITY_FAILURE_LIMIT = 10
+# A stressed portal drops a fraction of connections rather than all of them,
+# and with several workers in flight a bad patch can produce the limit above in
+# seconds while the portal is still serving most requests. So a trip is not
+# final: after a cooldown the breaker goes half-open and lets one attempt
+# through. If it succeeds the run carries on; if the portal really is gone the
+# breaker re-trips, and after CONNECTIVITY_MAX_TRIPS it stays down for good.
+# Bounds a true outage to roughly limit x max_trips requests while still
+# surviving the transient bursts that a busy portal produces.
+CONNECTIVITY_COOLDOWN_SECONDS = 60
+CONNECTIVITY_MAX_TRIPS = 3
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -369,28 +379,57 @@ class _ConnectivityBreaker:
         self._lock = threading.Lock()
         self._consecutive = 0
         self._tripped = False
+        self._tripped_at = 0.0
+        self._trips = 0
 
     def reset(self):
         with self._lock:
             self._consecutive = 0
             self._tripped = False
+            self._tripped_at = 0.0
+            self._trips = 0
 
     def record_success(self):
+        """The portal answered, so whatever we saw before was a blip."""
         with self._lock:
             self._consecutive = 0
+            if self._tripped:
+                # Half-open probe succeeded: give the run a clean slate,
+                # including its trip budget.
+                self._tripped = False
+                self._trips = 0
 
     def record_failure(self):
-        """Returns True if this failure tripped the breaker."""
+        """Returns True if the run should stop contacting the portal now."""
         with self._lock:
             self._consecutive += 1
             if self._consecutive >= CONNECTIVITY_FAILURE_LIMIT:
+                if not self._tripped:
+                    self._trips += 1
                 self._tripped = True
+                self._tripped_at = time.monotonic()
+                self._consecutive = 0
             return self._tripped
+
+    @property
+    def exhausted(self):
+        """Tripped too many times: the portal is genuinely gone."""
+        with self._lock:
+            return self._tripped and self._trips >= CONNECTIVITY_MAX_TRIPS
 
     @property
     def tripped(self):
         with self._lock:
-            return self._tripped
+            if not self._tripped:
+                return False
+            if self._trips >= CONNECTIVITY_MAX_TRIPS:
+                return True
+            if time.monotonic() - self._tripped_at >= CONNECTIVITY_COOLDOWN_SECONDS:
+                # Half-open: let attempts through again. A success clears the
+                # breaker; another run of failures re-trips it.
+                self._tripped = False
+                return False
+            return True
 
 
 connectivity_breaker = _ConnectivityBreaker()
@@ -400,9 +439,13 @@ def process_task(task: CourtDateTask, compression_enabled=False):
     """Process a single court-date task"""
     court_codes = get_court_codes()
     for attempt in range(1, TASK_DOWNLOAD_ATTEMPTS + 1):
-        # Once the portal is judged unreachable, stop issuing requests at all -
-        # including retries of tasks already in flight.
-        if connectivity_breaker.tripped:
+        # While the breaker is open, hold this worker instead of failing the
+        # range: a stressed portal usually recovers within the cooldown, and
+        # failing here would throw away a range we could still scrape. Only a
+        # breaker that has used up its trips is treated as final.
+        while connectivity_breaker.tripped and not connectivity_breaker.exhausted:
+            time.sleep(5)
+        if connectivity_breaker.exhausted:
             raise PortalUnreachable(
                 f"Portal unreachable; skipped {task} without contacting it"
             )
@@ -583,7 +626,7 @@ def run(
         # Tracked separately from budget skips: the cause is different and so
         # is the fix, and conflating them tells the reader to raise a timeout
         # that was never the problem.
-        if connectivity_breaker.tripped:
+        if connectivity_breaker.exhausted:
             courts_skipped_portal_down.append(court_code)
             continue
 
@@ -730,7 +773,7 @@ def run(
     # progress the run did make is still persisted.
     # Suppressed when the portal died: the message above already explains why
     # work was skipped, and blaming the clock would point at the wrong fix.
-    if (unattempted_courts or unrun_tasks) and not connectivity_breaker.tripped:
+    if (unattempted_courts or unrun_tasks) and not connectivity_breaker.exhausted:
         problems.append(
             f"Run budget of {max_runtime_minutes} minute(s) exhausted before the "
             f"work was finished: {len(unattempted_courts)} court(s) not attempted "
@@ -741,7 +784,7 @@ def run(
             f"--court_code run."
         )
 
-    if connectivity_breaker.tripped:
+    if connectivity_breaker.exhausted:
         skipped = (
             f" {len(courts_skipped_portal_down)} court(s) were skipped without "
             f"being contacted ({', '.join(courts_skipped_portal_down)})."
@@ -750,9 +793,11 @@ def run(
         )
         problems.insert(
             0,
-            f"Portal unreachable: stopped after "
+            f"Portal unreachable: the breaker tripped "
+            f"{CONNECTIVITY_MAX_TRIPS} times ("
             f"{CONNECTIVITY_FAILURE_LIMIT} consecutive connection failures "
-            f"rather than continuing to send requests.{skipped} Nothing is "
+            f"each, with a {CONNECTIVITY_COOLDOWN_SECONDS}s retry between), so "
+            f"the run stopped contacting it.{skipped} Nothing is "
             f"wrong with the resume cursors - no range was marked covered - so "
             f"a later run picks up exactly where this one stopped. This is a "
             f"reachability problem, not a timeout: check whether "
@@ -828,7 +873,7 @@ def _run_tasks(tasks, max_workers, compression_enabled=False, deadline=None):
                 # rather than working through it one 30s timeout at a time.
                 # Cancelled ranges are reported as unrun, so no cursor advances
                 # over them and the next run retries them.
-                if not aborted and connectivity_breaker.tripped:
+                if not aborted and connectivity_breaker.exhausted:
                     aborted = True
                     for pending_future, pending_task in future_to_task.items():
                         if pending_future.cancel():
