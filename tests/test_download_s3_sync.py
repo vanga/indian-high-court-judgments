@@ -570,6 +570,47 @@ class ConnectivityBreakerTests(unittest.TestCase):
             download.connectivity_breaker.record_failure()
         self.assertTrue(download.connectivity_breaker.tripped)
 
+    def test_portal_failure_is_not_reported_as_a_timeout(self):
+        """Blaming the clock would point at the wrong fix.
+
+        The breaker skips courts, which used to land them in the budget
+        message telling the reader to raise --max-runtime-minutes - advice
+        that cannot help when nothing is answering.
+        """
+        task = download.CourtDateTask("9~13", "2026-08-20", "2026-08-24")
+
+        def trip_and_fail(*_a, **_k):
+            for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
+                download.connectivity_breaker.record_failure()
+            return ([(task, download.PortalUnreachable("down"))], [])
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "get_court_codes",
+                    return_value={"9~13": "Allahabad", "27~1": "Bombay"},
+                )
+            )
+            stack.enter_context(patch.object(download, "S3_ENABLED", False))
+            stack.enter_context(
+                patch.object(download, "_run_tasks", side_effect=trip_and_fail)
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                download.run(
+                    start_date="2026-08-20",
+                    end_date="2026-08-24",
+                    day_step=5,
+                    max_runtime_minutes=300,
+                )
+
+        message = str(ctx.exception)
+        self.assertIn("Portal unreachable", message)
+        self.assertIn("27~1", message)  # named as skipped, not silently dropped
+        self.assertNotIn("Run budget", message)
+        self.assertNotIn("raise --max-runtime-minutes", message)
+
     def test_process_task_stops_contacting_the_portal_once_tripped(self):
         task = download.CourtDateTask("9~13", "2026-01-01", "2026-01-05")
         download.connectivity_breaker._tripped = True

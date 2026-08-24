@@ -568,6 +568,7 @@ def run(
     # from an earlier call in the same process.
     connectivity_breaker.reset()
     task_failures = []
+    courts_skipped_portal_down = []
     total_tasks = 0
     unrun_tasks: List[CourtDateTask] = []
     unattempted_courts: List[str] = []
@@ -579,8 +580,11 @@ def run(
     for court_code in target_courts:
         # Nothing is reachable, so starting another court would only generate
         # more failed connections against a portal that is already down.
+        # Tracked separately from budget skips: the cause is different and so
+        # is the fix, and conflating them tells the reader to raise a timeout
+        # that was never the problem.
         if connectivity_breaker.tripped:
-            unattempted_courts.append(court_code)
+            courts_skipped_portal_down.append(court_code)
             continue
 
         if deadline is not None and time.monotonic() >= deadline:
@@ -724,7 +728,9 @@ def run(
     # data gap, not a transient error, so it is always fatal — unlike the
     # tolerated task failures above. Raised after the uploads above so whatever
     # progress the run did make is still persisted.
-    if unattempted_courts or unrun_tasks:
+    # Suppressed when the portal died: the message above already explains why
+    # work was skipped, and blaming the clock would point at the wrong fix.
+    if (unattempted_courts or unrun_tasks) and not connectivity_breaker.tripped:
         problems.append(
             f"Run budget of {max_runtime_minutes} minute(s) exhausted before the "
             f"work was finished: {len(unattempted_courts)} court(s) not attempted "
@@ -736,15 +742,22 @@ def run(
         )
 
     if connectivity_breaker.tripped:
+        skipped = (
+            f" {len(courts_skipped_portal_down)} court(s) were skipped without "
+            f"being contacted ({', '.join(courts_skipped_portal_down)})."
+            if courts_skipped_portal_down
+            else ""
+        )
         problems.insert(
             0,
             f"Portal unreachable: stopped after "
             f"{CONNECTIVITY_FAILURE_LIMIT} consecutive connection failures "
-            f"rather than continuing to send requests. Nothing is wrong with "
-            f"the resume cursors - no range was marked covered - so a later "
-            f"run picks up exactly where this one stopped. Check whether "
-            f"judgments.ecourts.gov.in is reachable from this network before "
-            f"re-running.",
+            f"rather than continuing to send requests.{skipped} Nothing is "
+            f"wrong with the resume cursors - no range was marked covered - so "
+            f"a later run picks up exactly where this one stopped. This is a "
+            f"reachability problem, not a timeout: check whether "
+            f"judgments.ecourts.gov.in answers from this network before "
+            f"re-running. Raising --max-runtime-minutes will not help.",
         )
 
     if problems:
