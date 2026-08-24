@@ -390,14 +390,18 @@ class _ConnectivityBreaker:
             self._trips = 0
 
     def record_success(self):
-        """The portal answered, so whatever we saw before was a blip."""
+        """The portal answered, so whatever we saw before was a blip.
+
+        Always clears the trip budget, not just when still flagged tripped:
+        the cooldown in `tripped` clears that flag on its way to half-open, so
+        keying off it here let trips accumulate across a whole run despite
+        thousands of successful downloads in between - eventually latching a
+        run against a portal that was plainly working.
+        """
         with self._lock:
             self._consecutive = 0
-            if self._tripped:
-                # Half-open probe succeeded: give the run a clean slate,
-                # including its trip budget.
-                self._tripped = False
-                self._trips = 0
+            self._tripped = False
+            self._trips = 0
 
     def record_failure(self):
         """Returns True if the run should stop contacting the portal now."""

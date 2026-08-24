@@ -599,6 +599,28 @@ class ConnectivityBreakerTests(unittest.TestCase):
         self.assertFalse(b.tripped)
         self.assertFalse(b.exhausted)
 
+    def test_success_clears_the_trip_budget_after_a_reopen(self):
+        """Trips must not accumulate across a run that is plainly working.
+
+        The cooldown clears the tripped flag on its way to half-open, so a
+        success arriving afterwards has to reset the budget too - otherwise a
+        long run latches after N scattered bursts despite thousands of
+        successful downloads between them.
+        """
+        b = download.connectivity_breaker
+        for burst in range(download.CONNECTIVITY_MAX_TRIPS + 2):
+            for _ in range(download.CONNECTIVITY_FAILURE_LIMIT):
+                b.record_failure()
+            # Cooldown elapses -> half-open (this clears _tripped internally).
+            b._tripped_at -= download.CONNECTIVITY_COOLDOWN_SECONDS + 1
+            self.assertFalse(b.tripped)
+            # The portal then serves a range, as it did ~9,800 times today.
+            b.record_success()
+            self.assertFalse(
+                b.exhausted,
+                f"burst {burst}: a working portal must never exhaust the budget",
+            )
+
     def test_breaker_gives_up_after_repeated_trips(self):
         """A portal that is genuinely gone must still be abandoned."""
         b = download.connectivity_breaker
