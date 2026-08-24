@@ -64,6 +64,14 @@ FAILURE_COUNT_THRESHOLD = 10
 # reported as a failure: an unattempted court is a silent data gap, not a
 # transient error.
 DEFAULT_MAX_RUNTIME_MINUTES = 300
+# Upload and advance the resume cursor every N date ranges within a court,
+# instead of only once after the whole court finishes. The graceful budget above
+# only helps when the process gets to exit on its own; a hard kill (CI hard
+# timeout, OOM, runner eviction) never reaches the end-of-court upload and
+# discards everything that court scraped. Checkpointing bounds that loss to the
+# last partial batch. A normal daily run generates fewer tasks than this, so it
+# still uploads once per court - this only engages when draining a backlog.
+DEFAULT_CHECKPOINT_TASKS = 10
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -347,6 +355,7 @@ def run(
     dist_code: Optional[str] = None,
     use_default_dist_codes: bool = True,
     max_runtime_minutes: Optional[int] = DEFAULT_MAX_RUNTIME_MINUTES,
+    checkpoint_every: Optional[int] = DEFAULT_CHECKPOINT_TASKS,
 ):
     """
     Run the downloader with explicit date ranges.
@@ -358,6 +367,9 @@ def run(
     - Appends to existing tar files in S3 after download
     - Stops starting new work after max_runtime_minutes and fails the run if
       any court was left unattempted (pass None to disable the budget)
+    - Uploads and advances the resume cursor every checkpoint_every ranges
+      within a court, so an ungraceful kill loses at most one batch (pass None
+      to checkpoint only once per court)
     """
 
     if isinstance(court_codes, str):
@@ -524,30 +536,53 @@ def run(
         # Scrape this court in the foreground, then hand the upload off to
         # the background worker so we can start the next court immediately.
         total_tasks += len(tasks)
-        court_failures, court_unrun = _run_tasks(
-            tasks, max_workers, compress_pdfs, deadline
-        )
+        # Scrape in batches and checkpoint after each, so an ungraceful kill
+        # costs at most one batch rather than everything this court scraped.
+        batch_size = checkpoint_every if checkpoint_every else len(tasks)
+        court_failures = []
+        court_unrun = []
+
+        for batch_start in range(0, len(tasks), batch_size):
+            if deadline is not None and time.monotonic() >= deadline:
+                court_unrun.extend(tasks[batch_start:])
+                break
+
+            batch = tasks[batch_start : batch_start + batch_size]
+            batch_failures, batch_unrun = _run_tasks(
+                batch, max_workers, compress_pdfs, deadline
+            )
+            court_failures.extend(batch_failures)
+            court_unrun.extend(batch_unrun)
+            remaining = tasks[batch_start + len(batch) :]
+
+            if S3_ENABLED:
+                end_date_obj = (
+                    datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
+                )
+                # Only advance this court's resume cursor as far as it is
+                # contiguously covered, so a failed or unrun range is retried
+                # next run instead of being stepped over. Batches not yet
+                # reached block the cursor for the same reason.
+                scraped_through = _contiguous_scraped_through(
+                    end_date,
+                    [task for task, _ in court_failures] + court_unrun + remaining,
+                )
+                if pending_upload is not None:
+                    # Wait for the previous upload to finish before queueing the
+                    # next — bounds disk to ~2 batches at a time.
+                    pending_upload.result()
+                pending_upload = upload_executor.submit(
+                    _upload_court_to_s3, court_code, end_date_obj, scraped_through
+                )
+
+            if batch_unrun:
+                # Budget went while this batch was in flight; later batches
+                # would only be cancelled too.
+                court_unrun.extend(remaining)
+                break
+
         task_failures.extend(court_failures)
         unrun_tasks.extend(court_unrun)
-
-        if S3_ENABLED:
-            end_date_obj = (
-                datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else None
-            )
-            # Only advance this court's resume cursor as far as it is
-            # contiguously covered, so a failed or unrun range is retried next
-            # run instead of being stepped over.
-            scraped_through = _contiguous_scraped_through(
-                end_date,
-                [task for task, _ in court_failures] + court_unrun,
-            )
-            if pending_upload is not None:
-                # Wait for previous court's upload to finish before queueing
-                # the next one — bounds disk to ~2 courts at a time.
-                pending_upload.result()
-            pending_upload = upload_executor.submit(
-                _upload_court_to_s3, court_code, end_date_obj, scraped_through
-            )
 
     if pending_upload is not None:
         pending_upload.result()
@@ -1730,6 +1765,16 @@ Examples:
         ),
     )
     parser.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=DEFAULT_CHECKPOINT_TASKS,
+        help=(
+            "Upload and advance the resume cursor every N date ranges within a "
+            "court, so a run killed outright loses at most one batch instead of "
+            "everything that court scraped. Pass 0 to checkpoint once per court."
+        ),
+    )
+    parser.add_argument(
         "--fetch_dates",
         action="store_true",
         help="Just display latest dates from S3 index files without downloading",
@@ -1797,6 +1842,7 @@ Examples:
             dist_code=args.dist_code,
             use_default_dist_codes=args.default_dist_codes,
             max_runtime_minutes=args.max_runtime_minutes or None,
+            checkpoint_every=args.checkpoint_every or None,
         )
 
 """

@@ -1,3 +1,4 @@
+import math
 import os
 import tempfile
 import time
@@ -520,6 +521,122 @@ class RunBudgetTests(unittest.TestCase):
         message = str(ctx.exception)
         self.assertIn("boom", message)
         self.assertIn("not run", message)
+
+
+class CheckpointTests(unittest.TestCase):
+    """Progress must be durable mid-court, not only once a court finishes.
+
+    The graceful budget only helps when the process gets to exit on its own. A
+    run killed outright never reaches the end-of-court upload, so without
+    intermediate checkpoints everything that court scraped is discarded and
+    re-scraped from its old cursor on the next run.
+    """
+
+    START = "2026-01-01"
+    END = "2026-03-01"
+
+    def _uploads_for(self, checkpoint_every):
+        """Run one court end-to-end, returning (court, scraped_through) per upload."""
+        uploads = []
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download, "get_court_codes", return_value={"9~13": "Allahabad"}
+                )
+            )
+            stack.enter_context(patch.object(download, "S3_ENABLED", True))
+            stack.enter_context(
+                patch.object(download, "_run_tasks", return_value=([], []))
+            )
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "_upload_court_to_s3",
+                    side_effect=lambda court, _end, through=None: uploads.append(
+                        (court, through)
+                    ),
+                )
+            )
+            download.run(
+                start_date=self.START,
+                end_date=self.END,
+                day_step=1,
+                max_runtime_minutes=None,
+                checkpoint_every=checkpoint_every,
+            )
+        return uploads
+
+    def _task_count(self):
+        return len(
+            list(download.generate_tasks(["9~13"], self.START, self.END, 1))
+        )
+
+    def test_backlog_is_checkpointed_in_batches(self):
+        uploads = self._uploads_for(10)
+        expected = math.ceil(self._task_count() / 10)
+
+        self.assertEqual(len(uploads), expected)
+        self.assertGreater(len(uploads), 1, "a 2-month backlog should checkpoint")
+
+    def test_checkpoint_never_advances_past_unreached_batches(self):
+        uploads = self._uploads_for(10)
+
+        # First batch covers 10 daily ranges, so the cursor stops the day before
+        # the 11th — never at end_date, which is not covered yet.
+        self.assertEqual(uploads[0][1], "2026-01-10")
+        # Cursors move strictly forward, and only the final one reaches end_date.
+        cursors = [through for _, through in uploads]
+        self.assertEqual(cursors, sorted(cursors))
+        self.assertEqual(cursors[-1], self.END)
+
+    def test_disabled_checkpointing_uploads_once_per_court(self):
+        self.assertEqual(len(self._uploads_for(None)), 1)
+
+    def test_budget_exhausted_midcourt_checkpoints_what_completed(self):
+        """A batch cut short still persists the ground it gained."""
+        uploads = []
+
+        def fake_run_tasks(batch, *_args, **_kwargs):
+            # Budget goes mid-batch: the tail is cancelled, and later batches
+            # are never started.
+            return ([], list(batch[5:]))
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch.object(
+                    download, "get_court_codes", return_value={"9~13": "Allahabad"}
+                )
+            )
+            stack.enter_context(patch.object(download, "S3_ENABLED", True))
+            stack.enter_context(
+                patch.object(download, "_run_tasks", side_effect=fake_run_tasks)
+            )
+            stack.enter_context(
+                patch.object(
+                    download,
+                    "_upload_court_to_s3",
+                    side_effect=lambda court, _end, through=None: uploads.append(
+                        (court, through)
+                    ),
+                )
+            )
+
+            with self.assertRaises(RuntimeError) as ctx:
+                download.run(
+                    start_date=self.START,
+                    end_date=self.END,
+                    day_step=1,
+                    max_runtime_minutes=None,
+                    checkpoint_every=10,
+                )
+
+        # Exactly one checkpoint: later batches were abandoned, not attempted.
+        self.assertEqual(len(uploads), 1)
+        # Cursor stops the day before the first cancelled range, not at the
+        # end of the batch and certainly not at end_date.
+        self.assertEqual(uploads[0][1], "2026-01-05")
+        self.assertIn("not run", str(ctx.exception))
 
 
 if __name__ == "__main__":
