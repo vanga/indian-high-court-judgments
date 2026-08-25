@@ -96,6 +96,11 @@ CONNECTIVITY_PAUSE_SECONDS = 60
 # No successful request at all for this long means the portal is genuinely
 # gone, and the run stops rather than waiting out its whole budget.
 CONNECTIVITY_OUTAGE_SECONDS = 300
+# How recently a request must have failed for the run to count as "still
+# asking". Deliberately independent of the outage window: between batches the
+# run uploads for minutes at a time without touching the portal, and that
+# silence must not read as an outage.
+CONNECTIVITY_FAILURE_RECENCY_SECONDS = 60
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 warnings.filterwarnings("ignore")
@@ -384,15 +389,18 @@ class _ConnectivityBreaker:
     the failure ratio over the last CONNECTIVITY_WINDOW requests. Workers hold
     while this is true, then traffic is let back in to re-prove it.
 
-    `exhausted` - has *nothing at all* succeeded for CONNECTIVITY_OUTAGE_SECONDS?
-    That is the only condition that ends a run, and a portal serving even a
-    trickle can never satisfy it.
+    `exhausted` - is the portal refusing us, despite us actively asking? Needs
+    both a long drought of successes *and* live evidence that requests are
+    being made and failing. That is the only condition that ends a run, and a
+    portal serving even a trickle can never satisfy it.
     """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._window = deque(maxlen=CONNECTIVITY_WINDOW)
         self._last_success = time.monotonic()
+        self._last_failure = None
+        self._failures_since_success = 0
         self._paused_until = None
 
     def reset(self):
@@ -400,23 +408,42 @@ class _ConnectivityBreaker:
             self._window.clear()
             # Start the outage clock at the run, not at process import.
             self._last_success = time.monotonic()
+            self._last_failure = None
+            self._failures_since_success = 0
             self._paused_until = None
 
     def record_success(self):
         with self._lock:
             self._window.append(True)
             self._last_success = time.monotonic()
+            self._failures_since_success = 0
 
     def record_failure(self):
         with self._lock:
             self._window.append(False)
+            self._last_failure = time.monotonic()
+            self._failures_since_success += 1
 
     @property
     def exhausted(self):
-        """Nothing has answered for a long time: give up on this run."""
+        """Nothing answers although we keep asking: give up on this run.
+
+        Silence alone is not evidence. A run spends long stretches making no
+        portal requests at all - a checkpoint that appends to a 140 MB tar and
+        uploads it can take far longer than the outage window - and idle time
+        must never be mistaken for an outage. So the drought only counts when
+        requests are actually being attempted and failing right now.
+        """
         with self._lock:
+            if self._failures_since_success < CONNECTIVITY_MIN_SAMPLES:
+                return False
+            now = time.monotonic()
+            if self._last_failure is None:
+                return False
+            # Still failing recently, and nothing has answered for a long time.
             return (
-                time.monotonic() - self._last_success >= CONNECTIVITY_OUTAGE_SECONDS
+                now - self._last_success >= CONNECTIVITY_OUTAGE_SECONDS
+                and now - self._last_failure <= CONNECTIVITY_FAILURE_RECENCY_SECONDS
             )
 
     @property
