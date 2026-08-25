@@ -548,6 +548,19 @@ class ConnectivityBreakerTests(unittest.TestCase):
             else:
                 download.connectivity_breaker.record_failure()
 
+    @staticmethod
+    def _starve():
+        """Put the breaker in a genuinely exhausted state.
+
+        Exhaustion means workers are still asking and still failing, so a test
+        cannot get there by rewinding the success clock alone - live failures
+        are half the condition.
+        """
+        b = download.connectivity_breaker
+        b._last_success = time.monotonic() - download.CONNECTIVITY_OUTAGE_SECONDS - 1
+        for _ in range(download.CONNECTIVITY_MIN_SAMPLES):
+            b.record_failure()
+
     def test_connection_errors_are_recognised_through_the_cause_chain(self):
         try:
             try:
@@ -613,14 +626,43 @@ class ConnectivityBreakerTests(unittest.TestCase):
             self.assertFalse(b.exhausted)
 
     def test_total_silence_exhausts_the_run(self):
+        """Still asking, still nothing answering: end the run.
+
+        The failures have to be *live*. Workers that keep hitting a dead
+        portal go on producing them, so the clock advances alongside them.
+        """
         b = download.connectivity_breaker
         self._feed([False] * download.CONNECTIVITY_WINDOW)
-        with patch.object(
-            download.time,
-            "monotonic",
-            return_value=time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS + 1,
-        ):
+        later = time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS + 1
+        with patch.object(download.time, "monotonic", return_value=later):
+            b.record_failure()  # a worker is still trying, and still failing
             self.assertTrue(b.exhausted)
+
+    def test_idle_time_is_not_an_outage(self):
+        """The 2026-08-25 regression: a long checkpoint killed a healthy run.
+
+        Between batches the run appends to a 140 MB tar and uploads it, which
+        can take half an hour and makes no portal requests at all. Judging the
+        portal on that silence stopped a run while eCourts was answering in
+        0.3s, and skipped 14 courts that were never contacted.
+        """
+        b = download.connectivity_breaker
+        self._feed([False] * download.CONNECTIVITY_WINDOW)
+
+        # A long upload: the clock runs on, but nothing is being asked.
+        later = time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS * 6
+        with patch.object(download.time, "monotonic", return_value=later):
+            self.assertFalse(b.exhausted)
+
+    def test_a_few_failures_are_not_enough_to_end_a_run(self):
+        """One unlucky worker must not condemn the portal for everyone."""
+        b = download.connectivity_breaker
+        # One short of the threshold once the live failure below is counted.
+        self._feed([False] * (download.CONNECTIVITY_MIN_SAMPLES - 2))
+        later = time.monotonic() + download.CONNECTIVITY_OUTAGE_SECONDS + 1
+        with patch.object(download.time, "monotonic", return_value=later):
+            b.record_failure()
+            self.assertFalse(b.exhausted)
 
     def test_tracked_request_records_both_outcomes(self):
         b = download.connectivity_breaker
@@ -648,9 +690,7 @@ class ConnectivityBreakerTests(unittest.TestCase):
 
     def test_process_task_skips_only_once_exhausted(self):
         task = download.CourtDateTask("9~13", "2026-01-01", "2026-01-05")
-        download.connectivity_breaker._last_success = (
-            time.monotonic() - download.CONNECTIVITY_OUTAGE_SECONDS - 1
-        )
+        self._starve()
 
         with (
             patch.object(
@@ -698,9 +738,7 @@ class ConnectivityBreakerTests(unittest.TestCase):
         task = download.CourtDateTask("9~13", "2026-08-20", "2026-08-24")
 
         def fail_and_starve(*_a, **_k):
-            download.connectivity_breaker._last_success = (
-                time.monotonic() - download.CONNECTIVITY_OUTAGE_SECONDS - 1
-            )
+            self._starve()
             return ([(task, download.PortalUnreachable("down"))], [])
 
         with ExitStack() as stack:
