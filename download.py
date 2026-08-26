@@ -511,13 +511,10 @@ def process_task(task: CourtDateTask, compression_enabled=False):
             connectivity_breaker.record_success()
             return
         except Exception as e:
-            connectivity = _is_connectivity_error(e)
-            if connectivity and connectivity_breaker.record_failure():
-                raise PortalUnreachable(
-                    f"Portal unreachable after {CONNECTIVITY_FAILURE_LIMIT} "
-                    f"consecutive connection failures; stopping so we stop "
-                    f"hammering it: {e}"
-                ) from e
+            # Connection failures are recorded by _tracked_request at the point
+            # they happen; recording them again here would count one failure
+            # twice in the breaker's window. Whether the portal is gone is the
+            # breaker's call, made at the top of this loop, not this handler's.
             logger.error(
                 f"Error processing court {task.court_code} "
                 f"{court_codes.get(task.court_code, 'Unknown')} "
@@ -762,7 +759,9 @@ def run(
                 # reached block the cursor for the same reason.
                 scraped_through = _contiguous_scraped_through(
                     end_date,
-                    [task for task, _ in court_failures] + court_unrun + remaining,
+                    _cursor_blocking_tasks(court_failures)
+                    + court_unrun
+                    + remaining,
                 )
                 if pending_upload is not None:
                     # Wait for the previous upload to finish before queueing the
@@ -869,12 +868,35 @@ def _run_deadline(max_runtime_minutes):
     return time.monotonic() + max_runtime_minutes * 60
 
 
+def _cursor_blocking_tasks(failures):
+    """The failed ranges that must still hold the resume cursor back.
+
+    A range we contacted and could not finish does not block. Some judgments
+    fail to download on any given night - an expired session, a PDF the portal
+    serves empty, a row that will not parse - and holding the cursor for them
+    means a single bad five-day window freezes a court for months. Bombay spent
+    five hours a night re-scanning ten months because one October range kept
+    failing, while the data itself was being retrieved and uploaded fine. What
+    those ranges actually need is the reconciliation pass, which walks history
+    and re-downloads whatever is missing.
+
+    A range we never contacted is different. When the breaker gives up it marks
+    the remaining ranges PortalUnreachable without asking the portal anything at
+    all, and a five-minute outage would otherwise declare ten months covered on
+    the strength of zero requests. Those still hold the line.
+    """
+    return [
+        task for task, exc in failures if isinstance(exc, PortalUnreachable)
+    ]
+
+
 def _contiguous_scraped_through(end_date, incomplete_tasks):
     """Date a court is contiguously covered through.
 
-    The resume cursor must never step over a range that failed or never ran,
-    so it stops the day before the earliest such range. With no incomplete
-    ranges the court is covered through end_date.
+    The resume cursor must never step over a range that never ran, so it stops
+    the day before the earliest such range. With nothing incomplete the court
+    is covered through end_date. See _cursor_blocking_tasks for which failures
+    count as incomplete.
     """
     if not incomplete_tasks:
         return end_date

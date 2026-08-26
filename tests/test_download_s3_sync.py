@@ -432,6 +432,44 @@ class ContiguousCursorTests(unittest.TestCase):
             "2026-08-05",
         )
 
+    def test_a_range_we_tried_and_could_not_finish_does_not_block(self):
+        """Bombay's ten-month re-scan, in one assertion.
+
+        hcbgoa sat at 2025-10-16 for five consecutive runs because one October
+        range kept failing on session expiry, dragging the whole court back
+        through ten months every night while its four sibling benches were
+        current. Reconciliation is what recovers those judgments.
+        """
+        task = download.CourtDateTask("27~1", "2025-10-16", "2025-10-20")
+        failures = [(task, RuntimeError("Search API session expired"))]
+        self.assertEqual(download._cursor_blocking_tasks(failures), [])
+
+    def test_a_range_we_never_contacted_still_blocks(self):
+        """The breaker's skips are not evidence of anything being covered.
+
+        When the portal goes dark the remaining ranges are failed without a
+        single request being sent. Advancing over those would mark months
+        covered on the strength of no requests at all.
+        """
+        task = download.CourtDateTask("27~1", "2025-10-16", "2025-10-20")
+        failures = [(task, download.PortalUnreachable("skipped without contacting"))]
+        self.assertEqual(download._cursor_blocking_tasks(failures), [task])
+
+    def test_mixed_failures_keep_only_the_uncontacted_ranges(self):
+        tried = download.CourtDateTask("27~1", "2026-08-06", "2026-08-10")
+        untried = download.CourtDateTask("27~1", "2026-08-16", "2026-08-20")
+        failures = [
+            (tried, RuntimeError("Empty pdf")),
+            (untried, download.PortalUnreachable("skipped without contacting")),
+        ]
+        blocking = download._cursor_blocking_tasks(failures)
+        self.assertEqual(blocking, [untried])
+        # The cursor stops before the untried range, not the failed one.
+        self.assertEqual(
+            download._contiguous_scraped_through("2026-08-24", blocking),
+            "2026-08-15",
+        )
+
 
 class RunBudgetTests(unittest.TestCase):
     """The run must stop itself and say so, rather than be killed by CI."""
