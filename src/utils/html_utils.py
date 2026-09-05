@@ -5,6 +5,45 @@ from datetime import datetime
 from typing import Optional, Tuple
 
 
+def parse_judgment_metadata(metadata: dict) -> dict:
+    """
+    Extract all judgment metadata using the same logic
+    currently used by process_metadata.py.
+    """
+    if not metadata.get("raw_html"):
+        return None
+
+    html_s = metadata["raw_html"]
+    html_element = html.fromstring(html_s)
+
+    try:
+        title = html_element.xpath("./button//text()")[0].strip()
+    except (IndexError, KeyError):
+        title = ""
+
+    description_elem = html_element.xpath("./text()")
+
+    judge_txt = html_element.xpath("./strong/text()")
+    judge_name = (
+        judge_txt[0].split(":")[1].strip() if judge_txt and ":" in judge_txt[0] else ""
+    )
+
+    case_details = {
+        "court_code": metadata.get("court_code"),
+        "title": title,
+        "description": (description_elem[0].strip() if description_elem else ""),
+        "judge": judge_name,
+        "pdf_link": metadata.get("pdf_link"),
+        "raw_html": metadata.get("raw_html"),
+    }
+
+    parsed_details = parse_case_details_from_html(metadata["raw_html"])
+
+    case_details.update(parsed_details)
+
+    return case_details
+
+
 def parse_decision_date_from_html(raw_html) -> Tuple[Optional[str], Optional[int]]:
     """
     Extract decision date from judgment HTML.

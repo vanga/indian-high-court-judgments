@@ -49,7 +49,6 @@ from src.utils.s3_utils import (
     write_scraped_through_date,
 )
 
-
 S3_ENABLED = False
 DAILY_UPDATE_BUFFER_DAYS = 14
 TASK_DOWNLOAD_ATTEMPTS = 3
@@ -216,6 +215,7 @@ class S3FileListCacheStore:
     Populated lazily on first access. Call invalidate() after uploading new files
     so subsequent lookups reflect the new state.
     """
+
     def __init__(self):
         self.cache = {}
 
@@ -295,9 +295,7 @@ class CourtDateTask:
 
     def __str__(self):
         dist_part = (
-            f", dist_code={self.dist_code}"
-            if self.dist_code is not None
-            else ""
+            f", dist_code={self.dist_code}" if self.dist_code is not None else ""
         )
         return (
             f"CourtDateTask(id={self.id}, court_code={self.court_code}, "
@@ -341,9 +339,7 @@ def generate_tasks(
             code, start_date, end_date, day_step
         ):
             for task_dist_code in dist_codes:
-                yield CourtDateTask(
-                    code, from_date, to_date, dist_code=task_dist_code
-                )
+                yield CourtDateTask(code, from_date, to_date, dist_code=task_dist_code)
 
 
 class PortalUnreachable(RuntimeError):
@@ -415,9 +411,7 @@ class _ConnectivityBreaker:
     def exhausted(self):
         """Nothing has answered for a long time: give up on this run."""
         with self._lock:
-            return (
-                time.monotonic() - self._last_success >= CONNECTIVITY_OUTAGE_SECONDS
-            )
+            return time.monotonic() - self._last_success >= CONNECTIVITY_OUTAGE_SECONDS
 
     @property
     def unreachable(self):
@@ -580,9 +574,7 @@ def run(
                 earliest = min(bench_cursors)
                 overlap_floor = end_date_dt - timedelta(days=DAILY_UPDATE_BUFFER_DAYS)
                 overlap_start = min(earliest, overlap_floor)
-                court_start_dates[court] = overlap_start.strftime(
-                    "%Y-%m-%d"
-                )
+                court_start_dates[court] = overlap_start.strftime("%Y-%m-%d")
 
         if not court_start_dates:
             print("ERROR: Could not parse any dates from S3 index files")
@@ -616,8 +608,7 @@ def run(
         }
         if active_defaults:
             formatted = ", ".join(
-                f"{court}={','.join(codes)}"
-                for court, codes in active_defaults.items()
+                f"{court}={','.join(codes)}" for court, codes in active_defaults.items()
             )
             print(f"Using default dist_code splits for: {formatted}")
 
@@ -681,9 +672,7 @@ def run(
             )
             continue
 
-        print(
-            f"\nProcessing court {court_code} from {court_start} to {end_date}..."
-        )
+        print(f"\nProcessing court {court_code} from {court_start} to {end_date}...")
 
         # Generate tasks for this specific court
         tasks = list[CourtDateTask](
@@ -767,16 +756,17 @@ def run(
     problems = []
 
     if task_failures:
-        failed_tasks = "\n".join(
-            f"- {task}: {error}" for task, error in task_failures
-        )
+        failed_tasks = "\n".join(f"- {task}: {error}" for task, error in task_failures)
         # Failed ranges never advance their court's last-downloaded date, so the
         # exact same ranges are retried automatically on the next run. A handful
         # of transient failures (e.g. eCourts session expiry) therefore don't
         # warrant a red CI run — only fail hard when failures are widespread.
         n_failed = len(task_failures)
         failure_ratio = n_failed / total_tasks if total_tasks else 1.0
-        fatal = failure_ratio > FAILURE_RATIO_THRESHOLD or n_failed > FAILURE_COUNT_THRESHOLD
+        fatal = (
+            failure_ratio > FAILURE_RATIO_THRESHOLD
+            or n_failed > FAILURE_COUNT_THRESHOLD
+        )
         if fatal:
             problems.append(
                 f"{n_failed}/{total_tasks} task(s) failed "
@@ -952,7 +942,9 @@ def group_files_by_year(files: List[Path]) -> Dict[int, List[Path]]:
     return files_by_year
 
 
-def filter_new_files_by_name(local_files: List[Path], existing_names: List[str]) -> set[Path]:
+def filter_new_files_by_name(
+    local_files: List[Path], existing_names: List[str]
+) -> set[Path]:
     """Return local files whose filename is not already present in an S3 index."""
     existing_name_set = {Path(name).name for name in existing_names}
     return {file for file in local_files if file.name not in existing_name_set}
@@ -1084,9 +1076,11 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
 
             for year in json_files_by_year_partition.keys():
                 # get cached files from S3
-                existing_files = set(get_existing_files_from_s3_v2(
-                    "metadata", year, court_code_underscore, bench
-                ))
+                existing_files = set(
+                    get_existing_files_from_s3_v2(
+                        "metadata", year, court_code_underscore, bench
+                    )
+                )
                 existing_identities = get_existing_judgment_identities_from_parquet(
                     year, court_code_underscore, bench
                 )
@@ -1109,9 +1103,11 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
                 )
                 bench_files[year]["metadata"] = new_files
             for year in pdf_files_by_year_partition.keys():
-                existing_pdf_files = set(get_existing_files_from_s3_v2(
-                    "data", year, court_code_underscore, bench
-                ))
+                existing_pdf_files = set(
+                    get_existing_files_from_s3_v2(
+                        "data", year, court_code_underscore, bench
+                    )
+                )
                 new_pdf_files = filter_new_files_by_name(
                     pdf_files_by_year_partition[year], existing_pdf_files
                 )
@@ -1148,9 +1144,7 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
                         },
                     )
                     if not success:
-                        raise RuntimeError(
-                            "parquet update failed before raw upload"
-                        )
+                        raise RuntimeError("parquet update failed before raw upload")
 
                     if year_files["metadata"]:
                         upload_files_to_s3_v2(
@@ -1164,7 +1158,11 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
 
                     if year_files["data"]:
                         upload_files_to_s3_v2(
-                            "data", year, court_code_underscore, bench, year_files["data"]
+                            "data",
+                            year,
+                            court_code_underscore,
+                            bench,
+                            year_files["data"],
                         )
                         cache_store.invalidate(year, court_code, bench, "data")
 
@@ -1194,7 +1192,11 @@ def _upload_court_to_s3(court_code, end_date, scraped_through=None):
                 except OSError:
                     pass
             # Remove bench dir if no files remain (ignore empty subdirectories)
-            remaining_files = [p for p in bench_path.rglob("*") if p.is_file()] if bench_path.exists() else []
+            remaining_files = (
+                [p for p in bench_path.rglob("*") if p.is_file()]
+                if bench_path.exists()
+                else []
+            )
             if bench_path.exists() and not remaining_files:
                 shutil.rmtree(bench_path)
             elif remaining_files:
@@ -1453,7 +1455,11 @@ class Downloader:
             return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
-        json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
+        # json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
+        if S3_ENABLED:
+            json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
+        else:
+            json_in_s3, pdf_in_s3 = False, False
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_local_pdf_present = self.is_pdf_downloaded(pdf_fragment)
         is_pdf_present = pdf_in_s3 or is_local_pdf_present
@@ -1585,7 +1591,10 @@ class Downloader:
         # download captcha image and save
         captcha_response = _tracked_request(
             "GET",
-            captcha_url, headers={"Cookie": self.get_cookie()}, verify=False, timeout=30
+            captcha_url,
+            headers={"Cookie": self.get_cookie()},
+            verify=False,
+            timeout=30,
         )
         # Generate a unique filename using UUID
         unique_id = uuid.uuid4().hex[:8]
@@ -1690,26 +1699,34 @@ class Downloader:
         elif response_dict.get("session_expire") == "Y":
             self.task_stats["session_expire_events"] += 1
             if _retry_count >= MAX_RETRIES:
-                logger.error(f"Giving up after {MAX_RETRIES} session_expire retries for {url}")
+                logger.error(
+                    f"Giving up after {MAX_RETRIES} session_expire retries for {url}"
+                )
                 return response
             self._sleep_backoff(_retry_count)
             self.init_user_session()
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
-            return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
+            return self.request_api(
+                method, url, payload, _retry_count=_retry_count + 1, **kwargs
+            )
 
         elif "errormsg" in response_dict:
             self.task_stats["errormsg_events"] += 1
             if _retry_count >= MAX_RETRIES:
-                logger.error(f"Giving up after {MAX_RETRIES} errormsg retries for {url}: {response_dict.get('errormsg')}")
+                logger.error(
+                    f"Giving up after {MAX_RETRIES} errormsg retries for {url}: {response_dict.get('errormsg')}"
+                )
                 return response
             logger.debug(f"Error {response_dict['errormsg']}")
             self._sleep_backoff(_retry_count)
             self.refresh_token()
             if payload:
                 payload["app_token"] = self.app_token
-            return self.request_api(method, url, payload, _retry_count=_retry_count + 1, **kwargs)
+            return self.request_api(
+                method, url, payload, _retry_count=_retry_count + 1, **kwargs
+            )
 
         return response
 
@@ -1838,9 +1855,7 @@ class Downloader:
                     ) as result_pbar:
                         for idx, row in enumerate(results):
                             try:
-                                outcome = self.process_result_row(
-                                    row, row_pos=idx
-                                )
+                                outcome = self.process_result_row(row, row_pos=idx)
                                 self.task_stats[outcome] += 1
                                 if outcome == "downloaded":
                                     pdfs_downloaded += 1
@@ -1998,7 +2013,7 @@ Examples:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Compress PDFs during download with Ghostscript. Enabled by default; "
-             "pass --no-compress-pdfs to disable. No-op if Ghostscript is not installed.",
+        "pass --no-compress-pdfs to disable. No-op if Ghostscript is not installed.",
     )
 
     args = parser.parse_args()
