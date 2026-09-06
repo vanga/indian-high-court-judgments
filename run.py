@@ -1,6 +1,7 @@
 import argparse
 import logging
 import signal
+import shutil
 import subprocess
 import sys
 import time
@@ -16,6 +17,9 @@ PROCESSOR_SCRIPT = BASE_DIR / "judgment_processor.py"
 SCRAPER_SCRIPT = BASE_DIR / "download.py"
 
 ORDERS_DIR = BASE_DIR / "data" / "court" / "cnrorders" / "cmis" / "orders"
+
+# Temporary directory containing solved captcha files.
+CAPTCHA_TMP_DIR = BASE_DIR / "captcha-tmp"
 
 # Give the processor a little time to start watching orders/
 PROCESSOR_STARTUP_WAIT_SECONDS = 3
@@ -118,6 +122,46 @@ def wait_for_queue_to_drain():
             )
 
         time.sleep(QUEUE_CHECK_INTERVAL_SECONDS)
+
+
+def cleanup_captcha_tmp():
+    """
+    Empty captcha-tmp after the scraper and processor have finished.
+
+    The directory itself is preserved; only its contents are removed.
+    Cleanup errors are logged as warnings so they do not hide the
+    result of an otherwise successful scrape.
+    """
+
+    logger.info("=" * 70)
+    logger.info("Cleaning captcha-tmp...")
+    logger.info("=" * 70)
+
+    if not CAPTCHA_TMP_DIR.exists():
+        logger.info("captcha-tmp does not exist. Nothing to clean.")
+        return
+
+    removed = 0
+    failed = 0
+
+    for item in CAPTCHA_TMP_DIR.iterdir():
+        try:
+            if item.is_dir() and not item.is_symlink():
+                shutil.rmtree(item)
+            else:
+                item.unlink()
+            removed += 1
+        except Exception:
+            failed += 1
+            logger.exception(f"Failed to remove captcha temp item: {item}")
+
+    if failed:
+        logger.warning(
+            f"captcha-tmp cleanup completed with errors: "
+            f"{removed} removed, {failed} failed."
+        )
+    else:
+        logger.info(f"captcha-tmp cleanup complete. Removed {removed} item(s).")
 
 
 # ============================================================
@@ -514,7 +558,13 @@ def main():
         stop_processor()
 
         # ----------------------------------------------------
-        # 6. Final status.
+        # 6. Cleanup temporary captcha files.
+        # ----------------------------------------------------
+
+        cleanup_captcha_tmp()
+
+        # ----------------------------------------------------
+        # 7. Final status.
         # ----------------------------------------------------
 
         if scraper_exit_code == 0:

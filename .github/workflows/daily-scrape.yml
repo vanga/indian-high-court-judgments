@@ -1,0 +1,58 @@
+name: NyaySaathi Daily Judgment Scrape
+
+on:
+  schedule:
+    # 4:00 PM IST = 10:30 AM UTC
+    - cron: "30 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  daily-scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+
+    env:
+      SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+      SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Calculate today's date (IST)
+        id: date
+        run: |
+          TODAY=$(TZ=Asia/Kolkata date +%Y-%m-%d)
+          echo "today=$TODAY" >> "$GITHUB_OUTPUT"
+          echo "Scraping date: $TODAY (IST)"
+
+      - name: Run daily NyaySaathi pipeline
+        run: |
+          python run.py \
+            --court_codes "9~13,27~1,19~16,18~6,36~29,28~2,22~18,7~26,24~17,2~5,1~12,20~7,29~3,32~4,23~23,14~25,17~21,21~11,3~22,8~9,11~24,16~20,5~15,33~10,10~8" \
+            --start_date "${{ steps.date.outputs.today }}" \
+            --end_date "${{ steps.date.outputs.today }}" \
+            --max_workers 2 \
+            --no-default-dist-codes \
+            --no-compress-pdfs
+
+      - name: Report completion
+        if: always()
+        run: |
+          echo "Daily NyaySaathi scrape workflow finished."
+          echo "Scrape date: ${{ steps.date.outputs.today }}"
