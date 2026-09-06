@@ -27,6 +27,8 @@ import lxml.html as LH
 import requests
 import urllib3
 from bs4 import BeautifulSoup
+from dotenv import load_dotenv
+from supabase import create_client, Client
 from tqdm import tqdm
 from src.captcha_solver.main import get_text
 
@@ -207,6 +209,24 @@ captcha_tmp_dir.mkdir(parents=True, exist_ok=True)
 S3_PREFIX = "metadata/json/"
 LOCAL_DIR = "./local_hc_metadata"
 OUTPUT_DIR = output_dir
+
+# Supabase is used here only as a lightweight pre-download existence check.
+# The processor/database UNIQUE(source, pdf_link) constraint remains the
+# authoritative duplicate-prevention mechanism. If Supabase is unavailable,
+# scraping continues and the processor will still enforce uniqueness.
+load_dotenv(Path(__file__).resolve().parent / ".env")
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")
+
+supabase: Client | None = None
+if SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY:
+    try:
+        supabase = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+    except Exception:
+        logger.warning(
+            "Could not initialize Supabase pre-download deduplication; "
+            "scraping will continue without the optimization."
+        )
 
 
 class S3FileListCacheStore:
@@ -1320,6 +1340,72 @@ class Downloader:
         # PDF compression settings
         self.compression_enabled = compression_enabled and COMPRESSION_AVAILABLE
         self.task_stats = self._new_task_stats()
+        self._existing_db_pdf_links: set[str] = set()
+        self._db_pdf_links_loaded = False
+
+    def _load_existing_db_pdf_links(self):
+        """Load known source PDF links for this court/date range once.
+
+        This prevents repeated PDF requests to eCourts on rolling/repeated
+        scrape runs. It deliberately does NOT query Supabase once per result.
+        """
+        if self._db_pdf_links_loaded:
+            return
+
+        self._db_pdf_links_loaded = True
+
+        if supabase is None:
+            return
+
+        page_size_db = 1000
+        offset = 0
+        start_date = self.task.from_date
+        end_date = self.task.to_date
+
+        try:
+            while True:
+                response = (
+                    supabase.table("high_court_judgments")
+                    .select("pdf_link")
+                    .eq("source", "ecourts")
+                    .eq("court_code", self.court_code)
+                    .gte("decision_date", start_date)
+                    .lte("decision_date", end_date)
+                    .not_.is_("pdf_link", "null")
+                    .range(offset, offset + page_size_db - 1)
+                    .execute()
+                )
+
+                rows = response.data or []
+                for row in rows:
+                    pdf_link = row.get("pdf_link")
+                    if pdf_link:
+                        self._existing_db_pdf_links.add(pdf_link)
+
+                if len(rows) < page_size_db:
+                    break
+
+                offset += page_size_db
+
+            logger.info(
+                "Loaded %s existing pdf_link(s) from Supabase for court=%s "
+                "date=%s..%s; these PDFs will not be requested from eCourts.",
+                len(self._existing_db_pdf_links),
+                self.court_code,
+                start_date,
+                end_date,
+            )
+        except Exception as e:
+            logger.warning(
+                "Supabase pre-download deduplication check failed for court=%s: %s. "
+                "Continuing without it.",
+                self.court_code,
+                e,
+            )
+
+    def _pdf_exists_in_db(self, pdf_link: str) -> bool:
+        self._load_existing_db_pdf_links()
+        return pdf_link in self._existing_db_pdf_links
 
     def _new_task_stats(self):
         return {
@@ -1328,6 +1414,7 @@ class Downloader:
             "downloaded": 0,
             "skip_s3": 0,
             "skip_local": 0,
+            "skip_db": 0,
             "metadata_only": 0,
             "no_download": 0,
             "parse_failure": 0,
@@ -1339,7 +1426,7 @@ class Downloader:
     def _log_task_summary(self):
         logger.info(
             "Task summary: court=%s from=%s to=%s pages=%s results=%s downloaded=%s "
-            "skip_s3=%s skip_local=%s metadata_only=%s no_download=%s parse_failures=%s "
+            "skip_s3=%s skip_local=%s skip_db=%s metadata_only=%s no_download=%s parse_failures=%s "
             "session_refreshes=%s session_expire=%s api_errors=%s",
             self.court_code,
             self.task.from_date,
@@ -1349,6 +1436,7 @@ class Downloader:
             self.task_stats["downloaded"],
             self.task_stats["skip_s3"],
             self.task_stats["skip_local"],
+            self.task_stats["skip_db"],
             self.task_stats["metadata_only"],
             self.task_stats["no_download"],
             self.task_stats["parse_failure"],
@@ -1455,11 +1543,17 @@ class Downloader:
             return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
-        # json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
-        if S3_ENABLED:
-            json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
-        else:
-            json_in_s3, pdf_in_s3 = False, False
+        # Check our DB before requesting the PDF from eCourts. This is a single
+        # cached Supabase lookup per court/date task, not one query per result.
+        if self._pdf_exists_in_db(pdf_fragment):
+            self.task_stats["skip_db"] += 1
+            logger.debug(
+                "Skipping PDF already present in DB: %s",
+                pdf_fragment,
+            )
+            return "skip_db"
+
+        json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_local_pdf_present = self.is_pdf_downloaded(pdf_fragment)
         is_pdf_present = pdf_in_s3 or is_local_pdf_present

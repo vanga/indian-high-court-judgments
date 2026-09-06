@@ -474,7 +474,40 @@ def process_judgment(
         record = extract_and_map_metadata(metadata)
 
         # ----------------------------------------------------
-        # 5. Convert PDF → HTML
+        # 5. Duplicate check by source + pdf_link
+        # ----------------------------------------------------
+        # This check happens BEFORE the expensive PDF → HTML conversion.
+        # The UNIQUE(source, pdf_link) database constraint remains the final
+        # safety net for races or duplicates that slip through this check.
+        pdf_link = record.get("pdf_link")
+        source = record.get("source", "ecourts")
+
+        if pdf_link:
+            existing = (
+                supabase.table("high_court_judgments")
+                .select("id")
+                .eq("source", source)
+                .eq("pdf_link", pdf_link)
+                .limit(1)
+                .execute()
+            )
+
+            if existing.data:
+                existing_id = existing.data[0].get("id")
+                logger.info(
+                    f"DUPLICATE: {pdf_path.name} already exists in Supabase "
+                    f"(id={existing_id}); skipping conversion and upload"
+                )
+                pdf_path.unlink()
+                json_path.unlink()
+                logger.info(
+                    f"Deleted duplicate source files: {pdf_path.name}, "
+                    f"{json_path.name}"
+                )
+                return True
+
+        # ----------------------------------------------------
+        # 6. Convert PDF → HTML
         # ----------------------------------------------------
 
         html_content, plain_text = pdf_to_html(pdf_path)
@@ -490,7 +523,7 @@ def process_judgment(
         record["content_processed_at"] = datetime.now(timezone.utc).isoformat()
 
         # ----------------------------------------------------
-        # 6. Validate required fields
+        # 7. Validate required fields
         # ----------------------------------------------------
 
         if not record.get("court_code"):
@@ -500,15 +533,30 @@ def process_judgment(
             raise RuntimeError(f"Missing court_name in {json_path.name}")
 
         # ----------------------------------------------------
-        # 7. Upload + verify
+        # 8. Upload + verify
         # ----------------------------------------------------
 
-        inserted_id = upload_judgment(
-            record=record,
-            filename=pdf_path.name,
-        )
+        try:
+            inserted_id = upload_judgment(
+                record=record,
+                filename=pdf_path.name,
+            )
+        except Exception as upload_error:
+            # A concurrent worker/run may have inserted the same source
+            # between the existence check above and this INSERT. PostgreSQL
+            # reports that as SQLSTATE 23505 (unique_violation). Treat it as
+            # a successful duplicate skip, not a retryable processing failure.
+            if "23505" in str(upload_error):
+                logger.info(
+                    f"DUPLICATE RACE: {pdf_path.name} was inserted by another "
+                    "process; deleting local source files"
+                )
+                pdf_path.unlink()
+                json_path.unlink()
+                return True
+            raise
         # ----------------------------------------------------
-        # 8. ONLY NOW delete source files
+        # 9. ONLY NOW delete source files
         # ----------------------------------------------------
 
         pdf_path.unlink()
