@@ -2,7 +2,7 @@
 Pydantic models for Indian High Court Judgments data structures
 """
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_serializer
 from typing import List, Optional
 from datetime import datetime
 
@@ -77,9 +77,26 @@ class IndexPart(BaseModel):
     size: int = Field(default=0, ge=0, description="Part size in bytes")
     size_human: str = Field(default="0 B", description="Human-readable size")
     created_at: str = Field(description="ISO datetime when this part was created")
+    superseded_files: List[str] = Field(
+        default_factory=list,
+        description=(
+            "Members still physically inside this tar whose authoritative copy "
+            "now lives in a later part (e.g. a placeholder PDF replaced by a "
+            "re-fetch). They are not listed in ``files``. Omitted when empty."
+        ),
+    )
 
     def model_post_init(self, __context):
         self.file_count = len(self.files)
+
+    @model_serializer(mode="wrap")
+    def _omit_empty_superseded_files(self, handler):
+        # Keep index JSON byte-for-byte unchanged for the (usual) parts that
+        # have never had a member superseded.
+        data = handler(self)
+        if not data.get("superseded_files"):
+            data.pop("superseded_files", None)
+        return data
 
 
 class IndexFileV2(BaseModel):

@@ -48,6 +48,10 @@ Files are partitioned by **decision date year** (extracted from case HTML), not 
 
 S3 tar archives split at 1 GB per part. `s3_utils.py` handles this automatically — don't create tars manually.
 
+### Replaced tar members
+
+`download.py --refetch-list` replaces placeholder PDFs by adding a `part-*-refetch.tar` and moving the names in `data.index.json`; the older part keeps the stale member and lists it in `superseded_files`. A name's authoritative copy is the part whose `files` lists it (without the index: last part wins). See `docs/placeholder-pdf-refetch.md`.
+
 ### Ghostscript dependency
 
 PDF compression requires `gs` (Ghostscript) on PATH. The `--compress` flag silently skips compression if `gs` is not found.
