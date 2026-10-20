@@ -163,6 +163,7 @@ Output: `processed_metadata.parquet`, plus per-court intermediate files under `p
 - **CAPTCHA failures**: failed CAPTCHA images are saved to `./captcha-failures/` for debugging.
 - **Session expiry**: handled automatically; the scraper refreshes its eCourts session every 25 downloads.
 - **Download errors**: failed tasks are tracked and retried on subsequent runs.
+- **Tiny "PDFs" that are really error pages**: older runs stored some portal error responses (HTML 404 pages, JSON errors) under the judgment's filename, and the filename-based skip checks never fetch them again. List them with `python scripts/find_placeholder_pdfs.py --verify-magic --output placeholder-pdfs.csv` and re-fetch them with `python download.py --refetch-list placeholder-pdfs.csv` (add `--sync-s3` to replace them in S3). See [docs/placeholder-pdf-refetch.md](docs/placeholder-pdf-refetch.md), including how to resolve a filename that appears in two tar parts.
 
 ## For contributors
 

@@ -72,6 +72,8 @@ class IndexPart:
     name: str
     files: list[str]
     size: int | None = None
+    # Members still in this tar but replaced by a later part (re-fetch).
+    superseded_files: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -165,6 +167,9 @@ def load_index(s3, partition: Partition) -> tuple[list[IndexPart], int, bytes | 
             name=part.get("name", ""),
             files=[PurePosixPath(name).name for name in part.get("files", [])],
             size=part.get("size"),
+            superseded_files=[
+                PurePosixPath(name).name for name in part.get("superseded_files", [])
+            ],
         )
         for part in data.get("parts", [])
     ]
@@ -293,7 +298,7 @@ def audit_partition(
             members = tar_member_names(s3, partition, part, tmp_dir)
             expected = set(part.files)
             missing_in_tar = sorted(expected - members)
-            extra_in_tar = sorted(members - expected)
+            extra_in_tar = sorted(members - expected - set(part.superseded_files))
             if missing_in_tar:
                 write_issue(issue_writer, partition, "part_index_files_missing_in_tar", part.name, missing_in_tar)
             if extra_in_tar:
