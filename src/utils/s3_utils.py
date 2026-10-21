@@ -777,12 +777,17 @@ def _append_to_existing_part(
             return False
 
         read_mode = "r:gz" if data_type == "metadata" else "r"
+        # Members replaced by a later part (see upload_replacement_tar_part)
+        # must not be carried into a newer tar, or they would win again.
+        superseded = set(target.superseded_files)
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             merged_tar_temp = tmp.name
         try:
             with tarfile.open(old_tar_temp, read_mode) as old_tar, \
                  tarfile.open(merged_tar_temp, tar_mode) as new_tar:
                 for member in old_tar:
+                    if member.isfile() and Path(member.name).name in superseded:
+                        continue
                     if member.isfile():
                         extracted = old_tar.extractfile(member)
                         new_tar.addfile(member, extracted)
@@ -1011,6 +1016,160 @@ def create_and_upload_tar_file(data_type: str, year: int, court_code: str, bench
         print(f"  Split into {parts_uploaded} tar parts due to size limit ({format_size(MAX_TAR_SIZE_BYTES)})")
 
     return True
+
+
+def _load_index_v2_strict(index_key: str) -> IndexFileV2:
+    """Like _load_index_v2, but only a missing index yields an empty one.
+
+    _load_index_v2 turns *any* read error into an empty index; writing that
+    back would drop every existing part. Replacement rewrites existing parts,
+    so a transient read error must fail the replacement instead.
+    """
+    try:
+        resp = s3_client.get_object(Bucket=S3_BUCKET, Key=index_key)
+    except s3_client.exceptions.NoSuchKey:
+        return IndexFileV2(
+            file_count=0,
+            tar_size=0,
+            tar_size_human="0 B",
+            updated_at=utc_now_iso(),
+            parts=[],
+        )
+    return IndexFileV2.model_validate(json.loads(resp["Body"].read().decode("utf-8")))
+
+
+def replace_files_in_index(
+    data_type: str,
+    year: int,
+    court_code: str,
+    bench: str,
+    files: List[Path],
+    tar_file_name: str,
+    tar_file_size: int,
+) -> IndexFileV2:
+    """Record a replacement tar part in the index.
+
+    Unlike update_index_file(), names that are already indexed are NOT
+    filtered out: they are moved. Each name is removed from the ``files`` of
+    whichever older part listed it, added to that part's ``superseded_files``
+    (its stale member is still physically in that tar), and listed in the new
+    part. Afterwards every name still appears in exactly one part's
+    ``files``, and the totals stay consistent.
+    """
+    index_key = (
+        get_metadata_index_key(year, court_code, bench)
+        if data_type == "metadata"
+        else get_data_index_key(year, court_code, bench)
+    )
+    index_data = _load_index_v2_strict(index_key)
+
+    names = list(dict.fromkeys(Path(f).name for f in files))
+    name_set = set(names)
+    moved_total = 0
+    for part in index_data.parts:
+        moved = [n for n in part.files if n in name_set]
+        if not moved:
+            continue
+        moved_total += len(moved)
+        part.files = [n for n in part.files if n not in name_set]
+        part.file_count = len(part.files)
+        part.superseded_files = sorted(set(part.superseded_files) | set(moved))
+
+    index_data.parts.append(
+        IndexPart(
+            name=tar_file_name,
+            files=names,
+            file_count=len(names),
+            size=tar_file_size,
+            size_human=format_size(tar_file_size),
+            created_at=utc_now_iso(),
+        )
+    )
+    index_data.file_count = max(index_data.file_count - moved_total, 0) + len(names)
+    index_data.tar_size = index_data.tar_size + tar_file_size
+    index_data.tar_size_human = format_size(index_data.tar_size)
+    index_data.updated_at = utc_now_iso()
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=index_key,
+        Body=index_data.model_dump_json(indent=2),
+        ContentType="application/json",
+    )
+    return index_data
+
+
+def upload_replacement_tar_part(
+    data_type: str, year: int, court_code: str, bench: str, files: List[Path]
+) -> List[str]:
+    """Upload corrected copies of already-indexed files as new tar part(s).
+
+    Used by the placeholder re-fetch. The normal tar path
+    (create_and_upload_tar_file) deliberately drops names the index already
+    has, so a corrected file with the same name would never reach the tar.
+    Here the corrected files go into a fresh part named
+    ``part-<UTC timestamp>-refetch.tar`` and the index is updated with
+    replace_files_in_index(). Existing tar objects are never rewritten.
+
+    Resolution rule for tar consumers: a name's authoritative copy is in the
+    part whose ``files`` lists it. Without the index, extract parts in
+    ascending name order (names are UTC timestamps) and let later members
+    overwrite earlier ones: last part wins.
+
+    Returns the uploaded part names.
+    """
+    if not files:
+        return []
+    parts_prefix = get_bench_partition_key(data_type, "tar", year, court_code, bench)
+    suffix = ".tar.gz" if data_type == "metadata" else ".tar"
+    tar_mode = "w:gz" if data_type == "metadata" else "w"
+    content_type = "application/x-tar.gz" if data_type == "metadata" else "application/x-tar"
+
+    # Split on the same size ceiling as normal parts.
+    chunks: List[List[Path]] = [[]]
+    chunk_size = 0
+    for f in files:
+        size = Path(f).stat().st_size
+        if size > MAX_TAR_SIZE_BYTES:
+            raise ValueError(
+                f"File {f} (size={format_size(size)}) exceeds the maximum "
+                f"tar part size of {format_size(MAX_TAR_SIZE_BYTES)}"
+            )
+        if chunks[-1] and chunk_size + size > MAX_TAR_SIZE_BYTES:
+            chunks.append([])
+            chunk_size = 0
+        chunks[-1].append(Path(f))
+        chunk_size += size
+
+    uploaded: List[str] = []
+    base = generate_part_name(utc_now_iso())
+    for i, chunk in enumerate(chunks):
+        seq = f"-{i}" if i else ""
+        part_file_name = f"{base}-refetch{seq}{suffix}"
+        with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as temp_tar:
+            temp_path = temp_tar.name
+        try:
+            with tarfile.open(temp_path, tar_mode) as tar:
+                for pf in chunk:
+                    tar.add(pf, arcname=pf.name)
+            tar_size = Path(temp_path).stat().st_size
+            print(
+                f"  Uploading replacement tar part {part_file_name} "
+                f"({format_size(tar_size)}, {len(chunk)} files)"
+            )
+            if not upload_large_file_to_s3(
+                temp_path, S3_BUCKET, parts_prefix + part_file_name, content_type
+            ):
+                raise RuntimeError(
+                    f"Failed to upload replacement tar part {part_file_name}; "
+                    f"index not updated."
+                )
+            replace_files_in_index(
+                data_type, year, court_code, bench, chunk, part_file_name, tar_size
+            )
+            uploaded.append(part_file_name)
+        finally:
+            Path(temp_path).unlink(missing_ok=True)
+    return uploaded
 
 
 def create_and_upload_parquet_files(

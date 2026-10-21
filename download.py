@@ -46,7 +46,19 @@ from src.utils.s3_utils import (
     get_existing_judgment_identities_from_parquet,
     get_metadata_identity_from_file,
     upload_files_to_s3_v2,
+    upload_replacement_tar_part,
+    upload_single_file_to_s3,
     write_scraped_through_date,
+)
+from src.utils.refetch_utils import (
+    OUTCOME_ERROR,
+    OUTCOME_REFETCHED,
+    OUTCOME_STILL_NOT_PDF,
+    RefetchTracker,
+    classify_download_failure,
+    court_date_ranges,
+    is_pdf_file,
+    parse_refetch_list,
 )
 
 
@@ -286,12 +298,15 @@ class CourtDateTask:
         from_date: str,
         to_date: str,
         dist_code: Optional[str] = None,
+        refetch: Optional[RefetchTracker] = None,
     ):
         self.id = str(uuid.uuid4())
         self.court_code = court_code
         self.from_date = from_date
         self.to_date = to_date
         self.dist_code = dist_code
+        # Set only for --refetch-list runs: restricts downloads to listed files.
+        self.refetch = refetch
 
     def __str__(self):
         dist_part = (
@@ -299,10 +314,20 @@ class CourtDateTask:
             if self.dist_code is not None
             else ""
         )
+        refetch_part = ", refetch" if self.refetch is not None else ""
         return (
             f"CourtDateTask(id={self.id}, court_code={self.court_code}, "
-            f"from_date={self.from_date}, to_date={self.to_date}{dist_part})"
+            f"from_date={self.from_date}, to_date={self.to_date}{dist_part}"
+            f"{refetch_part})"
         )
+
+
+def _dist_codes_for(code, dist_code=None, use_default_dist_codes=True):
+    if dist_code is not None:
+        return (dist_code,)
+    if use_default_dist_codes:
+        return DEFAULT_DIST_CODES_BY_COURT.get(code, (None,))
+    return (None,)
 
 
 def generate_tasks(
@@ -330,12 +355,7 @@ def generate_tasks(
         court_codes = normalized_codes
 
     for code in court_codes:
-        if dist_code is not None:
-            dist_codes = (dist_code,)
-        elif use_default_dist_codes:
-            dist_codes = DEFAULT_DIST_CODES_BY_COURT.get(code, (None,))
-        else:
-            dist_codes = (None,)
+        dist_codes = _dist_codes_for(code, dist_code, use_default_dist_codes)
 
         for from_date, to_date in get_date_ranges_to_process(
             code, start_date, end_date, day_step
@@ -344,6 +364,34 @@ def generate_tasks(
                 yield CourtDateTask(
                     code, from_date, to_date, dist_code=task_dist_code
                 )
+
+
+def generate_refetch_tasks(
+    tracker: RefetchTracker,
+    day_step: int = 1,
+    dist_code: Optional[str] = None,
+    use_default_dist_codes: bool = True,
+) -> List[CourtDateTask]:
+    """Tasks covering only the court x date ranges the listed files need.
+
+    Each task carries the tracker, so its Downloader downloads listed files
+    only. Search dates come from the targets (see RefetchTarget.search_date),
+    widened by tracker.pad_days on each side.
+    """
+    all_court_codes = get_court_codes()
+    tasks = []
+    ranges_by_court = court_date_ranges(tracker.targets, day_step, tracker.pad_days)
+    for code, ranges in ranges_by_court.items():
+        if code not in all_court_codes:
+            raise ValueError(f"Court code {code} from refetch list not found in court-codes.json")
+        for from_date, to_date in ranges:
+            for task_dist_code in _dist_codes_for(code, dist_code, use_default_dist_codes):
+                tasks.append(
+                    CourtDateTask(
+                        code, from_date, to_date, dist_code=task_dist_code, refetch=tracker
+                    )
+                )
+    return tasks
 
 
 class PortalUnreachable(RuntimeError):
@@ -1290,6 +1338,161 @@ def _advance_court_resume_cursors(
                 )
 
 
+DEFAULT_REFETCH_REPORT = "refetch-report.csv"
+
+
+def run_refetch(
+    refetch_list,
+    court_codes=None,
+    day_step=1,
+    pad_days=0,
+    max_workers=2,
+    compress_pdfs=False,
+    dist_code: Optional[str] = None,
+    use_default_dist_codes: bool = True,
+    max_runtime_minutes: Optional[int] = DEFAULT_MAX_RUNTIME_MINUTES,
+    checkpoint_every: Optional[int] = DEFAULT_CHECKPOINT_TASKS,
+    report_path=DEFAULT_REFETCH_REPORT,
+):
+    """Re-fetch the PDFs listed in ``refetch_list`` (see refetch_utils).
+
+    - Searches only the court x date ranges the listed files need.
+    - Downloads only listed files; every other search row is skipped without
+      a download and without writing metadata.
+    - Listed files are fetched even though the S3 indexes contain their names.
+    - Writes a per-key report (refetched / still_not_pdf / not_found_in_search
+      / error / unsupported) to ``report_path``.
+    - With S3 sync enabled, replaces the data/pdf/ object and adds a
+      replacement tar part (see _upload_refetched_to_s3). Without it, files
+      stay in the local data/ tree.
+    - Never touches resume cursors, metadata JSON/tar or parquet in S3.
+    """
+    targets, unsupported = parse_refetch_list(refetch_list)
+    if court_codes:
+        if isinstance(court_codes, str):
+            court_codes = [court_codes]
+        wanted = {to_s3_format(code) for code in court_codes}
+        targets = [t for t in targets if t.court_code in wanted]
+    tracker = RefetchTracker(targets, unsupported, pad_days=pad_days)
+    print(
+        f"Refetch list {refetch_list}: {len(targets)} key(s) to re-fetch, "
+        f"{len(unsupported)} unsupported"
+    )
+
+    tasks = generate_refetch_tasks(
+        tracker,
+        day_step=day_step,
+        dist_code=dist_code,
+        use_default_dist_codes=use_default_dist_codes,
+    )
+    tasks_by_court: Dict[str, List[CourtDateTask]] = {}
+    for task in tasks:
+        tasks_by_court.setdefault(task.court_code, []).append(task)
+    print(
+        f"Generated {len(tasks)} search task(s) across {len(tasks_by_court)} court(s)"
+    )
+
+    connectivity_breaker.reset()
+    deadline = _run_deadline(max_runtime_minutes)
+    batch_size = checkpoint_every if checkpoint_every else None
+    task_failures = []
+    unrun_tasks: List[CourtDateTask] = []
+
+    try:
+        for court_code, court_tasks in tasks_by_court.items():
+            print(f"\nRe-fetching for court {court_code}: {len(court_tasks)} task(s)")
+            size = batch_size or len(court_tasks)
+            for batch_start in range(0, len(court_tasks), size):
+                batch = court_tasks[batch_start : batch_start + size]
+                if connectivity_breaker.exhausted or (
+                    deadline is not None and time.monotonic() >= deadline
+                ):
+                    unrun_tasks.extend(batch)
+                    continue
+                failures, unrun = _run_tasks(batch, max_workers, compress_pdfs, deadline)
+                task_failures.extend(failures)
+                unrun_tasks.extend(unrun)
+                if S3_ENABLED:
+                    _upload_refetched_to_s3(tracker)
+    finally:
+        for task, error in task_failures:
+            tracker.mark_search_failed(
+                task.court_code, task.from_date, task.to_date, f"search failed: {error}"
+            )
+        for task in unrun_tasks:
+            tracker.mark_search_failed(
+                task.court_code,
+                task.from_date,
+                task.to_date,
+                "not searched: run stopped early (budget or portal unreachable)",
+            )
+        path = tracker.write_report(report_path)
+        summary = tracker.summary()
+        print(f"\nRefetch report written to {path}")
+        for outcome, count in sorted(summary.items()):
+            print(f"  {outcome}: {count}")
+
+    if task_failures or unrun_tasks:
+        raise RuntimeError(
+            f"Refetch finished with {len(task_failures)} failed and "
+            f"{len(unrun_tasks)} unrun search task(s); affected keys are marked "
+            f"'error' in {report_path}. Re-run with the same list to retry."
+        )
+    return summary
+
+
+def _upload_refetched_to_s3(tracker: RefetchTracker):
+    """Replace placeholder objects in S3 with the re-fetched PDFs.
+
+    For each (year, court, bench) partition of the *listed* key - not the
+    year parsed from the new metadata, so the corrected copy lands exactly
+    where the placeholder is:
+    1. Overwrite the per-object data/pdf/ key.
+    2. Add a replacement tar part and move the names to it in data.index.json
+       (upload_replacement_tar_part). The normal upload filters
+       (filter_new_files_by_name and the tar pre-filter) are bypassed on
+       purpose: they drop exactly these names because the index has them.
+    Local files are removed after both steps succeed. Failures are logged and
+    the files kept; the report shows uploaded=false for them.
+    """
+    pending = tracker.pending_uploads()
+    groups: Dict[tuple, list] = {}
+    for result in pending:
+        t = result.target
+        groups.setdefault((t.year, t.court_code, t.bench), []).append(result)
+
+    for (year, court_code, bench), results in sorted(groups.items()):
+        results = [r for r in results if r.local_path and Path(r.local_path).exists()]
+        if not results:
+            continue
+        files = [Path(r.local_path) for r in results]
+        try:
+            failed = [
+                f
+                for f in files
+                if not upload_single_file_to_s3("data", year, court_code, bench, f)
+            ]
+            if failed:
+                raise RuntimeError(
+                    f"{len(failed)} per-object upload(s) failed: "
+                    f"{[f.name for f in failed[:5]]}"
+                )
+            upload_replacement_tar_part("data", year, court_code, bench, files)
+            cache_store.invalidate(year, court_code, bench, "data")
+        except Exception as e:
+            logger.error(
+                f"Failed to upload re-fetched PDFs for {year}/{court_code}/{bench}: {e}"
+            )
+            continue
+        tracker.mark_uploaded(results)
+        for f in files:
+            f.unlink(missing_ok=True)
+            f.with_suffix(".json").unlink(missing_ok=True)
+        print(
+            f"  Replaced {len(files)} placeholder PDF(s) in {year}/{court_code}/{bench}"
+        )
+
+
 class Downloader:
     def __init__(self, task: CourtDateTask, compression_enabled=False):
         self.task = task
@@ -1318,6 +1521,7 @@ class Downloader:
         # PDF compression settings
         self.compression_enabled = compression_enabled and COMPRESSION_AVAILABLE
         self.task_stats = self._new_task_stats()
+        self.last_pdf_failure = None
 
     def _new_task_stats(self):
         return {
@@ -1332,6 +1536,7 @@ class Downloader:
             "session_refreshes": 0,
             "session_expire_events": 0,
             "errormsg_events": 0,
+            "refetch_skipped": 0,
         }
 
     def _log_task_summary(self):
@@ -1453,6 +1658,9 @@ class Downloader:
             return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
+        if self.task.refetch is not None:
+            return self.process_refetch_row(html, pdf_fragment, row_pos)
+
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         is_local_pdf_present = self.is_pdf_downloaded(pdf_fragment)
@@ -1486,7 +1694,75 @@ class Downloader:
             return "skip_local"
         return "no_download"
 
+    def process_refetch_row(self, html, pdf_fragment, row_pos):
+        """Handle a search row in a --refetch-list run.
+
+        Rows that are not listed are skipped before any S3 lookup, download or
+        metadata write. Listed rows are downloaded even though the S3 index
+        has their name, and still go through download_pdf's checks.
+        """
+        tracker = self.task.refetch
+        target = None
+        if pdf_fragment:
+            target = tracker.lookup(
+                self.court_code,
+                extract_bench_from_path(pdf_fragment),
+                Path(pdf_fragment).name,
+            )
+        if target is None:
+            return "refetch_skipped"
+
+        # Already settled earlier in this run (e.g. the same page is re-read
+        # after a session refresh): don't hit the portal for it again.
+        previous = tracker.result_for(target)
+        if previous is not None and previous.outcome in (
+            OUTCOME_REFETCHED,
+            OUTCOME_STILL_NOT_PDF,
+        ):
+            return "skip_local"
+
+        pdf_output_path = self.get_pdf_output_path(pdf_fragment)
+        if is_pdf_file(pdf_output_path):
+            # A real PDF from an earlier local re-fetch run; reuse it.
+            tracker.record(
+                target, OUTCOME_REFETCHED, "already on local disk", pdf_output_path
+            )
+            return "skip_local"
+        # A stale placeholder copied locally by an old run must not survive.
+        pdf_output_path.unlink(missing_ok=True)
+
+        try:
+            ok = self.download_pdf(pdf_fragment, row_pos)
+        except Exception as e:
+            tracker.record(target, OUTCOME_ERROR, f"{type(e).__name__}: {e}")
+            raise
+
+        if ok:
+            tracker.record(target, OUTCOME_REFETCHED, "", pdf_output_path)
+        else:
+            reason, detail = self.last_pdf_failure or ("unknown", "")
+            tracker.record(
+                target,
+                classify_download_failure(reason),
+                f"{reason}: {detail}" if detail else reason,
+            )
+
+        metadata = {
+            "court_code": self.court_code,
+            "court_name": self.court_name,
+            "raw_html": html,
+            "pdf_link": pdf_fragment,
+            "downloaded": ok,
+        }
+        metadata_output = pdf_output_path.with_suffix(".json")
+        metadata_output.parent.mkdir(parents=True, exist_ok=True)
+        with open(metadata_output, "w") as f:
+            json.dump(metadata, f)
+        return "downloaded" if ok else "no_download"
+
     def download_pdf(self, pdf_fragment, row_pos):
+        # (reason, detail) of the last failed attempt, for refetch reporting.
+        self.last_pdf_failure = None
         # prepare temp pdf request
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
         pdf_link_payload = self.default_pdf_link_payload()
@@ -1503,11 +1779,13 @@ class Downloader:
                 f"Error downloading pdf, task: {self.task}, "
                 f"non-json PDF link response: {e}"
             )
+            self.last_pdf_failure = ("pdf_link_not_json", str(e))
             return False
         if "outputfile" not in pdf_link_data:
             logger.error(
                 f"Error downloading pdf, task: {self.task}, Error: {pdf_link_data}"
             )
+            self.last_pdf_failure = ("pdf_link_error", str(pdf_link_data)[:200])
             return False
         pdf_download_link = pdf_link_data["outputfile"]
 
@@ -1526,16 +1804,22 @@ class Downloader:
             logger.error(
                 f"Empty pdf, task: {self.task}, output path: {pdf_output_path}"
             )
+            self.last_pdf_failure = ("empty", "")
             return False
         if no_of_bytes == 315:
             logger.error(
                 f"404 pdf response, task: {self.task}, output path: {pdf_output_path}"
             )
+            self.last_pdf_failure = ("not_found_page", "315-byte response")
             return False
         if pdf_response.status_code != 200:
             logger.error(
                 f"Unexpected pdf status {pdf_response.status_code}, "
                 f"task: {self.task}, output path: {pdf_output_path}"
+            )
+            self.last_pdf_failure = (
+                f"http_{pdf_response.status_code}",
+                f"{no_of_bytes} bytes",
             )
             return False
         if not pdf_response.content.startswith(b"%PDF"):
@@ -1543,6 +1827,10 @@ class Downloader:
                 f"Non-PDF response while downloading pdf, task: {self.task}, "
                 f"output path: {pdf_output_path}, first bytes: "
                 f"{pdf_response.content[:32]!r}"
+            )
+            self.last_pdf_failure = (
+                "not_pdf",
+                f"{no_of_bytes} bytes, starts {pdf_response.content[:32]!r}",
             )
             return False
         with open(pdf_output_path, "wb") as f:
@@ -1909,6 +2197,9 @@ Examples:
 
   # Just check what dates are in S3
   python download.py --fetch_dates
+
+  # Re-fetch placeholder PDFs listed by scripts/find_placeholder_pdfs.py
+  python download.py --refetch-list placeholder-pdfs.csv --court_code 28_2
         """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -2001,6 +2292,35 @@ Examples:
              "pass --no-compress-pdfs to disable. No-op if Ghostscript is not installed.",
     )
 
+    parser.add_argument(
+        "--refetch-list",
+        type=str,
+        default=None,
+        help=(
+            "Re-fetch only the data/pdf/ keys in this file (CSV with a 'key' "
+            "column, optionally 'search_date', or one key per line), e.g. "
+            "placeholder PDFs found by scripts/find_placeholder_pdfs.py. "
+            "Searches only the courts/dates those keys need and downloads only "
+            "listed files. --start_date/--end_date are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--refetch-report",
+        type=str,
+        default=DEFAULT_REFETCH_REPORT,
+        help="Where --refetch-list writes its per-key outcome CSV",
+    )
+    parser.add_argument(
+        "--refetch-pad-days",
+        type=int,
+        default=0,
+        help=(
+            "Also search this many days either side of each listed file's "
+            "date, for files whose filename date may differ from the portal's "
+            "Decision Date"
+        ),
+    )
+
     args = parser.parse_args()
 
     if args.sync_s3:
@@ -2023,7 +2343,29 @@ Examples:
         print("INFO: PDF compression disabled (--no-compress-pdfs)")
 
     # Handle different modes
-    if args.fetch_dates:
+    if args.refetch_list:
+        if args.start_date or args.end_date:
+            print("WARNING: --start_date/--end_date are ignored with --refetch-list")
+        if args.court_codes:
+            refetch_courts = args.court_codes.split(",")
+        elif args.court_code:
+            refetch_courts = [args.court_code]
+        else:
+            refetch_courts = None
+        run_refetch(
+            args.refetch_list,
+            court_codes=refetch_courts,
+            day_step=args.day_step,
+            pad_days=args.refetch_pad_days,
+            max_workers=args.max_workers,
+            compress_pdfs=args.compress_pdfs,
+            dist_code=args.dist_code,
+            use_default_dist_codes=args.default_dist_codes,
+            max_runtime_minutes=args.max_runtime_minutes or None,
+            checkpoint_every=args.checkpoint_every or None,
+            report_path=args.refetch_report,
+        )
+    elif args.fetch_dates:
         # Just print dates from S3 without downloading
         court_dates = get_court_dates_from_index_files()
         print(f"Found dates for {len(court_dates)} courts")

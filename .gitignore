@@ -176,3 +176,6 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+# Placeholder PDF audit / re-fetch outputs
+placeholder-pdfs*.csv
+refetch-report*.csv
