@@ -1338,6 +1338,10 @@ def _advance_court_resume_cursors(
                 )
 
 
+class RefetchParseError(RuntimeError):
+    """A search row cannot be matched safely to the recovery manifest."""
+
+
 DEFAULT_REFETCH_REPORT = "refetch-report.csv"
 
 
@@ -1397,6 +1401,7 @@ def run_refetch(
     batch_size = checkpoint_every if checkpoint_every else None
     task_failures = []
     unrun_tasks: List[CourtDateTask] = []
+    attempted_tasks = set()
 
     try:
         for court_code, court_tasks in tasks_by_court.items():
@@ -1410,10 +1415,16 @@ def run_refetch(
                     unrun_tasks.extend(batch)
                     continue
                 failures, unrun = _run_tasks(batch, max_workers, compress_pdfs, deadline)
+                attempted_tasks.update(id(task) for task in batch)
                 task_failures.extend(failures)
                 unrun_tasks.extend(unrun)
                 if S3_ENABLED:
                     _upload_refetched_to_s3(tracker)
+    except Exception:
+        # Upload failure stops the run too. Do not call untouched later
+        # ranges "not found" when they were never searched.
+        unrun_tasks.extend(task for task in tasks if id(task) not in attempted_tasks)
+        raise
     finally:
         for task, error in task_failures:
             tracker.mark_search_failed(
@@ -1424,7 +1435,7 @@ def run_refetch(
                 task.court_code,
                 task.from_date,
                 task.to_date,
-                "not searched: run stopped early (budget or portal unreachable)",
+                "not searched: run stopped early (budget, portal or upload failure)",
             )
         path = tracker.write_report(report_path)
         summary = tracker.summary()
@@ -1456,6 +1467,7 @@ def _upload_refetched_to_s3(tracker: RefetchTracker):
     the files kept; the report shows uploaded=false for them.
     """
     pending = tracker.pending_uploads()
+    upload_failures = []
     groups: Dict[tuple, list] = {}
     for result in pending:
         t = result.target
@@ -1480,9 +1492,10 @@ def _upload_refetched_to_s3(tracker: RefetchTracker):
             upload_replacement_tar_part("data", year, court_code, bench, files)
             cache_store.invalidate(year, court_code, bench, "data")
         except Exception as e:
-            logger.error(
-                f"Failed to upload re-fetched PDFs for {year}/{court_code}/{bench}: {e}"
-            )
+            message = f"Failed to upload re-fetched PDFs for {year}/{court_code}/{bench}: {e}"
+            logger.error(message)
+            tracker.mark_upload_failed(results, message)
+            upload_failures.append(message)
             continue
         tracker.mark_uploaded(results)
         for f in files:
@@ -1491,6 +1504,9 @@ def _upload_refetched_to_s3(tracker: RefetchTracker):
         print(
             f"  Replaced {len(files)} placeholder PDF(s) in {year}/{court_code}/{bench}"
         )
+
+    if upload_failures:
+        raise RuntimeError("Refetch upload failed: " + "; ".join(upload_failures))
 
 
 class Downloader:
@@ -1649,6 +1665,8 @@ class Downloader:
         # case_details = html_element.xpath("./strong//text()")
         # check if button with onclick is present
         if not (soup.button and "onclick" in soup.button.attrs):
+            if self.task.refetch is not None:
+                raise RefetchParseError("Recovery search row has no PDF handler")
             logger.debug(
                 f"No button found, likely multi language judgment, task: {self.task}"
             )
@@ -1659,6 +1677,8 @@ class Downloader:
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
 
         if self.task.refetch is not None:
+            if not pdf_fragment:
+                raise RefetchParseError("Recovery search row has an unsupported PDF handler")
             return self.process_refetch_row(html, pdf_fragment, row_pos)
 
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
@@ -1858,7 +1878,7 @@ class Downloader:
         headers["Cookie"] = cookie.output(header="", sep=";").strip()
 
     def extract_pdf_fragment(self, html_attribute):
-        pattern = r"javascript:open_pdf\('.*?','.*?','(.*?)'\)"
+        pattern = r"(?:javascript:)?open_pdf\('.*?','.*?','(.*?)'\)"
         match = re.search(pattern, html_attribute)
         if match:
             return match.group(1).split("#")[0]
@@ -2139,6 +2159,8 @@ class Downloader:
                                 if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                     break
                             except Exception as e:
+                                if isinstance(e, RefetchParseError):
+                                    raise
                                 logger.error(
                                     f"Error processing row {row}: {e}, task: {self.task}"
                                 )
