@@ -326,6 +326,14 @@ class RefetchTracker:
                 if r.outcome == OUTCOME_REFETCHED and not r.uploaded
             ]
 
+    def mark_upload_failed(self, results: Iterable[RefetchResult], detail: str) -> None:
+        """Keep local recovery files but report failed publication as an error."""
+        with self._lock:
+            for result in results:
+                result.outcome = OUTCOME_ERROR
+                result.detail = detail
+                result.uploaded = False
+
     def mark_uploaded(self, results: Iterable[RefetchResult]) -> None:
         with self._lock:
             for result in results:

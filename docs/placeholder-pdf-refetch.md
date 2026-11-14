@@ -126,3 +126,16 @@ A filename can now appear in more than one tar of a partition. To resolve it:
 Parts that have never had a member replaced are serialized exactly as before
 (no `superseded_files` key). `scripts/full_s3_integrity_audit.py
 --verify-tar-members` does not report superseded members as extra tar members.
+
+### Recovery failures
+
+A malformed PDF handler fails its search task rather than counting its targets
+as absent. Both `javascript:open_pdf(...)` and bare `open_pdf(...)` are accepted.
+Unresolved targets in failed searches are reported as `error`.
+
+With `--sync-s3`, any object, tar or index upload failure makes the command exit
+nonzero. Affected targets are reported as `error`, `uploaded=false`, with their
+local PDF retained. Later ranges that were never searched are also `error`, not
+`not_found_in_search`. Retry with the same manifest after resolving the error;
+a partial upload may already have replaced a loose PDF, but is not counted as
+published until its replacement tar and index update succeed.
