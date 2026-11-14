@@ -136,6 +136,11 @@ Two things to know about mobile-sourced data:
   pipeline doesn't reconcile per-PDF presence at metadata-generation time, so it
   leaves the flag unknown rather than asserting it. Treat null as "unknown — check
   the data tar/index if you need certainty."
+- **`pdf_exists` can be stale for incrementally synced web rows.** Parquet is
+  generated from a temporary directory containing only metadata JSON files, before
+  the raw PDF upload completes. Consequently, a row may remain `false` even when
+  its PDF was subsequently uploaded to the dataset. Treat `true` as confirmed,
+  but verify `false` against the corresponding data index when certainty matters.
 - **`metadata/parquet_case_details/court/bench/`** is a mobile-only **dimension
   table** (one row per CNR, *not* year-partitioned) carrying richer fields the
   website never exposed — acts/sections, full hearing history, linked cases,
