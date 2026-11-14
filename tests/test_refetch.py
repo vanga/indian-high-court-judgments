@@ -196,6 +196,21 @@ class RefetchRowTests(TempCwdTestCase):
             self.assertEqual(self.downloader.process_result_row(row, 0), "downloaded")
         dl.assert_called_once_with(BOMBAY_FRAGMENT, 0)
 
+    def test_reported_non_pdf_recovery_result_does_not_fail_daily_guard(self):
+        from unittest.mock import Mock
+        page = Mock()
+        page.json.return_value = {"reportrow": {"aaData": [_row(BOMBAY_FRAGMENT)]}}
+        end = Mock()
+        end.json.return_value = {"reportrow": {"aaData": []}}
+        with (
+            patch.object(self.downloader, "init_user_session"),
+            patch.object(self.downloader, "request_api", side_effect=[page, end]),
+            patch.object(self.downloader, "download_pdf", return_value=False),
+        ):
+            self.downloader.last_pdf_failure = ("not_pdf", "")
+            self.downloader.download()
+        self.assertEqual(self.tracker.rows()[0]["outcome"], OUTCOME_STILL_NOT_PDF)
+
     def test_unsupported_handlers_fail_the_search_not_target_presence(self):
         for html in ('<button onclick="unknown()">PDF</button>', '<div>No handler</div>'):
             with self.subTest(html=html):

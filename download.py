@@ -62,6 +62,10 @@ from src.utils.refetch_utils import (
 )
 
 
+class IncompleteResultsError(RuntimeError):
+    """Listed judgment rows were not all processed; never advance past them."""
+
+
 S3_ENABLED = False
 DAILY_UPDATE_BUFFER_DAYS = 14
 TASK_DOWNLOAD_ATTEMPTS = 3
@@ -824,12 +828,16 @@ def run(
         # warrant a red CI run — only fail hard when failures are widespread.
         n_failed = len(task_failures)
         failure_ratio = n_failed / total_tasks if total_tasks else 1.0
-        fatal = failure_ratio > FAILURE_RATIO_THRESHOLD or n_failed > FAILURE_COUNT_THRESHOLD
+        fatal = (
+            failure_ratio > FAILURE_RATIO_THRESHOLD
+            or n_failed > FAILURE_COUNT_THRESHOLD
+            or any(isinstance(error, IncompleteResultsError) for _, error in task_failures)
+        )
         if fatal:
             problems.append(
                 f"{n_failed}/{total_tasks} task(s) failed "
                 f"({failure_ratio:.0%} > {FAILURE_RATIO_THRESHOLD:.0%} or "
-                f"count > {FAILURE_COUNT_THRESHOLD}):\n{failed_tasks}"
+                f"count > {FAILURE_COUNT_THRESHOLD}, or incomplete result rows):\n{failed_tasks}"
             )
         else:
             logger.warning(
@@ -1549,6 +1557,7 @@ class Downloader:
             "metadata_only": 0,
             "no_download": 0,
             "parse_failure": 0,
+            "row_error": 0,
             "session_refreshes": 0,
             "session_expire_events": 0,
             "errormsg_events": 0,
@@ -1559,7 +1568,7 @@ class Downloader:
         logger.info(
             "Task summary: court=%s from=%s to=%s pages=%s results=%s downloaded=%s "
             "skip_s3=%s skip_local=%s metadata_only=%s no_download=%s parse_failures=%s "
-            "session_refreshes=%s session_expire=%s api_errors=%s",
+            "row_errors=%s session_refreshes=%s session_expire=%s api_errors=%s",
             self.court_code,
             self.task.from_date,
             self.task.to_date,
@@ -1571,6 +1580,7 @@ class Downloader:
             self.task_stats["metadata_only"],
             self.task_stats["no_download"],
             self.task_stats["parse_failure"],
+            self.task_stats["row_error"],
             self.task_stats["session_refreshes"],
             self.task_stats["session_expire_events"],
             self.task_stats["errormsg_events"],
@@ -1675,10 +1685,12 @@ class Downloader:
             # TODO: requires special parsing
             return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
+        if not pdf_fragment:
+            if self.task.refetch is not None:
+                raise RefetchParseError("Recovery search row has an unsupported PDF handler")
+            return "parse_failure"
 
         if self.task.refetch is not None:
-            if not pdf_fragment:
-                raise RefetchParseError("Recovery search row has an unsupported PDF handler")
             return self.process_refetch_row(html, pdf_fragment, row_pos)
 
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
@@ -1878,10 +1890,17 @@ class Downloader:
         headers["Cookie"] = cookie.output(header="", sep=";").strip()
 
     def extract_pdf_fragment(self, html_attribute):
-        pattern = r"(?:javascript:)?open_pdf\('.*?','.*?','(.*?)'\)"
-        match = re.search(pattern, html_attribute)
+        # The portal uses both javascript:open_pdf(...) and bare onclick calls.
+        # Match quoted arguments, not arbitrary JavaScript, and strip viewer
+        # anchors before using the fragment as a path or S3 lookup key.
+        pattern = (
+            r"^\s*(?:javascript\s*:\s*)?open_pdf\s*\(\s*"
+            r"(['\"])(.*?)\1\s*,\s*(['\"])(.*?)\3\s*,\s*"
+            r"(['\"])(.*?)\5\s*\)\s*;?\s*$"
+        )
+        match = re.fullmatch(pattern, html_attribute)
         if match:
-            return match.group(1).split("#")[0]
+            return match.group(6).split("#", 1)[0] or None
         return None
 
     def solve_captcha(self, retries=0, captcha_url=None):
@@ -2161,11 +2180,29 @@ class Downloader:
                             except Exception as e:
                                 if isinstance(e, RefetchParseError):
                                     raise
+                                self.task_stats["row_error"] += 1
                                 logger.error(
-                                    f"Error processing row {row}: {e}, task: {self.task}"
+                                    f"Error processing row position {idx}: {e}, task: {self.task}"
                                 )
                                 traceback.print_exc()
                                 result_pbar.update(1)
+
+                    # Zero downloads is valid for already-present rows, but any
+                    # unhandled row, parse failure or failed PDF is incomplete.
+                    # Raising feeds task retries and the existing contiguous
+                    # cursor guard; a partial success must not hide a data gap.
+                    incomplete_keys = ["parse_failure", "row_error"]
+                    # Recovery explicitly reports a portal still serving a
+                    # non-PDF; it is not an unobserved daily coverage gap.
+                    if self.task.refetch is None:
+                        incomplete_keys.append("no_download")
+                    incomplete = sum(self.task_stats[key] for key in incomplete_keys)
+                    if incomplete:
+                        self._log_task_summary()
+                        raise IncompleteResultsError(
+                            f"{incomplete} result row(s) incomplete for {self.task}; "
+                            "resume cursor must not advance through this range"
+                        )
 
                     # Re-fetch the same search page after a session refresh.
                     # For backfills, most rows on the page are usually already
