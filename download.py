@@ -8,6 +8,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
 import random
 import re
 import sys
@@ -59,6 +60,15 @@ TASK_DOWNLOAD_ATTEMPTS = 3
 # when failures are widespread (ratio) or large in absolute terms (count).
 FAILURE_RATIO_THRESHOLD = 0.2
 FAILURE_COUNT_THRESHOLD = 10
+# Rows the portal listed that we could not finish (parse failure, row error,
+# PDF not downloaded). They do not hold the resume cursor - the daily overlap
+# retries them for DAILY_UPDATE_BUFFER_DAYS - but they must never be silent.
+# A court losing more than this share of its rows (and at least the minimum
+# count) fails the run: that looks structural, like the #37 markup change,
+# rather than a few rows the portal cannot serve. Smaller losses are warnings.
+ROW_FAILURE_RATIO_THRESHOLD = 0.02
+ROW_FAILURE_MIN_COUNT = 5
+ROW_FAILURE_SAMPLES = 3
 # Wall-clock budget for a whole run. Must stay below the CI job timeout so the
 # run stops itself - draining in-flight uploads and advancing resume cursors -
 # instead of being killed mid-write. A run that cannot reach every court is
@@ -660,6 +670,7 @@ def run(
     # Module-level state, so clear it per run rather than inheriting a trip
     # from an earlier call in the same process.
     connectivity_breaker.reset()
+    row_failures.reset()
     task_failures = []
     courts_skipped_portal_down = []
     total_tasks = 0
@@ -792,6 +803,24 @@ def run(
     # wobble apart from a budget that is simply too small.
     problems = []
 
+    # Rows the portal listed but we did not save. Their ranges count as tried,
+    # so the cursor has already moved on; this is the only signal they leave.
+    rows_fatal, rows_warning = row_failures.report()
+    _publish_row_failure_report(rows_fatal, rows_warning)
+    if rows_warning:
+        logger.warning(
+            "Some listed rows were not saved (within tolerance; retried by the "
+            "daily overlap):\n%s",
+            "\n".join(f"- {line}" for _, line in rows_warning),
+        )
+    if rows_fatal:
+        problems.append(
+            f"{len(rows_fatal)} court(s) lost more than "
+            f"{ROW_FAILURE_RATIO_THRESHOLD:.0%} of listed rows - likely a portal "
+            f"markup or download change, not transient noise:\n"
+            + "\n".join(f"- {line}" for _, line in rows_fatal)
+        )
+
     if task_failures:
         failed_tasks = "\n".join(
             f"- {task}: {error}" for task, error in task_failures
@@ -859,6 +888,77 @@ def run(
         raise RuntimeError("\n\n".join(problems))
 
     logger.info("All download tasks completed")
+
+
+class RowFailureLedger:
+    """Per-court tally of listed rows and rows we could not finish."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._courts = {}
+
+    def reset(self):
+        with self._lock:
+            self._courts = {}
+
+    def record(self, court_code, results, failed, samples):
+        with self._lock:
+            entry = self._courts.setdefault(
+                court_code, {"results": 0, "failed": 0, "samples": []}
+            )
+            entry["results"] += results
+            entry["failed"] += failed
+            room = ROW_FAILURE_SAMPLES - len(entry["samples"])
+            entry["samples"].extend(samples[: max(room, 0)])
+
+    def report(self):
+        """Return (fatal, warnings): lists of (court_code, line)."""
+        fatal, warnings_ = [], []
+        with self._lock:
+            courts = dict(self._courts)
+        for court_code, entry in sorted(courts.items()):
+            failed, results = entry["failed"], entry["results"]
+            if not failed:
+                continue
+            ratio = failed / results if results else 1.0
+            line = (
+                f"{court_code}: {failed}/{results} listed row(s) not saved "
+                f"({ratio:.1%}); e.g. {'; '.join(entry['samples']) or 'n/a'}"
+            )
+            if failed >= ROW_FAILURE_MIN_COUNT and ratio > ROW_FAILURE_RATIO_THRESHOLD:
+                fatal.append((court_code, line))
+            else:
+                warnings_.append((court_code, line))
+        return fatal, warnings_
+
+
+row_failures = RowFailureLedger()
+
+
+def _publish_row_failure_report(fatal, warnings_):
+    """Make lost rows visible on the Actions run page, not just in the log."""
+    for _, line in fatal:
+        print(f"::error title=Judgment rows not saved::{line}")
+    for _, line in warnings_:
+        print(f"::warning title=Judgment rows not saved::{line}")
+    summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+    if not summary_path or not (fatal or warnings_):
+        return
+    lines = [
+        "## Judgment rows not saved",
+        "",
+        "The resume cursor still advanced; the next "
+        f"{DAILY_UPDATE_BUFFER_DAYS} daily runs retry these dates. Persistent "
+        "failures beyond that window need an explicit backfill.",
+        "",
+    ]
+    lines += [f"- **failing**: {line}" for _, line in fatal]
+    lines += [f"- warning: {line}" for _, line in warnings_]
+    try:
+        with open(summary_path, "a") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        logger.warning(f"Could not write step summary: {e}")
 
 
 def _run_deadline(max_runtime_minutes):
@@ -1378,6 +1478,7 @@ class Downloader:
             "metadata_only": 0,
             "no_download": 0,
             "parse_failure": 0,
+            "row_error": 0,
             "session_refreshes": 0,
             "session_expire_events": 0,
             "errormsg_events": 0,
@@ -1387,7 +1488,7 @@ class Downloader:
         logger.info(
             "Task summary: court=%s from=%s to=%s pages=%s results=%s downloaded=%s "
             "skip_s3=%s skip_local=%s metadata_only=%s no_download=%s parse_failures=%s "
-            "session_refreshes=%s session_expire=%s api_errors=%s",
+            "row_errors=%s session_refreshes=%s session_expire=%s api_errors=%s",
             self.court_code,
             self.task.from_date,
             self.task.to_date,
@@ -1399,6 +1500,7 @@ class Downloader:
             self.task_stats["metadata_only"],
             self.task_stats["no_download"],
             self.task_stats["parse_failure"],
+            self.task_stats["row_error"],
             self.task_stats["session_refreshes"],
             self.task_stats["session_expire_events"],
             self.task_stats["errormsg_events"],
@@ -1501,6 +1603,12 @@ class Downloader:
             # TODO: requires special parsing
             return "parse_failure"
         pdf_fragment = self.extract_pdf_fragment(soup.button["onclick"])
+        if not pdf_fragment:
+            logger.warning(
+                f"Unrecognised PDF handler {soup.button['onclick'][:120]!r}, "
+                f"task: {self.task}"
+            )
+            return "parse_failure"
 
         json_in_s3, pdf_in_s3 = self.check_result_in_s3(pdf_fragment)
         pdf_output_path = self.get_pdf_output_path(pdf_fragment)
@@ -1619,10 +1727,18 @@ class Downloader:
         headers["Cookie"] = cookie.output(header="", sep=";").strip()
 
     def extract_pdf_fragment(self, html_attribute):
-        pattern = r"javascript:open_pdf\('.*?','.*?','(.*?)'\)"
-        match = re.search(pattern, html_attribute)
+        # The portal has used both href-style "javascript:open_pdf(...)" and,
+        # since Nov 2026, a bare onclick "open_pdf(...);" (issue #37). Match
+        # the three quoted arguments exactly rather than arbitrary JavaScript,
+        # and strip the viewer anchor before using the path as a file/S3 key.
+        pattern = (
+            r"\s*(?:javascript\s*:\s*)?open_pdf\s*\(\s*"
+            r"(['\"])(.*?)\1\s*,\s*(['\"])(.*?)\3\s*,\s*"
+            r"(['\"])(.*?)\5\s*\)\s*;?\s*"
+        )
+        match = re.fullmatch(pattern, html_attribute)
         if match:
-            return match.group(1).split("#")[0]
+            return match.group(6).split("#", 1)[0] or None
         return None
 
     def solve_captcha(self, retries=0, captcha_url=None):
@@ -1865,6 +1981,7 @@ class Downloader:
         results_available = True
         pdfs_downloaded = 0
         self.task_stats = self._new_task_stats()
+        self._failed_row_samples = []
 
         logger.info(f"Starting task: {self.task}")
 
@@ -1891,6 +2008,8 @@ class Downloader:
                                     row, row_pos=idx
                                 )
                                 self.task_stats[outcome] += 1
+                                if outcome in ("parse_failure", "no_download"):
+                                    self._note_failed_row(outcome, idx)
                                 if outcome == "downloaded":
                                     pdfs_downloaded += 1
                                     result_pbar.set_postfix(downloaded=pdfs_downloaded)
@@ -1900,6 +2019,8 @@ class Downloader:
                                 if pdfs_downloaded >= NO_CAPTCHA_BATCH_SIZE:
                                     break
                             except Exception as e:
+                                self.task_stats["row_error"] += 1
+                                self._note_failed_row(f"row_error {e}", idx)
                                 logger.error(
                                     f"Error processing row {row}: {e}, task: {self.task}"
                                 )
@@ -1929,6 +2050,20 @@ class Downloader:
                 raise
 
         self._log_task_summary()
+        stats = self.task_stats
+        row_failures.record(
+            self.court_code,
+            stats["results_seen"],
+            stats["parse_failure"] + stats["row_error"] + stats["no_download"],
+            self._failed_row_samples,
+        )
+
+    def _note_failed_row(self, reason, idx):
+        if len(self._failed_row_samples) < ROW_FAILURE_SAMPLES:
+            self._failed_row_samples.append(
+                f"{self.task.from_date}..{self.task.to_date} row {idx}: "
+                f"{str(reason)[:80]}"
+            )
 
 
 if __name__ == "__main__":
