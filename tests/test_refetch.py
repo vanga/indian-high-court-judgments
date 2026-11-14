@@ -189,6 +189,19 @@ class RefetchRowTests(TempCwdTestCase):
         s3_check.assert_not_called()
         self.assertFalse(Path("data").exists(), "no metadata may be written")
 
+    def test_bare_onclick_for_listed_target_is_not_silently_skipped(self):
+        row = _row(BOMBAY_FRAGMENT)
+        row[1] = row[1].replace("javascript:", "")
+        with patch.object(self.downloader, "download_pdf", return_value=True) as dl:
+            self.assertEqual(self.downloader.process_result_row(row, 0), "downloaded")
+        dl.assert_called_once_with(BOMBAY_FRAGMENT, 0)
+
+    def test_unsupported_handlers_fail_the_search_not_target_presence(self):
+        for html in ('<button onclick="unknown()">PDF</button>', '<div>No handler</div>'):
+            with self.subTest(html=html):
+                with self.assertRaises(download.RefetchParseError):
+                    self.downloader.process_result_row([0, html], 0)
+
     def test_listed_row_is_downloaded_even_though_s3_index_has_it(self):
         def fake_download(fragment, _pos):
             path = self.downloader.get_pdf_output_path(fragment)
@@ -384,8 +397,10 @@ class RefetchUploadTests(TempCwdTestCase):
             patch.object(download, "upload_single_file_to_s3", return_value=False),
             patch.object(download, "upload_replacement_tar_part") as tar,
         ):
-            download._upload_refetched_to_s3(tracker)
+            with self.assertRaisesRegex(RuntimeError, "Refetch upload failed"):
+                download._upload_refetched_to_s3(tracker)
 
+        self.assertEqual(tracker.rows()[0]["outcome"], OUTCOME_ERROR)
         tar.assert_not_called()
         self.assertTrue(path.exists())
         self.assertEqual(tracker.rows()[0]["uploaded"], "false")
@@ -456,6 +471,52 @@ class RunRefetchTests(TempCwdTestCase):
 
         # 3 single-day tasks, checkpointed one by one.
         self.assertEqual(upload.call_count, 3)
+
+    def test_failed_upload_raises_and_writes_error_report(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(download, "get_court_codes", return_value=COURTS))
+            stack.enter_context(patch.object(download, "S3_ENABLED", True))
+            stack.enter_context(patch.object(download, "_run_tasks", side_effect=self._fake_run_tasks([])))
+            stack.enter_context(patch.object(download, "upload_single_file_to_s3", return_value=False))
+            with self.assertRaisesRegex(RuntimeError, "Refetch upload failed"):
+                download.run_refetch("list.csv", court_codes=["27_1"], report_path="r.csv")
+        rows = {r["key"]: r for r in csv.DictReader(Path("r.csv").open())}
+        self.assertEqual(rows[BOMBAY_KEY]["outcome"], OUTCOME_ERROR)
+        self.assertEqual(rows[BOMBAY_KEY]["uploaded"], "false")
+        self.assertIn("upload", rows[BOMBAY_KEY]["detail"])
+        self.assertTrue(Path(rows[BOMBAY_KEY]["local_path"]).exists())
+
+    def test_upload_failure_marks_later_unsearched_ranges_error(self):
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(download, "get_court_codes", return_value=COURTS))
+            stack.enter_context(patch.object(download, "S3_ENABLED", True))
+            stack.enter_context(patch.object(download, "_run_tasks", side_effect=self._fake_run_tasks([])))
+            stack.enter_context(patch.object(download, "upload_single_file_to_s3", return_value=True))
+            stack.enter_context(patch.object(download, "upload_replacement_tar_part", side_effect=RuntimeError("index write failed")))
+            with self.assertRaisesRegex(RuntimeError, "Refetch upload failed"):
+                download.run_refetch("list.csv", report_path="r.csv", checkpoint_every=1)
+        rows = list(csv.DictReader(Path("r.csv").open()))
+        self.assertTrue(all(r["outcome"] == OUTCOME_ERROR for r in rows))
+        self.assertTrue(all(r["uploaded"] == "false" for r in rows))
+        self.assertIn("index write failed", rows[0]["detail"])
+        self.assertIn("not searched", rows[1]["detail"])
+
+    def test_malformed_row_marks_unresolved_targets_error_and_fails_run(self):
+        from unittest.mock import Mock
+        response = Mock()
+        response.json.return_value = {"reportrow": {"aaData": [[0, '<button onclick="unknown()">PDF</button>']]}}
+        with ExitStack() as stack:
+            stack.enter_context(patch.object(download, "get_court_codes", return_value=COURTS))
+            stack.enter_context(patch.object(download, "S3_ENABLED", False))
+            stack.enter_context(patch.object(download, "TASK_DOWNLOAD_ATTEMPTS", 1))
+            stack.enter_context(patch.object(download.Downloader, "init_user_session"))
+            stack.enter_context(patch.object(download.Downloader, "request_api", return_value=response))
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                download.run_refetch("list.csv", court_codes=["27_1"], report_path="r.csv", max_workers=1)
+        rows = list(csv.DictReader(Path("r.csv").open()))
+        self.assertTrue(rows)
+        self.assertTrue(all(r["outcome"] == OUTCOME_ERROR for r in rows))
+        self.assertTrue(all("PDF handler" in r["detail"] for r in rows))
 
     def test_failed_search_marks_keys_error_writes_report_and_raises(self):
         def failing(batch, *_a, **_k):
