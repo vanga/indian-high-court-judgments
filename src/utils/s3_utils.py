@@ -14,7 +14,7 @@ from typing import Dict, List, Optional, Tuple
 import json
 import re
 
-from src.models import IndexFileV2, IndexPart
+from src.models import IndexFileV2, IndexPart, member_sizes, members_for
 from src.utils.shared_utils import format_size, utc_now_iso, generate_part_name, get_metadata_index_key, get_data_index_key, get_bench_partition_key
 
 try:
@@ -608,6 +608,17 @@ def _get_indexed_filenames(data_type: str, year: int, court_code: str, bench: st
     return indexed
 
 
+def _local_sizes(files: List[Path]) -> Dict[str, int]:
+    """Byte size of each local file, keyed by basename (unreadable ones skipped)."""
+    sizes: Dict[str, int] = {}
+    for f in files:
+        try:
+            sizes[Path(f).name] = Path(f).stat().st_size
+        except OSError:
+            pass
+    return sizes
+
+
 def update_index_file(
     data_type: str,
     year: int,
@@ -617,6 +628,7 @@ def update_index_file(
     tar_file_name: str,
     tar_file_size: int,
     replace_part_name: Optional[str] = None,
+    known_sizes: Optional[Dict[str, int]] = None,
 ) -> bool:
     """Update the S3 index file with a new tar part.
 
@@ -634,6 +646,11 @@ def update_index_file(
     list becomes the union of the replaced part's files and the incoming new
     files (deduped). This is used by the hybrid append path — callers upload a
     merged tar under a brand-new key, then swap the index entry in one PUT.
+
+    The part's ``members`` (name + size) come from the local ``files``,
+    ``known_sizes`` (sizes of members carried over from an appended tar), and
+    the replaced part's own ``members``. If any size is unknown, ``members``
+    is omitted rather than written partially.
     """
     index_key = get_metadata_index_key(
         year, court_code, bench) if data_type == "metadata" else get_data_index_key(year, court_code, bench)
@@ -686,6 +703,12 @@ def update_index_file(
         )
         return False
 
+    sizes: Dict[str, int] = {}
+    if old_part is not None:
+        sizes.update(member_sizes(old_part))
+    sizes.update(known_sizes or {})
+    sizes.update(_local_sizes(files))
+
     size_human = format_size(tar_file_size)
     new_part = IndexPart(
         name=tar_file_name,
@@ -694,6 +717,7 @@ def update_index_file(
         size=tar_file_size,
         size_human=size_human,
         created_at=utc_now_iso(),
+        members=members_for(part_files_list, sizes),
     )
     index_data.parts.append(new_part)
     index_data.file_count = index_data.file_count + len(part_files_list)
@@ -780,6 +804,7 @@ def _append_to_existing_part(
         # Members replaced by a later part (see upload_replacement_tar_part)
         # must not be carried into a newer tar, or they would win again.
         superseded = set(target.superseded_files)
+        carried_sizes: Dict[str, int] = {}
         with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
             merged_tar_temp = tmp.name
         try:
@@ -789,6 +814,7 @@ def _append_to_existing_part(
                     if member.isfile() and Path(member.name).name in superseded:
                         continue
                     if member.isfile():
+                        carried_sizes[Path(member.name).name] = member.size
                         extracted = old_tar.extractfile(member)
                         new_tar.addfile(member, extracted)
                     else:
@@ -838,6 +864,7 @@ def _append_to_existing_part(
                 data_type, year, court_code, bench,
                 part_files, new_part_file_name, merged_size,
                 replace_part_name=target.name,
+                known_sizes=carried_sizes,
             )
         except Exception as e:
             logger.error(
@@ -1073,6 +1100,8 @@ def replace_files_in_index(
         moved_total += len(moved)
         part.files = [n for n in part.files if n not in name_set]
         part.file_count = len(part.files)
+        if part.members is not None:
+            part.members = [m for m in part.members if m.name not in name_set]
         part.superseded_files = sorted(set(part.superseded_files) | set(moved))
 
     index_data.parts.append(
@@ -1083,6 +1112,7 @@ def replace_files_in_index(
             size=tar_file_size,
             size_human=format_size(tar_file_size),
             created_at=utc_now_iso(),
+            members=members_for(names, _local_sizes(files)),
         )
     )
     index_data.file_count = max(index_data.file_count - moved_total, 0) + len(names)

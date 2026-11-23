@@ -2,9 +2,13 @@
 Pydantic models for Indian High Court Judgments data structures
 """
 
-from pydantic import BaseModel, Field, field_validator, model_serializer
-from typing import List, Optional
+import logging
 from datetime import datetime
+from typing import Dict, List, Mapping, Optional
+
+from pydantic import BaseModel, Field, field_validator, model_serializer
+
+logger = logging.getLogger(__name__)
 
 
 class IndexFile(BaseModel):
@@ -59,6 +63,30 @@ class IndexFile(BaseModel):
         self.file_count = len(self.files)
 
 
+class IndexMember(BaseModel):
+    """One file listed in a tar part, with its size inside the tar."""
+
+    name: str = Field(description="Member filename, as listed in ``files``")
+    size: int = Field(ge=0, description="Member size in bytes (uncompressed)")
+
+
+def members_for(names: List[str], sizes: Mapping[str, int]) -> Optional[List[IndexMember]]:
+    """Members for ``names`` in order, or None unless every size is known.
+
+    A part's ``members`` either covers all of its ``files`` or is absent, so a
+    reader never has to guess whether a missing entry means "no size" or
+    "no file".
+    """
+    if any(n not in sizes for n in names):
+        return None
+    return [IndexMember(name=n, size=sizes[n]) for n in names]
+
+
+def member_sizes(part: "IndexPart") -> Dict[str, int]:
+    """Known sizes of a part's files ({} when the part carries none)."""
+    return {m.name: m.size for m in part.members or []}
+
+
 class IndexPart(BaseModel):
     """
     Represents a single incremental tar "part" for a bench/year.
@@ -85,17 +113,34 @@ class IndexPart(BaseModel):
             "re-fetch). They are not listed in ``files``. Omitted when empty."
         ),
     )
+    members: Optional[List[IndexMember]] = Field(
+        default=None,
+        description=(
+            "Name and size of every file in ``files``, in the same order. "
+            "Additive: ``files`` stays the authoritative list. Omitted when "
+            "sizes are unknown (parts written before sizes were recorded and "
+            "not yet backfilled)."
+        ),
+    )
 
     def model_post_init(self, __context):
         self.file_count = len(self.files)
+        if self.members is not None and [m.name for m in self.members] != self.files:
+            # Never publish sizes that disagree with ``files``; unknown is safer.
+            logger.warning(
+                "Dropping members of part %s: names do not match files", self.name
+            )
+            self.members = None
 
     @model_serializer(mode="wrap")
-    def _omit_empty_superseded_files(self, handler):
-        # Keep index JSON byte-for-byte unchanged for the (usual) parts that
-        # have never had a member superseded.
+    def _omit_empty_optional_fields(self, handler):
+        # Keep index JSON byte-for-byte unchanged for parts that have never had
+        # a member superseded and carry no sizes.
         data = handler(self)
         if not data.get("superseded_files"):
             data.pop("superseded_files", None)
+        if data.get("members") is None:
+            data.pop("members", None)
         return data
 
 

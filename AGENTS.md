@@ -62,7 +62,7 @@ The pipeline flows: **download.py** (orchestrator) → **src/captcha_solver/** (
 
 `download.py` generates `CourtDateTask` objects (court × date chunk), runs them in parallel via `ThreadPoolExecutor`, each using `ECourtSession` for HTTP + CAPTCHA handling.
 
-Index files (`metadata.index.json`, `data.index.json`) track tar contents and `updated_at` per bench, enabling incremental/resumable downloads.
+Index files (`metadata.index.json`, `data.index.json`) track tar contents and `updated_at` per bench, enabling incremental/resumable downloads. Each part may also carry `members` (`[{name, size}]`, same order as `files`); it is all-or-nothing per part, and `scripts/backfill_index_member_sizes.py` fills it for older parts from the `data/pdf/` listing.
 
 S3 path convention: `{metadata|data}/{json|pdf|tar}/year=YYYY/court=XX_YY/bench=name/`
 
