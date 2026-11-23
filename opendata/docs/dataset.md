@@ -65,11 +65,23 @@ Index file
       "file_count": 1000,
       "size": 100000,
       "size_human": "1.66 MB",
-      "created_at": "2025-10-23T07:11:49.283600"
+      "created_at": "2025-10-23T07:11:49.283600",
+      "members": [
+        {"name": "file1.json", "size": 2048},
+        {"name": "file2.json", "size": 1987},
+        {"name": "file3.json", "size": 2110}
+      ]
     }
   ]
 }
 ```
+
+`members` is optional and additive: when present it lists every name in
+`files`, in the same order, with the member's size in bytes inside the tar.
+Parts written before sizes were recorded may not have it yet; `files` remains
+the authoritative list of what a part contains. A part may also carry
+`superseded_files` (see [placeholder re-fetch](../../docs/placeholder-pdf-refetch.md)).
+Readers should ignore keys they do not recognise.
 
 
 ### Example usage
