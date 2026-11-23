@@ -7,8 +7,8 @@ For bulk access, use the tar archives and parquet files. The bucket also exposes
 
 ## Data
  * 25 high courts (45 benches)
- * ~17.8M judgments
- * ~1.25 TiB of S3 tar archives
+ * ~19.4M judgments
+ * ~1.43 TiB of S3 tar archives
  * Code used to download and process the data is [here](https://github.com/vanga/indian-high-court-judgments)
 
 #### Update cadence

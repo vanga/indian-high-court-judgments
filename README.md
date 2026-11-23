@@ -7,7 +7,7 @@ An open dataset of judgments from 25 Indian High Courts, scraped from the [eCour
 - **Download the dataset**: [AWS Open Data Registry](https://registry.opendata.aws/indian-high-court-judgments/)
 - **License**: [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/) — free to use, share, and adapt with attribution
 - **Storage & transfer**: sponsored by AWS
-- **Size**: 17.8M judgments, ~1.25 TiB of S3 tar archives across all years. See [STATS.md](STATS.md) for a breakdown by court and year.
+- **Size**: 19.4M judgments, ~1.43 TiB of S3 tar archives across all years. See [STATS.md](STATS.md) for a breakdown by court and year.
 - **Collaborate / ask questions**: [Discord](https://discord.gg/mQhghxCRJU)
 
 > **Please scrape responsibly.** The eCourts portal is a public service — avoid high-concurrency scraping and be considerate of the maintainers. If you just want the data, use the AWS Open Data link above instead of running the scraper.
